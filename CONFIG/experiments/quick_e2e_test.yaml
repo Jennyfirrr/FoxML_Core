@@ -1,0 +1,103 @@
+# ============================================================================
+# QUICK E2E TEST
+# ============================================================================
+# Minimal config for fast end-to-end testing of the full pipeline.
+# Tests all new features from production_baseline with minimal data.
+#
+# Usage:
+#   python -m TRAINING.orchestration.intelligent_trainer \
+#     --experiment-config quick_e2e_test \
+#     --output-dir TRAINING/results/quick_test
+#
+# Expected runtime: ~2-5 minutes
+# ============================================================================
+
+experiment:
+  name: quick_e2e_test
+  description: "Quick E2E test: 5 symbols, 10 targets (regression+classification), 50 features, lazy loading"
+
+# ============================================================================
+# DATA CONFIGURATION - MINIMAL
+# ============================================================================
+data:
+  data_dir: data/data_labeled/interval=5m
+  symbols: [AAPL, MSFT, GOOGL, TSLA, NVDA]  # 5 symbols only
+  interval: 5m
+  max_samples_per_symbol: 2000  # Very small for speed
+  max_rows_per_symbol: 2000
+  max_rows_train: 10000
+  max_cs_samples: 2000
+  min_cs: 3
+
+# ============================================================================
+# INTELLIGENT TRAINING - MINIMAL BUT COMPREHENSIVE
+# ============================================================================
+intelligent_training:
+  auto_targets: true
+  top_n_targets: 10  # Train top 10 targets (regression + classification)
+  max_targets_to_evaluate: 25  # Evaluate enough to cover target types
+
+  # Exclude problematic targets
+  exclude_target_patterns:
+    - "_raw$"
+    - "^debug_"
+
+  auto_features: true
+  top_m_features: 50
+
+  strategy: single_task
+  run_leakage_diagnostics: false  # Skip for speed
+
+  # NEW: Lazy loading (from production_baseline)
+  lazy_loading:
+    enabled: true
+    verify_memory_release: false
+    log_memory_usage: true
+    fail_on_fallback: false  # Don't fail on fallback for testing
+    # Feature probing
+    probe_features: true
+    probe_top_n: 30
+    probe_rows: 1000  # Reduced for speed
+
+# ============================================================================
+# TARGET ROUTING - CROSS-SECTIONAL ONLY (like production)
+# ============================================================================
+target_routing:
+  max_symbols_for_ss: 0  # Force CS only
+  ss_fallback_route: CROSS_SECTIONAL
+
+# ============================================================================
+# MODEL TRAINING
+# ============================================================================
+training:
+  model_families:
+    - lightgbm
+    - xgboost
+    - ridge
+    - elasticnet
+
+feature_selection:
+  model_families:
+    - lightgbm
+    - xgboost
+    - random_forest
+
+# ============================================================================
+# PARALLEL EXECUTION - ENABLED FOR SPEED
+# ============================================================================
+multi_target:
+  parallel_targets: true
+  skip_on_error: true
+  save_summary: true
+
+threading:
+  parallel:
+    enabled: true
+    max_workers_process: 4
+    max_workers_thread: 4
+
+# ============================================================================
+# DECISIONS - OFF FOR TESTING
+# ============================================================================
+decisions:
+  apply_mode: "off"

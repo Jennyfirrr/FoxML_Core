@@ -1,0 +1,78 @@
+# CatBoost Model Configuration
+# Optimized for large-scale datasets (10M+ rows)
+
+model_family: "CatBoost"
+description: "Gradient Boosting with ordered boosting - large-scale optimized"
+
+# LARGE-SCALE NOTES (70M rows):
+# - CatBoost handles ordered boosting well - good for time series
+# - Higher min_data_in_leaf prevents overfitting
+# - depth should stay moderate (CatBoost trees grow symmetrically)
+
+hyperparameters:
+  # Tree structure - CatBoost uses symmetric trees
+  depth: 8                  # 6-10 range (symmetric trees, so effective capacity is 2^depth)
+  min_data_in_leaf: 500     # HIGH - prevents overfitting on large data
+
+  # Learning
+  learning_rate: 0.02       # Slower = more trees = better
+  iterations: 2000          # High limit, early stopping will cap
+  early_stopping_rounds: 50
+
+  # Regularization
+  l2_leaf_reg: 3.0          # L2 regularization
+  random_strength: 1.0      # Randomness for splits
+  bagging_temperature: 0.5  # Bayesian bootstrap temperature
+
+  # Performance
+  thread_count: -1          # Use all cores
+  verbose: false
+  task_type: "CPU"          # Set to "GPU" if available
+
+# Variants for different use cases
+variants:
+  # For quick ranking/feature selection
+  lightweight:
+    depth: 6
+    min_data_in_leaf: 100
+    learning_rate: 0.05
+    iterations: 300
+    early_stopping_rounds: 20
+    l2_leaf_reg: 1.0
+
+  # Small datasets (<1M rows)
+  small_data:
+    depth: 7
+    min_data_in_leaf: 50
+    learning_rate: 0.03
+    iterations: 1000
+    early_stopping_rounds: 50
+    l2_leaf_reg: 2.0
+
+  # Large datasets (10M+ rows) - DEFAULT behavior
+  large_scale:
+    depth: 8
+    min_data_in_leaf: 500
+    learning_rate: 0.02
+    iterations: 2000
+    early_stopping_rounds: 50
+    l2_leaf_reg: 3.0
+
+  # Very large datasets (50M+ rows)
+  very_large:
+    depth: 10
+    min_data_in_leaf: 1000
+    learning_rate: 0.01
+    iterations: 3000
+    early_stopping_rounds: 100
+    l2_leaf_reg: 5.0
+
+  # GPU-optimized (if GPU available)
+  gpu:
+    depth: 8
+    min_data_in_leaf: 500
+    learning_rate: 0.03
+    iterations: 2000
+    early_stopping_rounds: 50
+    task_type: "GPU"
+    devices: "0"

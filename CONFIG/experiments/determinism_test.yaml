@@ -1,0 +1,206 @@
+# Determinism Test Configuration
+# Based on e2e_full_targets_test.yaml but with DETERMINISM ENFORCED
+# Purpose: Verify bitwise reproducibility across runs
+#
+# Usage:
+#   Run 1: bin/run_deterministic.sh python TRAINING/orchestration/intelligent_trainer.py --experiment-config determinism_test 2>&1 | tee run1.log
+#   Run 2: bin/run_deterministic.sh python TRAINING/orchestration/intelligent_trainer.py --experiment-config determinism_test 2>&1 | tee run2.log
+#   Compare: diff <(grep fingerprint run1.log) <(grep fingerprint run2.log)
+#
+# For production financial use:
+#   - Always use strict mode for reproducibility audits
+#   - Store run fingerprints for regulatory compliance
+#   - Compare fingerprints across runs to detect drift
+
+experiment:
+  name: determinism_test
+  description: "E2E determinism test: 5 symbols, 10 targets (regression+classification), 50 features, lazy loading"
+
+# ============================================================================
+# DATA CONFIGURATION - MINIMAL FOR QUICK E2E
+# ============================================================================
+data:
+  # Data directory (relative to repo root or absolute path)
+  data_dir: data/data_labeled/interval=5m
+
+  # Fixed 5 symbols for fast, reproducible testing
+  symbols: [AAPL, MSFT, GOOGL, TSLA, NVDA]
+  interval: 5m
+
+  # MINIMAL limits for quick e2e testing (~2-5 min runtime)
+  max_samples_per_symbol: 2000
+  max_rows_per_symbol: 2000
+  max_rows_train: 10000
+  max_cs_samples: 2000
+  min_cs: 3
+
+# ============================================================================
+# INTELLIGENT TRAINING CONFIGURATION
+# ============================================================================
+intelligent_training:
+  # Auto-discover ALL targets from data
+  auto_targets: true # Disabled to use manual targets including leaky canary
+
+  # Manual targets (covers all target types + leaky canary for autofixer testing)
+  #manual_targets:
+  # Regression targets
+  #- fwd_ret_10m  # Forward return (non-repainting, honest baseline)
+  #- fwd_ret_60m  # Forward return (longer horizon)
+  #- fwd_ret_120m  # Forward return (even longer horizon)
+
+  # Train top N targets (covers regression + classification)
+  top_n_targets: 10
+
+  # Evaluate more targets to get good coverage of target types
+  max_targets_to_evaluate: 25
+
+  # Auto-discover features
+  auto_features: true
+
+  # Number of top features to select
+  top_m_features: 50
+
+  # Training strategy
+  strategy: single_task
+
+  # Skip leakage diagnostics for faster testing
+  run_leakage_diagnostics: false
+
+  # Exclude target patterns
+  exclude_target_patterns:
+    - "fwd_ret_20d"
+    - "fwd_ret_15d"
+    - "_raw$"
+    - "^debug_"
+
+  # Lazy loading (from production_baseline - memory optimization)
+  lazy_loading:
+    enabled: true
+    verify_memory_release: false
+    log_memory_usage: true
+    fail_on_fallback: false # Don't fail for testing
+    # Feature probing: Single-symbol importance filtering
+    probe_features: true
+    probe_top_n: 50
+    probe_rows: 2000
+
+# ============================================================================
+# TARGET ROUTING - CROSS-SECTIONAL ONLY (like production)
+# ============================================================================
+target_routing:
+  max_symbols_for_ss: 0 # Force CS only for determinism
+  ss_fallback_route: CROSS_SECTIONAL
+
+# ============================================================================
+# TARGETS CONFIGURATION
+# ============================================================================
+#targets:
+# Primary target (required when auto_targets=false, used for reference)
+# Using first manual target as primary
+#primary: fwd_ret_10m
+
+# ============================================================================
+# TARGET RANKING OVERRIDES
+# ============================================================================
+target_ranking_overrides:
+  # Auto-rerun after leakage fixes (SST: experiment config overrides safety config)
+  auto_rerun:
+    enabled: true # Enable automatic rerun of targets after auto-fix
+    max_reruns: 3 # Maximum number of reruns per target
+    rerun_on_perfect_train_acc: true # Rerun if perfect training accuracy detected
+    rerun_on_high_auc_only: false # Rerun on high AUC alone (default: false, only rerun on perfect train acc)
+
+# ============================================================================
+# FEATURE SELECTION CONFIGURATION
+# ============================================================================
+feature_selection:
+  model_families:
+    - lightgbm
+    - xgboost
+    - random_forest
+
+# ============================================================================
+# TRAINING CONFIGURATION
+# ============================================================================
+training:
+  # Fast CPU families for comprehensive coverage
+  model_families:
+    - lightgbm
+    - xgboost
+    - ridge
+    - elasticnet
+
+# ============================================================================
+# DECISION CONFIGURATION
+# ============================================================================
+decisions:
+  apply_mode: "off"
+  min_level_to_apply: 2
+  use_bayesian: false
+
+# ============================================================================
+# SAFETY & LEAKAGE DETECTION CONFIGURATION
+# ============================================================================
+# Explicit lookback budget configuration for determinism testing
+# This ensures policy cap computation is deterministic and reproducible
+# Policy cap = k * horizon (with min/max bounds), so same horizon → same cap
+safety:
+  leakage_detection:
+    # Explicit lookback budget for determinism testing
+    # Using auto mode with explicit k, min, max ensures deterministic policy cap
+    lookback_budget:
+      mode: auto # "auto" | "fixed"
+      auto_rule: k_times_horizon # Only rule for now
+      k: 10.0 # Multiplier for k_times_horizon (cap = k * horizon)
+      min_minutes: 240.0 # Floor for auto rules (4 hours)
+      max_minutes: 28800.0 # Optional maximum cap (28800 = 20 days, null to disable)
+
+    # Policy: how to handle violations
+    policy: drop # "strict" | "drop" | "warn" - drop is safe for testing
+    over_budget_action: drop # "drop" | "hard_stop" | "warn" - drop is safe for testing
+
+# ============================================================================
+# CRITICAL: DISABLE ALL PARALLELISM FOR DETERMINISM
+# ============================================================================
+# Unlike e2e_full_targets_test.yaml, parallelism is DISABLED here
+# to ensure bitwise reproducible results across runs.
+
+multi_target:
+  parallel_targets: false # CRITICAL: Sequential for determinism
+  skip_on_error: true # Continue on error (same as e2e)
+  save_summary: true
+
+multi_model_feature_selection:
+  parallel_symbols: false # CRITICAL: Sequential for determinism
+
+threading:
+  parallel:
+    max_workers_process: 1 # CRITICAL: Single worker for determinism
+    max_workers_thread: 1 # CRITICAL: Single worker for determinism
+    enabled: false # CRITICAL: Disable parallelism
+
+# ============================================================================
+# VERIFICATION INSTRUCTIONS
+# ============================================================================
+# After running twice with strict mode:
+#
+# 1. Compare fingerprints in logs:
+#    grep "fingerprint" run1.log > fp1.txt
+#    grep "fingerprint" run2.log > fp2.txt
+#    diff fp1.txt fp2.txt  # Should be empty (identical)
+#
+# 2. Compare feature importances:
+#    diff -r RESULTS/runs/<run1>/*/feature_importances RESULTS/runs/<run2>/*/feature_importances
+#
+# 3. Verify policy cap determinism:
+#    grep "Gatekeeper policy cap" run1.log > cap1.txt
+#    grep "Gatekeeper policy cap" run2.log > cap2.txt
+#    diff cap1.txt cap2.txt  # Should be empty (identical policy caps)
+#    # Policy cap should be: k * horizon (clamped by min/max)
+#    # Same horizon → same policy cap → same gatekeeper behavior
+#
+# 4. For production financial use:
+#    - Store fingerprints in audit log
+#    - Verify fingerprints match expected values
+#    - Verify policy cap values are identical between runs
+#    - Any drift indicates environment/code change

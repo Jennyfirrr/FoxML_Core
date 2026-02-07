@@ -1,0 +1,407 @@
+"""
+Multi-Horizon Predictor
+=======================
+
+Coordinates predictions across all horizons and model families.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+
+from CONFIG.config_loader import get_cfg
+from TRAINING.common.utils.determinism_ordering import sorted_items
+
+from LIVE_TRADING.common.constants import HORIZONS
+from LIVE_TRADING.models.loader import ModelLoader
+from LIVE_TRADING.models.inference import InferenceEngine
+from LIVE_TRADING.models.feature_builder import FeatureBuilder
+from .standardization import ZScoreStandardizer
+from .confidence import ConfidenceScorer, ConfidenceComponents
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ModelPrediction:
+    """Single model prediction with metadata."""
+
+    family: str
+    horizon: str
+    raw: float
+    standardized: float
+    confidence: ConfidenceComponents
+    calibrated: float  # standardized × confidence
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "family": self.family,
+            "horizon": self.horizon,
+            "raw": self.raw,
+            "standardized": self.standardized,
+            "confidence": self.confidence.to_dict(),
+            "calibrated": self.calibrated,
+        }
+
+
+@dataclass
+class HorizonPredictions:
+    """Predictions for a single horizon."""
+
+    horizon: str
+    timestamp: datetime
+    predictions: Dict[str, ModelPrediction] = field(default_factory=dict)
+
+    @property
+    def families(self) -> List[str]:
+        """List of families with predictions."""
+        return list(self.predictions.keys())
+
+    @property
+    def mean_calibrated(self) -> float:
+        """Mean of calibrated predictions."""
+        if not self.predictions:
+            return 0.0
+        return float(np.mean([p.calibrated for p in self.predictions.values()]))
+
+    @property
+    def mean_standardized(self) -> float:
+        """Mean of standardized predictions."""
+        if not self.predictions:
+            return 0.0
+        return float(np.mean([p.standardized for p in self.predictions.values()]))
+
+    def get_calibrated_dict(self) -> Dict[str, float]:
+        """Get dict of calibrated predictions (sorted by family)."""
+        return {f: p.calibrated for f, p in sorted_items(self.predictions)}
+
+    def get_standardized_dict(self) -> Dict[str, float]:
+        """Get dict of standardized predictions (sorted by family)."""
+        return {f: p.standardized for f, p in sorted_items(self.predictions)}
+
+    def get_raw_dict(self) -> Dict[str, float]:
+        """Get dict of raw predictions (sorted by family)."""
+        return {f: p.raw for f, p in sorted_items(self.predictions)}
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "horizon": self.horizon,
+            "timestamp": self.timestamp.isoformat(),
+            "predictions": {f: p.to_dict() for f, p in sorted_items(self.predictions)},
+            "mean_calibrated": self.mean_calibrated,
+            "mean_standardized": self.mean_standardized,
+        }
+
+
+@dataclass
+class AllPredictions:
+    """Predictions across all horizons."""
+
+    symbol: str
+    timestamp: datetime
+    horizons: Dict[str, HorizonPredictions] = field(default_factory=dict)
+
+    def get_horizon(self, horizon: str) -> Optional[HorizonPredictions]:
+        """Get predictions for a specific horizon."""
+        return self.horizons.get(horizon)
+
+    @property
+    def available_horizons(self) -> List[str]:
+        """List of horizons with predictions."""
+        return list(self.horizons.keys())
+
+    def get_best_horizon(self) -> Optional[str]:
+        """Get horizon with highest mean calibrated signal."""
+        if not self.horizons:
+            return None
+        return max(
+            self.horizons.keys(),
+            key=lambda h: abs(self.horizons[h].mean_calibrated)
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "symbol": self.symbol,
+            "timestamp": self.timestamp.isoformat(),
+            "horizons": {h: hp.to_dict() for h, hp in sorted_items(self.horizons)},
+            "best_horizon": self.get_best_horizon(),
+        }
+
+
+class MultiHorizonPredictor:
+    """
+    Generates predictions across all horizons and model families.
+
+    Pipeline:
+    1. Build features from market data
+    2. Run inference for each (horizon, family) pair
+    3. Standardize predictions
+    4. Calculate confidence
+    5. Apply calibration
+    """
+
+    def __init__(
+        self,
+        run_root: str,
+        horizons: List[str] | None = None,
+        families: List[str] | None = None,
+        device: str = "cpu",
+    ):
+        """
+        Initialize multi-horizon predictor.
+
+        Args:
+            run_root: Path to TRAINING run artifacts
+            horizons: Horizons to predict (default: all)
+            families: Model families to use (default: all available)
+            device: Device for inference
+        """
+        self.horizons = horizons or get_cfg(
+            "live_trading.horizons", default=HORIZONS
+        )
+        self.families = families
+
+        # Initialize components
+        self.loader = ModelLoader(run_root)
+        self.engine = InferenceEngine(self.loader, device=device)
+        self.standardizer = ZScoreStandardizer()
+        self.confidence_scorer = ConfidenceScorer()
+
+        # Feature builders per target (cached)
+        self._feature_builders: Dict[str, FeatureBuilder] = {}
+
+        logger.info(f"MultiHorizonPredictor initialized: horizons={self.horizons}")
+
+    def _get_feature_builder(
+        self,
+        target: str,
+        family: str,
+    ) -> FeatureBuilder:
+        """Get or create feature builder for target/family."""
+        key = f"{target}:{family}"
+        if key not in self._feature_builders:
+            feature_list = self.loader.get_feature_list(target, family)
+            self._feature_builders[key] = FeatureBuilder(feature_list)
+        return self._feature_builders[key]
+
+    def predict_all_horizons(
+        self,
+        target: str,
+        prices: pd.DataFrame,
+        symbol: str,
+        data_timestamp: datetime | None = None,
+        adv: float = float("inf"),
+        planned_dollars: float = 0.0,
+    ) -> AllPredictions:
+        """
+        Generate predictions for all horizons.
+
+        Args:
+            target: Target name (e.g., "ret_5m")
+            prices: OHLCV DataFrame
+            symbol: Trading symbol
+            data_timestamp: Data timestamp for freshness
+            adv: Average daily volume
+            planned_dollars: Planned trade size
+
+        Returns:
+            AllPredictions with all horizons
+        """
+        if data_timestamp is None:
+            data_timestamp = datetime.now(timezone.utc)
+
+        # Get available families for this target
+        available_families = self.loader.list_available_families(target)
+        families_to_use = self.families or available_families
+
+        all_preds = AllPredictions(
+            symbol=symbol,
+            timestamp=data_timestamp,
+        )
+
+        for horizon in self.horizons:
+            horizon_preds = self._predict_horizon(
+                target=target,
+                horizon=horizon,
+                prices=prices,
+                symbol=symbol,
+                families=families_to_use,
+                data_timestamp=data_timestamp,
+                adv=adv,
+                planned_dollars=planned_dollars,
+            )
+            if horizon_preds.predictions:  # Only add if we got predictions
+                all_preds.horizons[horizon] = horizon_preds
+
+        return all_preds
+
+    def predict_single_horizon(
+        self,
+        target: str,
+        horizon: str,
+        prices: pd.DataFrame,
+        symbol: str,
+        families: List[str] | None = None,
+        data_timestamp: datetime | None = None,
+        adv: float = float("inf"),
+        planned_dollars: float = 0.0,
+    ) -> HorizonPredictions:
+        """
+        Generate predictions for a single horizon.
+
+        Args:
+            target: Target name
+            horizon: Horizon (e.g., "5m")
+            prices: OHLCV DataFrame
+            symbol: Trading symbol
+            families: Model families to use
+            data_timestamp: Data timestamp
+            adv: Average daily volume
+            planned_dollars: Planned trade size
+
+        Returns:
+            HorizonPredictions for the horizon
+        """
+        if data_timestamp is None:
+            data_timestamp = datetime.now(timezone.utc)
+
+        # Get available families
+        available_families = self.loader.list_available_families(target)
+        families_to_use = families or self.families or available_families
+
+        return self._predict_horizon(
+            target=target,
+            horizon=horizon,
+            prices=prices,
+            symbol=symbol,
+            families=families_to_use,
+            data_timestamp=data_timestamp,
+            adv=adv,
+            planned_dollars=planned_dollars,
+        )
+
+    def _predict_horizon(
+        self,
+        target: str,
+        horizon: str,
+        prices: pd.DataFrame,
+        symbol: str,
+        families: List[str],
+        data_timestamp: datetime,
+        adv: float,
+        planned_dollars: float,
+    ) -> HorizonPredictions:
+        """Generate predictions for a single horizon."""
+        horizon_preds = HorizonPredictions(
+            horizon=horizon,
+            timestamp=data_timestamp,
+        )
+
+        for family in families:
+            try:
+                pred = self._predict_single(
+                    target=target,
+                    horizon=horizon,
+                    family=family,
+                    prices=prices,
+                    symbol=symbol,
+                    data_timestamp=data_timestamp,
+                    adv=adv,
+                    planned_dollars=planned_dollars,
+                )
+                if pred is not None:
+                    horizon_preds.predictions[family] = pred
+
+            except Exception as e:
+                logger.warning(f"Prediction failed for {family}/{horizon}: {e}")
+
+        return horizon_preds
+
+    def _predict_single(
+        self,
+        target: str,
+        horizon: str,
+        family: str,
+        prices: pd.DataFrame,
+        symbol: str,
+        data_timestamp: datetime,
+        adv: float,
+        planned_dollars: float,
+    ) -> Optional[ModelPrediction]:
+        """Generate single model prediction."""
+
+        # Build features
+        builder = self._get_feature_builder(target, family)
+        features = builder.build_features(prices, symbol)
+
+        if np.any(np.isnan(features)):
+            logger.warning(f"NaN in features for {family}/{symbol}")
+            return None
+
+        # Run inference
+        raw_pred = self.engine.predict(target, family, features, symbol)
+
+        if np.isnan(raw_pred):
+            return None
+
+        # Standardize
+        std_pred = self.standardizer.standardize(raw_pred, family, horizon)
+
+        # Calculate confidence
+        confidence = self.confidence_scorer.calculate_confidence(
+            model=family,
+            horizon=horizon,
+            data_timestamp=data_timestamp,
+            adv=adv,
+            planned_dollars=planned_dollars,
+        )
+
+        # Calibrated prediction
+        calibrated = self.confidence_scorer.apply_confidence(
+            std_pred, confidence.overall
+        )
+
+        return ModelPrediction(
+            family=family,
+            horizon=horizon,
+            raw=raw_pred,
+            standardized=std_pred,
+            confidence=confidence,
+            calibrated=calibrated,
+        )
+
+    def update_actuals(
+        self,
+        model: str,
+        horizon: str,
+        prediction: float,
+        actual_return: float,
+    ) -> None:
+        """
+        Update with actual returns for IC tracking.
+
+        Args:
+            model: Model family
+            horizon: Horizon
+            prediction: Previous prediction
+            actual_return: Realized return
+        """
+        self.confidence_scorer.update_with_actual(
+            model, horizon, prediction, actual_return
+        )
+
+    def reset(self) -> None:
+        """Reset all stateful components."""
+        self.standardizer.reset()
+        self.confidence_scorer.reset()
+        self.engine.reset_buffers()
+        logger.debug("MultiHorizonPredictor reset")

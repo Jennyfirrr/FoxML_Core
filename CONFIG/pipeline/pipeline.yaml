@@ -1,0 +1,391 @@
+# Training Pipeline Configuration
+# Main settings for the training pipeline orchestration
+
+pipeline:
+  # Timeouts
+  isolation_timeout_seconds: 7200  # 2 hours default for isolated child processes
+  
+  # Family-specific timeouts (in seconds)
+  # Families that may need longer timeouts can be specified here
+  family_timeouts:
+    LSTM: 10800  # 3 hours for LSTM (can be slow with long sequences)
+    Transformer: 10800  # 3 hours for Transformer (can be slow with long sequences)
+    # Add more family-specific timeouts as needed
+  
+  # Retry/Backoff Settings
+  retry:
+    # Default retry settings for transient failures
+    max_retries: 3  # Maximum number of retry attempts
+    initial_delay_seconds: 0.1  # Initial delay before first retry
+    backoff_multiplier: 2.0  # Exponential backoff multiplier
+    max_delay_seconds: 60  # Maximum delay between retries
+  
+  # Data Processing Limits
+  data_limits:
+    max_samples_per_symbol: null  # None = no limit, or set to integer (e.g., 20 for testing)
+    min_cross_sectional_samples: 10  # Minimum cross-sectional samples required
+    max_cross_sectional_samples: null  # None = no limit, falls back to 1000 if not specified
+    max_rows_train: null  # Maximum training rows (None = no limit)
+    min_cs: 1  # Minimum cross-sectional samples
+    default_max_samples_ranking: 10000  # Default max samples for ranking pipeline
+    default_max_samples_feature_selection: 50000  # Default max samples for feature selection
+    max_cs_samples: 1000  # Maximum cross-sectional samples per timestamp
+    default_max_rows_per_symbol_ranking: 50000  # Default max rows per symbol for ranking
+    max_rows_per_batch: 8000000  # Maximum rows per batch (8M) - prevents OOM on large datasets
+  
+  # Sequential Model Settings (for feature-based sequence models)
+  sequential:
+    # DEPRECATED: Bar-based lookback (retained for backwards compatibility)
+    default_lookback: 64  # Default lookback window in bars (legacy)
+    # NEW: Time-based lookback (preferred, interval-agnostic)
+    # 320 minutes = ~5.3 hours, roughly equivalent to 64 bars @ 5m interval
+    lookback_minutes: 320
+    backend: "torch"  # "torch" or "tf" for sequential models
+
+  # Raw OHLCV Sequence Mode Settings
+  # Used when input_mode="raw_sequence" (no computed features)
+  # See INTEGRATION_CONTRACTS.md v1.3 for contract details
+  sequence:
+    # Default sequence length in minutes (converted to bars via minutes_to_bars)
+    # 320 minutes = 64 bars @ 5m, good for capturing intraday patterns
+    default_length_minutes: 320
+
+    # OHLCV channels to use (order matters for model input)
+    default_channels:
+      - open
+      - high
+      - low
+      - close
+      - volume
+
+    # Normalization method for price/volume sequences
+    # Options:
+    #   - "returns": (price / first_close) - 1.0 (centered around 0)
+    #   - "log_returns": log(price / first_close) (better for multiplicative effects)
+    #   - "minmax": Per-sequence [0, 1] scaling (bounded range)
+    #   - "none": Raw prices/volumes (not recommended)
+    normalization: "returns"
+
+    # Gap handling: what to do when timestamps have gaps (weekends, halts)
+    # Options:
+    #   - "split": Don't create sequences that span gaps (recommended)
+    #   - "pad": Fill gaps with forward-fill (not implemented yet)
+    gap_handling: "split"
+    gap_tolerance: 1.5  # Gap detection threshold (1.5 = 50% tolerance)
+  
+  # Leakage Detection Settings
+  # SST note: Two purge settings exist for different contexts:
+  #   - purge_buffer_bars: Added to target horizon as safety margin (used by PurgedTimeSeriesSplit)
+  #   - purge_time_minutes: Fallback when horizon cannot be parsed (85min ~= 5m*17 bars, covers most short horizons)
+  # Relationship: purge_time_minutes = data_interval_default * estimated_max_horizon_bars
+  leakage:
+    purge_buffer_bars: 5  # Safety buffer added to target horizon (bars)
+    purge_time_minutes: 85  # Fallback purge window when horizon unknown (minutes)
+    data_interval_default: 5  # Default data interval for bar conversion (minutes)
+  
+  # Data Interval Detection
+  data_interval:
+    max_reasonable_minutes: 1440.0  # Maximum reasonable interval (1 day in minutes)
+  
+  # Test Configuration
+  test:
+    max_samples_per_symbol: 20  # Reduced for testing
+    epochs: 10  # Reduced for testing
+    targets:  # Test targets
+      - "fwd_ret_5m"
+      - "fwd_ret_15m"
+      - "mdd_5m_0.001"
+      - "will_peak_5m"
+  
+  # Production Defaults
+  production:
+    epochs: 50  # Default epochs (can be overridden via CLI)
+    max_samples_per_symbol: null  # No limit in production
+  
+  # Data Interval Settings
+  # IMPORTANT: This is the central source of truth for data interval.
+  # All components should use get_cfg("pipeline.data.interval_minutes") to get this value.
+  data:
+    interval_minutes: 5  # Default data interval (can be overridden via CLI --interval-minutes)
+
+  # Paths
+  paths:
+    data_dir: "data/data_labeled_v2/interval=5m"  # Default data directory (SST: single source)
+    output_dir_pattern: "test_output_*"  # Output directory pattern
+    joblib_temp: null  # null = use default (~/trainer_tmp/joblib), or set custom path
+  
+  # Polars Settings
+  polars:
+    enabled: true  # Use Polars for data processing
+    max_threads: null  # null = use DEFAULT_THREADS, or set custom value
+    cross_sectional_align_mode: "union"  # "union" or "intersection"
+  
+  # Determinism
+  determinism:
+    python_hash_seed: "42"
+    tf_deterministic_ops: "1"
+    base_seed: 42  # Single source of truth for all random seeds (SST)
+
+  # Input Mode: Controls how data is fed to models
+  # Options:
+  #   - "features": Traditional mode - compute technical indicators, select features, train
+  #   - "raw_sequence": Feed raw OHLCV bars directly to sequence models (Transformer, LSTM, CNN1D)
+  #
+  # In raw_sequence mode:
+  #   - Feature selection is SKIPPED (raw bars are the input)
+  #   - Only sequence model families are trained (LSTM, Transformer, CNN1D, etc.)
+  #   - Model input shape is (N, seq_len, 5) where 5 = OHLCV channels
+  #   - See INTEGRATION_CONTRACTS.md v1.3 for model_meta fields
+  input_mode: "features"  # Default: use computed features
+
+  # Interval-Agnostic Migration Flags
+  # Controls gradual rollout of time-based (v2) vs bar-based (v1) interval handling
+  # See .claude/plans/interval_agnostic_pipeline.md for full implementation plan
+  interval_agnostic:
+    # Use v2 lookback_minutes instead of v1 lag_bars in feature registry
+    # When true: features use lookback_minutes field (time-based)
+    # When false: features use lag_bars field (bar-based, legacy)
+    use_v2_lookback: true  # Enabled in Phase 1 (2026-01-18)
+
+    # Use ceil() rounding for bar conversion (safer, prevents under-lookback)
+    # When true: minutes_to_bars() uses ceil (conservative, prevents data leakage)
+    # When false: uses floor (legacy behavior, may cause under-lookback)
+    use_ceil_rounding: true  # Enabled in Phase 3 (2026-01-18)
+
+    # Log all bar/minute conversions for migration audit
+    # Useful during migration to verify v1/v2 equivalence
+    audit_conversions: false  # Enable during migration phases
+
+    # Strict mode: fail if v1/v2 conversion results differ
+    # When true: raises error on any v1/v2 discrepancy
+    # When false: logs warning but continues (for gradual rollout)
+    strict_v1_v2_equivalence: true
+
+  # Phase 18: Hyperparameter Scaling Guidance
+  # When training at different data intervals, hyperparameters may need adjustment.
+  # This section provides scaling guidance and optional automatic scaling.
+  #
+  # Key scaling considerations:
+  # - Tree max_depth/num_leaves: May need reduction at smaller intervals (more noise)
+  # - Learning rate: May need reduction at smaller intervals
+  # - min_data_in_leaf: Should scale with interval (fewer samples at 1m vs 5m)
+  # - Regularization: May need increase at smaller intervals
+  #
+  # Reference: Training optimized for 5-minute bars (interval_minutes=5)
+  interval_scaling:
+    reference_interval_minutes: 5
+    enabled: false  # Set to true to enable automatic scaling
+
+    # Scaling factors for different intervals
+    # Formula: param = base_param * factor[interval]
+    scaling_factors:
+      # 1-minute bars have ~5x more noise, need conservative params
+      1:
+        num_leaves_factor: 0.5      # Reduce tree complexity
+        max_depth_factor: 0.8       # Shallower trees
+        learning_rate_factor: 0.5   # Slower learning
+        min_data_factor: 2.0        # More data per leaf
+        reg_alpha_factor: 2.0       # More regularization
+        reg_lambda_factor: 2.0
+      # 5-minute is the reference (factor=1.0 for all)
+      5:
+        num_leaves_factor: 1.0
+        max_depth_factor: 1.0
+        learning_rate_factor: 1.0
+        min_data_factor: 1.0
+        reg_alpha_factor: 1.0
+        reg_lambda_factor: 1.0
+      # 15-minute bars have less noise, can use more complex models
+      15:
+        num_leaves_factor: 1.2
+        max_depth_factor: 1.1
+        learning_rate_factor: 1.2
+        min_data_factor: 0.8
+        reg_alpha_factor: 0.8
+        reg_lambda_factor: 0.8
+      # 60-minute bars (hourly) can be most aggressive
+      60:
+        num_leaves_factor: 1.5
+        max_depth_factor: 1.2
+        learning_rate_factor: 1.5
+        min_data_factor: 0.5
+        reg_alpha_factor: 0.5
+        reg_lambda_factor: 0.5
+
+  # Cross-Sectional Ranking Mode
+  # Enables ranking-based training objectives that align with actual trading strategy:
+  # "At each timestamp t, rank symbols, long top decile, short bottom decile"
+  #
+  # When enabled:
+  # - Target ranking stage is SKIPPED (ranking defines its own objective)
+  # - Feature selection is SKIPPED (uses raw OHLCV sequences)
+  # - Model training uses ranking loss (pairwise/listwise)
+  # - Metrics are ranking-aligned (Spearman IC, top-bottom spread)
+  #
+  # Depends on: input_mode="raw_sequence" (recommended, but not required)
+  # See .claude/plans/cross-sectional-ranking-objective.md for design details
+  cross_sectional_ranking:
+    # Master switch to enable CS ranking mode
+    enabled: false
+
+    # Target construction (Phase 1)
+    # Transforms raw returns to cross-sectionally normalized targets
+    target:
+      # Target type determines how raw returns are normalized:
+      #   - "cs_percentile": Percentile rank [0, 1] (recommended)
+      #   - "cs_zscore": Robust z-score using median/MAD
+      #   - "vol_scaled": Volatility-adjusted CS returns
+      type: "cs_percentile"
+      # Forward return column to normalize
+      return_col: "fwd_ret_5m"
+      # Whether to residualize (subtract market mean) before ranking
+      residualize: true
+      # Winsorization bounds for clipping extremes
+      winsorize_pct: [0.01, 0.99]
+      # Minimum symbols required per timestamp
+      min_symbols: 5
+      # Volatility column (only for vol_scaled type)
+      vol_col: "rolling_vol_20"
+
+    # Loss function configuration (Phase 3)
+    loss:
+      # Loss type for ranking optimization:
+      #   - "pairwise_logistic": Winners should score > losers (recommended)
+      #   - "pairwise_hinge": Margin-based pairwise loss
+      #   - "listwise_softmax": Match score distribution to target
+      #   - "listwise_kl": KL divergence between distributions
+      #   - "pointwise_mse": MSE baseline (not true ranking)
+      #   - "hybrid": Pairwise + pointwise combined
+      type: "pairwise_logistic"
+      # Pairwise loss settings
+      top_pct: 0.2           # Top 20% as "winners"
+      bottom_pct: 0.2        # Bottom 20% as "losers"
+      max_pairs: 100         # Max pairs per timestamp
+      margin: 0.0            # Hinge margin (0 = logistic)
+      # Listwise settings
+      temperature: 1.0       # Softmax temperature
+      # Hybrid settings
+      pairwise_weight: 0.8
+      pointwise_weight: 0.2
+
+    # Batching configuration (Phase 2)
+    batching:
+      # Number of timestamps per batch (B dimension)
+      timestamps_per_batch: 32
+      # Number of symbols per timestamp (null = all, or subsample)
+      symbols_per_timestamp: null
+      # Minimum symbols to include a timestamp
+      min_symbols_per_timestamp: 50
+      # Whether to shuffle timestamps across epochs
+      shuffle_timestamps: true
+
+    # Metrics configuration (Phase 4)
+    metrics:
+      # Primary metric for model selection
+      primary: "spearman_ic"
+      # Top/bottom percentage for spread calculation
+      top_pct: 0.1
+      bottom_pct: 0.1
+      # Transaction cost in basis points for net spread
+      cost_per_trade_bps: 5.0
+      # Minimum symbols for valid metrics
+      min_symbols: 20
+
+  # Model Family Lists
+  families:
+    sequential:
+      - "CNN1D"
+      - "LSTM"
+      - "Transformer"
+      - "TabCNN"
+      - "TabLSTM"
+      - "TabTransformer"
+    
+    cross_sectional:
+      - "LightGBM"
+      - "QuantileLightGBM"
+      - "XGBoost"
+      - "NGBoost"
+      - "Ensemble"
+      - "MLP"
+      - "VAE"
+      - "GAN"
+      - "MetaLearning"
+      - "MultiTask"
+      - "RewardBased"
+      - "ChangePoint"
+      - "GMMRegime"
+      - "FTRLProximal"
+  
+  # Family Capabilities (for reference, may remain code-based)
+  # See train_with_strategies.py for full FAMILY_CAPS dictionary
+
+# Intelligent Training Settings
+# These settings control the intelligent training orchestrator behavior
+intelligent_training:
+  # Target selection
+  auto_targets: true  # Automatically rank and select targets
+  top_n_targets: 5  # Number of top targets to select (if auto_targets=true)
+  max_targets_to_evaluate: null  # Limit number of targets to evaluate (null = evaluate all)
+  
+  # Feature selection
+  auto_features: true  # Automatically select features per target
+  top_m_features: 100  # Number of top features per target (if auto_features=true)
+  
+  # Training strategy
+  strategy: "single_task"  # "single_task", "multi_task", or "cascade"
+  
+  # Data limits (can be overridden by experiment config)
+  min_cs: 10  # Minimum cross-sectional samples required
+  max_rows_per_symbol: null  # Maximum rows to load per symbol (null = no limit)
+  max_rows_train: null  # Maximum training rows (null = no limit)
+  max_cs_samples: null  # Maximum cross-sectional samples per timestamp (null = use pipeline.data_limits.max_cs_samples)
+  
+  # Diagnostics
+  run_leakage_diagnostics: false  # Run leakage sentinel tests after training
+
+  # Memory optimization: Lazy data loading with column projection
+  # When enabled, data is loaded per-target with only the required columns,
+  # reducing peak memory usage by 2-5x. This enables training on larger universes.
+  lazy_loading:
+    enabled: false  # Set to true to enable per-target loading (reduces memory ~5x)
+    verify_memory_release: false  # Verify memory is freed after each target (slower, for debugging)
+    log_memory_usage: true  # Log memory usage before/after each target
+    fail_on_fallback: true  # If true, fail immediately if lazy loading cannot be used (prevents OOM)
+
+    # Feature probing (single-symbol importance filtering)
+    # Uses LightGBM on a single symbol to identify top N features before loading all symbols.
+    # This provides ~67% additional memory reduction on top of lazy loading.
+    # Key insight: For cross-sectional models, one symbol is representative.
+    probe_features: true  # Enable single-symbol feature probing
+    probe_top_n: 100  # Maximum features to keep per target
+    probe_rows: 10000  # Rows to load for probe (10k is fast but representative)
+    probe_importance_threshold: 0.0001  # Minimum cumulative importance threshold
+
+    # Streaming concat settings (for large universes like 728+ symbols)
+    # streaming_concat converts DataFrames to Polars lazy frames incrementally,
+    # releasing memory as it goes, then collects with streaming mode.
+    use_float32: true  # Cast float64→float32 at concat time (50% memory reduction)
+    streaming_collect: true  # Use Polars streaming mode for collect (memory efficient)
+
+# Target Routing Settings
+# Controls how targets are routed to CROSS_SECTIONAL, SYMBOL_SPECIFIC, BOTH, or BLOCKED
+target_routing:
+  # Universe size gate for SYMBOL_SPECIFIC routing
+  # SS routing creates one model per symbol. With large universes (728 symbols):
+  #   728 models × 20 families = 14,560 model instances
+  # This negates memory savings and is computationally expensive.
+  max_symbols_for_ss: 100  # Disable SS routing above this threshold
+  ss_fallback_route: CROSS_SECTIONAL  # What to use instead of SS when gated
+
+# Test Configuration (for E2E testing)
+# Override intelligent_training settings for faster testing
+test:
+  intelligent_training:
+    top_n_targets: 23
+    max_targets_to_evaluate: 23
+    top_m_features: 50
+    min_cs: 3
+    max_rows_per_symbol: 5000
+    max_rows_train: 10000
+

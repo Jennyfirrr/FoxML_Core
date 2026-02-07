@@ -1,0 +1,127 @@
+# ============================================================================
+# MULTI-INTERVAL EXPERIMENT EXAMPLE
+# ============================================================================
+# Demonstrates running experiments across multiple data intervals to compare
+# model performance and identify optimal intervals for different use cases.
+#
+# Key capabilities:
+# 1. Train models at multiple intervals (1m, 5m, 15m, etc.)
+# 2. Cross-interval validation (train at 5m, validate at 1m)
+# 3. Feature transfer warm-start from coarser intervals
+# 4. Interval comparison reports
+#
+# Usage:
+#   python -m TRAINING.orchestration.intelligent_trainer \
+#     --experiment-config multi_interval_example \
+#     --output-dir multi_interval_run
+# ============================================================================
+
+experiment:
+  name: multi_interval_example
+  description: "Multi-interval comparison experiment"
+
+# ============================================================================
+# MULTI-INTERVAL CONFIGURATION
+# ============================================================================
+multi_interval:
+  # Intervals to train at (in minutes)
+  # The pipeline will train separate models at each interval
+  intervals: [5, 15, 60]
+
+  # Primary interval for comparison baseline
+  primary_interval: 5
+
+  # Cross-interval validation settings
+  # Validates how well models generalize across intervals
+  cross_validation:
+    enabled: true
+    # Intervals to train models at (for cross-validation)
+    train_intervals: [5]
+    # Intervals to validate trained models on
+    validate_intervals: [1, 5, 15, 60]
+
+  # Feature transfer settings
+  # Warm-start from coarser interval models
+  feature_transfer:
+    enabled: false  # Set to true to enable warm-start
+    source_interval: 15  # Transfer FROM this interval
+    target_interval: 5   # Transfer TO this interval
+    transfer_method: warm_start  # "warm_start" or "feature_projection"
+
+  # Comparison settings
+  comparison:
+    # Metrics to compare across intervals
+    metrics: [auc, ic, sharpe]
+    # Primary metric for determining "best" interval
+    primary_metric: auc
+    # Generate human-readable comparison report
+    generate_report: true
+
+# ============================================================================
+# DATA CONFIGURATION
+# ============================================================================
+data:
+  # Root data directory (intervals are subdirs)
+  # Structure: data_root/interval=5m/, data_root/interval=15m/, etc.
+  data_dir: data/data_labeled_v2
+  symbols: [AAPL, MSFT, GOOGL, TSLA, NVDA]
+  max_samples_per_symbol: 50000
+  max_rows_per_symbol: 50000
+
+# ============================================================================
+# TARGET SELECTION
+# ============================================================================
+intelligent_training:
+  auto_targets: true
+  top_n_targets: 5
+  max_targets_to_evaluate: 10
+
+  # Use single-task strategy for interval comparison
+  strategy: single_task
+
+  auto_features: true
+  top_m_features: 50
+
+# ============================================================================
+# MODEL FAMILIES
+# ============================================================================
+training:
+  model_families:
+    - lightgbm
+    - xgboost
+
+feature_selection:
+  model_families:
+    - lightgbm
+    - xgboost
+
+# ============================================================================
+# PARALLEL EXECUTION
+# ============================================================================
+multi_target:
+  parallel_targets: true
+  skip_on_error: true
+  save_summary: true
+
+# ============================================================================
+# NOTES
+# ============================================================================
+# Expected output structure:
+#   output_dir/
+#   ├── interval_5m/        # Results for 5m interval
+#   │   ├── models/
+#   │   └── metrics/
+#   ├── interval_15m/       # Results for 15m interval
+#   ├── interval_60m/       # Results for 60m interval
+#   ├── comparison_report.txt  # Human-readable comparison
+#   └── experiment_results.json  # Full results JSON
+#
+# Cross-interval validation interprets degradation:
+#   - <20% degradation: Model generalizes well
+#   - 20-50% degradation: Caution, interval-specific patterns
+#   - >50% degradation: Model doesn't generalize, interval-specific training needed
+#
+# Feature transfer helps when:
+#   - Training data is limited at target interval
+#   - Coarser interval has stronger signal
+#   - You want to warm-start fine interval models

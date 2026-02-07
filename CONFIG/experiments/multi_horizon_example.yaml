@@ -1,0 +1,146 @@
+# ============================================================================
+# MULTI-HORIZON BUNDLE TRAINING EXAMPLE
+# ============================================================================
+# Demonstrates multi-horizon bundle training, which trains a single model with
+# shared encoder + per-horizon heads for related targets across prediction horizons.
+#
+# Benefits:
+# - Shared feature representations across horizons
+# - Efficient training (one model vs N separate models)
+# - Built-in regularization through multi-task learning
+# - Better generalization when horizons are somewhat correlated
+#
+# Usage:
+#   python -m TRAINING.orchestration.intelligent_trainer \
+#     --experiment-config multi_horizon_example \
+#     --output-dir mh_training
+# ============================================================================
+
+experiment:
+  name: multi_horizon_example
+  description: "Multi-horizon bundle training demonstration"
+
+# ============================================================================
+# DATA CONFIGURATION
+# ============================================================================
+data:
+  data_dir: data/data_labeled_v2/interval=5m
+  symbols: [AAPL, MSFT, GOOGL, TSLA, NVDA]
+  interval: 5m
+  max_samples_per_symbol: 50000
+  max_rows_per_symbol: 50000
+  max_rows_train: 100000
+  max_cs_samples: 10000
+  min_cs: 10
+
+# ============================================================================
+# TARGET SELECTION
+# ============================================================================
+# Multi-horizon training works best with multiple targets at different horizons
+# that share the same base name (e.g., fwd_ret_5m, fwd_ret_15m, fwd_ret_60m).
+intelligent_training:
+  auto_targets: true
+  top_n_targets: 15  # Select more targets to form bundles
+  max_targets_to_evaluate: 30
+
+  # Don't exclude any targets - we want multiple horizons
+  exclude_target_patterns: []
+
+  auto_features: true
+  top_m_features: 100
+
+  # Use multi-horizon bundle strategy
+  strategy: multi_horizon_bundle
+
+  run_leakage_diagnostics: false
+
+# ============================================================================
+# MULTI-HORIZON BUNDLE CONFIGURATION
+# ============================================================================
+strategy_configs:
+  multi_horizon_bundle:
+    # Enable multi-horizon bundle training
+    enabled: true
+
+    # Auto-discover bundles from target names (groups by base name)
+    auto_discover: true
+
+    # Bundle discovery settings
+    min_horizons: 2  # Minimum horizons to form a bundle (e.g., 5m + 15m)
+    max_horizons: 5  # Maximum horizons per bundle
+    min_diversity: 0.2  # Minimum diversity score (1 - mean correlation)
+    top_n_bundles: 3  # Train top 3 bundles
+
+    # Ranking weights (how to prioritize bundles)
+    diversity_weight: 0.3  # Higher = prefer uncorrelated targets
+    predictability_weight: 0.7  # Higher = prefer more predictable targets
+
+    # Model architecture
+    shared_layers: [256, 128]  # Shared encoder layer sizes
+    head_layers: [64]  # Per-horizon head layer sizes
+    dropout: 0.2
+    batch_norm: true
+
+    # Training settings
+    backend: tensorflow
+    epochs: 100
+    batch_size: 256
+    patience: 10
+    lr: 0.001
+
+    # Loss weighting strategy
+    # "equal": All targets weighted equally
+    # "horizon_decay": Weight decays with distance from primary horizon
+    loss_weighting: horizon_decay
+    horizon_decay_half_life_minutes: 30
+
+# ============================================================================
+# ALSO TRAIN SINGLE-TASK MODELS FOR COMPARISON
+# ============================================================================
+# In addition to multi-horizon bundles, train traditional single-task models
+training:
+  model_families:
+    - lightgbm
+    - xgboost
+
+feature_selection:
+  model_families:
+    - lightgbm
+    - xgboost
+    - random_forest
+
+# ============================================================================
+# PARALLEL EXECUTION
+# ============================================================================
+multi_target:
+  parallel_targets: true
+  skip_on_error: true
+  save_summary: true
+
+multi_model_feature_selection:
+  parallel_symbols: true
+
+threading:
+  parallel:
+    max_workers_process: null
+    max_workers_thread: null
+    enabled: true
+
+# ============================================================================
+# NOTES
+# ============================================================================
+# Expected bundles from typical target set:
+#   - fwd_ret bundle: fwd_ret_5m, fwd_ret_15m, fwd_ret_60m
+#   - will_peak bundle: will_peak_5m, will_peak_15m, will_peak_60m
+#   - will_valley bundle: will_valley_5m, will_valley_15m, will_valley_60m
+#
+# Output artifacts (in output_dir/multi_horizon/):
+#   - {base_name}/model.keras - Trained TensorFlow model
+#   - {base_name}/metadata.json - Model metadata
+#   - {base_name}/scaler.joblib - Feature scaler
+#   - training_summary.json - Summary of all trained bundles
+#
+# To load and use a trained multi-horizon model:
+#   from TRAINING.model_fun.multi_horizon_trainer import MultiHorizonTrainer
+#   trainer = MultiHorizonTrainer.load("output_dir/multi_horizon/fwd_ret")
+#   predictions = trainer.predict(X)  # Returns dict: {target: predictions}

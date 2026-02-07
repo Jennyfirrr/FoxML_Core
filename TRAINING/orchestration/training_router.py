@@ -1,0 +1,943 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later OR Commercial
+# Copyright (c) 2025-2026 Fox ML Infrastructure LLC
+
+"""
+Training Router
+
+Determines training strategy (cross-sectional, symbol-specific, both, experimental, or blocked)
+for each (target, symbol) pair based on metrics from feature selection, stability analysis,
+and leakage detection.
+
+This is the "quant infra brain" that makes reproducible, config-driven decisions about
+where to train models.
+"""
+
+# DETERMINISM: Bootstrap reproducibility BEFORE any ML libraries
+import TRAINING.common.repro_bootstrap  # noqa: F401 - MUST be first ML import
+
+import json
+import logging
+import math
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple
+import hashlib
+import yaml
+import pandas as pd
+import numpy as np
+
+from CONFIG.config_loader import get_cfg
+
+logger = logging.getLogger(__name__)
+
+
+def _get_auto_dev_mode_threshold() -> int:
+    """Get threshold for auto-enabling dev_mode. SST: from config."""
+    return get_cfg("routing.auto_dev_mode_threshold", default=10000, config_name="routing")
+
+
+def _get_dev_mode_min_sample_size() -> int:
+    """Get minimum sample size for dev_mode. SST: from config."""
+    return get_cfg("routing.dev_mode_min_sample_size", default=5000, config_name="routing")
+
+
+def _resolve_horizon_minutes(target: str) -> Optional[int]:
+    """
+    Resolve horizon in minutes from target name.
+    
+    Uses SST contract function if available, with fallback regex extraction.
+    
+    Args:
+        target: Target name (e.g., 'fwd_ret_10m', 'fwd_ret_5d', 'y_will_peak_60m_0.8')
+        
+    Returns:
+        Horizon in minutes, or None if cannot be determined
+    """
+    try:
+        from TRAINING.common.utils.sst_contract import resolve_target_horizon_minutes
+        return resolve_target_horizon_minutes(target)
+    except ImportError:
+        pass
+    
+    # Fallback: simple regex extraction
+    import re
+    # Try to match patterns like 10m, 60m, 1d, 5d
+    m_match = re.search(r'(\d+)m(?:_|$)', target)
+    if m_match:
+        return int(m_match.group(1))
+    
+    d_match = re.search(r'(\d+)d(?:_|$)', target)
+    if d_match:
+        return int(d_match.group(1)) * 1440  # days to minutes
+    
+    h_match = re.search(r'(\d+)h(?:_|$)', target)
+    if h_match:
+        return int(h_match.group(1)) * 60  # hours to minutes
+    
+    return None
+
+
+class RouteState(str, Enum):
+    """Training route states."""
+    ROUTE_CROSS_SECTIONAL = "ROUTE_CROSS_SECTIONAL"
+    ROUTE_SYMBOL_SPECIFIC = "ROUTE_SYMBOL_SPECIFIC"
+    ROUTE_BOTH = "ROUTE_BOTH"
+    ROUTE_EXPERIMENTAL_ONLY = "ROUTE_EXPERIMENTAL_ONLY"
+    ROUTE_BLOCKED = "ROUTE_BLOCKED"
+
+
+class SignalState(str, Enum):
+    """Signal quality states."""
+    STRONG = "STRONG"
+    WEAK_BUT_OK = "WEAK_BUT_OK"
+    EXPERIMENTAL = "EXPERIMENTAL"
+    DISALLOWED = "DISALLOWED"
+
+
+class StabilityCategory(str, Enum):
+    """Stability categories."""
+    STABLE = "STABLE"
+    DRIFTING = "DRIFTING"
+    DIVERGED = "DIVERGED"
+    UNKNOWN = "UNKNOWN"
+
+
+class LeakageStatus(str, Enum):
+    """Leakage detection status."""
+    SAFE = "SAFE"
+    SUSPECT = "SUSPECT"
+    BLOCKED = "BLOCKED"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass
+class CrossSectionalMetrics:
+    """Cross-sectional metrics for a target."""
+    target: str
+    score: float
+    score_ci_low: Optional[float] = None
+    score_ci_high: Optional[float] = None
+    stability: StabilityCategory = StabilityCategory.UNKNOWN
+    sample_size: int = 0
+    leakage_status: LeakageStatus = LeakageStatus.UNKNOWN
+    feature_set_id: Optional[str] = None
+    failed_model_families: List[str] = field(default_factory=list)
+    stability_metrics: Optional[Dict[str, float]] = None  # mean_overlap, mean_tau, etc.
+    task_type: Optional[str] = None  # REGRESSION, BINARY_CLASSIFICATION, etc.
+    metric_name: Optional[str] = None  # R², AUC, etc.
+
+
+@dataclass
+class SymbolMetrics:
+    """Symbol-specific metrics for a (target, symbol) pair."""
+    target: str
+    symbol: str
+    score: float
+    score_ci_low: Optional[float] = None
+    score_ci_high: Optional[float] = None
+    stability: StabilityCategory = StabilityCategory.UNKNOWN
+    sample_size: int = 0
+    leakage_status: LeakageStatus = LeakageStatus.UNKNOWN
+    feature_set_id: Optional[str] = None
+    failed_model_families: List[str] = field(default_factory=list)
+    model_status: str = "UNKNOWN"  # OK, FAILED, SKIPPED
+    stability_metrics: Optional[Dict[str, float]] = None
+    task_type: Optional[str] = None  # REGRESSION, BINARY_CLASSIFICATION, etc.
+    metric_name: Optional[str] = None  # R², AUC, etc.
+
+
+def _get_horizon_tier(horizon_minutes: Optional[int]) -> str:
+    """
+    Get horizon tier from horizon in minutes.
+
+    Tiers:
+        short: < 60 min (e.g., fwd_ret_10m, fwd_ret_30m)
+        medium: 60min - 4h (e.g., fwd_ret_60m, fwd_ret_120m)
+        long: 4h - 1d (e.g., fwd_ret_1d)
+        very_long: > 1d (e.g., fwd_ret_5d)
+
+    Args:
+        horizon_minutes: Target horizon in minutes
+
+    Returns:
+        Tier name string
+    """
+    if horizon_minutes is None:
+        return "default"
+    if horizon_minutes < 60:
+        return "short"
+    elif horizon_minutes < 240:  # 4 hours
+        return "medium"
+    elif horizon_minutes < 1440:  # 1 day
+        return "long"
+    else:
+        return "very_long"
+
+
+def _get_score_threshold(
+    config_value: Any,
+    task_type: Optional[str],
+    horizon_minutes: Optional[int] = None
+) -> float:
+    """
+    Get score threshold from config, handling task-type and horizon-aware thresholds.
+
+    Args:
+        config_value: Either a float (legacy) or dict with classification/regression keys
+        task_type: Task type string (REGRESSION, BINARY_CLASSIFICATION, MULTICLASS_CLASSIFICATION)
+        horizon_minutes: Target horizon in minutes (for regression horizon-aware thresholds)
+
+    Returns:
+        Threshold value (float)
+    """
+    if isinstance(config_value, dict):
+        # Task-type aware config
+        if task_type and "CLASSIFICATION" in task_type.upper():
+            # Load from config (SST: config first, fallback to hardcoded default)
+            # Default must match CONFIG/pipeline/training/routing.yaml → cross_sectional.min_score.classification (0.52)
+            try:
+                classification_default = get_cfg(
+                    "routing.cross_sectional.min_score.classification",
+                    default=0.52,
+                    config_name="routing_config"
+                )
+            except Exception:
+                classification_default = 0.52  # Fallback if config system unavailable (defensive boundary)
+            return config_value.get("classification", classification_default)
+        else:
+            # Regression - check for horizon-aware nested config
+            regression_config = config_value.get("regression", -0.5)
+            if isinstance(regression_config, dict):
+                # Horizon-aware regression thresholds
+                tier = _get_horizon_tier(horizon_minutes)
+                return regression_config.get(tier, regression_config.get("default", -0.5))
+            else:
+                # Legacy: single regression threshold
+                return float(regression_config)
+    else:
+        # Legacy: single threshold for all task types
+        return float(config_value)
+
+
+@dataclass
+class RoutingDecision:
+    """Routing decision for a (target, symbol) pair."""
+    target: str
+    symbol: str
+    route: RouteState
+    cs_state: SignalState
+    local_state: SignalState
+    reasons: List[str]
+    cs_metrics: Optional[CrossSectionalMetrics] = None
+    local_metrics: Optional[SymbolMetrics] = None
+    
+    def __post_init__(self):
+        """Validate routing decision invariants."""
+        # SST invariant: target must be set
+        if not self.target:
+            raise ValueError("RoutingDecision: target cannot be empty")
+        
+        # SST invariant: symbol must be set
+        if not self.symbol:
+            raise ValueError("RoutingDecision: symbol cannot be empty")
+        
+        # SST invariant: route must be a valid RouteState
+        if not isinstance(self.route, RouteState):
+            raise ValueError(f"RoutingDecision: route must be RouteState, got {type(self.route)}")
+
+
+class TrainingRouter:
+    """
+    Training router that makes routing decisions based on metrics and config.
+    """
+    
+    def __init__(self, routing_config: Dict[str, Any]):
+        """
+        Initialize router with config.
+        
+        Args:
+            routing_config: Routing configuration dict (from routing_config.yaml)
+        """
+        self.config = routing_config.get("routing", {})
+        self._validate_config()
+    
+    def _validate_config(self):
+        """Validate routing config has required keys."""
+        required = [
+            "min_sample_size",
+            "cross_sectional",
+            "symbol",
+            "stability_allowlist",
+            "both_strong_behavior"
+        ]
+        for key in required:
+            if key not in self.config:
+                raise ValueError(f"Missing required routing config key: {key}")
+    
+    def classify_stability(
+        self,
+        stability_metrics: Optional[Dict[str, float]]
+    ) -> StabilityCategory:
+        """
+        Classify stability from metrics.
+        
+        Args:
+            stability_metrics: Dict with mean_overlap, std_overlap, mean_tau, std_tau
+        
+        Returns:
+            StabilityCategory
+        """
+        if stability_metrics is None:
+            return StabilityCategory.UNKNOWN
+        
+        classification_rules = self.config.get("stability_classification", {})
+        
+        mean_overlap = stability_metrics.get("mean_overlap", np.nan)
+        std_overlap = stability_metrics.get("std_overlap", np.nan)
+        mean_tau = stability_metrics.get("mean_tau", np.nan)
+        std_tau = stability_metrics.get("std_tau", np.nan)
+        
+        # Check for divergence (high variance)
+        max_std_overlap = classification_rules.get("max_std_overlap", 0.20)
+        max_std_tau = classification_rules.get("max_std_tau", 0.25)
+        
+        if not np.isnan(std_overlap) and std_overlap > max_std_overlap:
+            return StabilityCategory.DIVERGED
+        if not np.isnan(std_tau) and std_tau > max_std_tau:
+            return StabilityCategory.DIVERGED
+        
+        # Check for stability
+        stable_overlap_min = classification_rules.get("stable_overlap_min", 0.70)
+        stable_tau_min = classification_rules.get("stable_tau_min", 0.60)
+        
+        if (not np.isnan(mean_overlap) and mean_overlap >= stable_overlap_min and
+            not np.isnan(mean_tau) and mean_tau >= stable_tau_min):
+            return StabilityCategory.STABLE
+        
+        # Check for drifting
+        drifting_overlap_min = classification_rules.get("drifting_overlap_min", 0.50)
+        drifting_tau_min = classification_rules.get("drifting_tau_min", 0.40)
+        
+        if (not np.isnan(mean_overlap) and mean_overlap >= drifting_overlap_min and
+            not np.isnan(mean_tau) and mean_tau >= drifting_tau_min):
+            return StabilityCategory.DRIFTING
+        
+        return StabilityCategory.UNKNOWN
+    
+    def evaluate_cross_sectional_eligibility(
+        self,
+        cs_metrics: CrossSectionalMetrics
+    ) -> SignalState:
+        """
+        Evaluate cross-sectional eligibility.
+        
+        Args:
+            cs_metrics: Cross-sectional metrics
+        
+        Returns:
+            SignalState
+        """
+        # Check dev_mode and use adaptive thresholds if enabled
+        dev_mode = self.config.get("dev_mode", False)
+        # Auto-enable dev thresholds if dataset is small (unless explicitly disabled)
+        # SST: threshold from config (routing.auto_dev_mode_threshold)
+        auto_threshold = _get_auto_dev_mode_threshold()
+        if not dev_mode:
+            try:
+                max_samples = get_cfg("experiment.data.max_samples_per_symbol", default=None)
+                if max_samples and max_samples < auto_threshold:
+                    logger.info(f"Auto-enabling dev_mode thresholds (dataset size: {max_samples} < {auto_threshold})")
+                    dev_mode = True
+            except Exception:
+                pass
+
+        base_min_sample_size = self.config["min_sample_size"]["cross_sectional"]
+        if dev_mode:
+            # Use adaptive threshold: max(dev_mode_min, 10% of cohort, floor)
+            # SST: dev_mode_min and floor from config
+            dev_mode_min = self.config.get("dev_mode_min_sample_size", _get_dev_mode_min_sample_size())
+            adaptive_min = max(dev_mode_min, int(cs_metrics.sample_size * 0.1), dev_mode_min)
+            min_sample_size = min(adaptive_min, base_min_sample_size)  # Don't exceed base
+            logger.debug(f"Dev mode: Using adaptive min_sample_size={min_sample_size} (base={base_min_sample_size}, cohort={cs_metrics.sample_size})")
+        else:
+            min_sample_size = base_min_sample_size
+        
+        block_on_leakage = self.config.get("block_on_leakage", True)
+        cs_config = self.config["cross_sectional"]
+        stability_allowlist = self.config["stability_allowlist"]["cross_sectional"]
+        # In dev_mode, allow UNKNOWN stability if sample_size is below threshold
+        if dev_mode and cs_metrics.sample_size < base_min_sample_size:
+            stability_allowlist = list(stability_allowlist) + ["UNKNOWN"]
+            logger.debug(f"Dev mode: Allowing UNKNOWN stability for small cohorts (sample_size={cs_metrics.sample_size} < {base_min_sample_size})")
+        experimental_config = self.config.get("experimental", {})
+        enable_experimental = self.config.get("enable_experimental_lane", False)
+        
+        # Hard blocks
+        if cs_metrics.sample_size < min_sample_size:
+            return SignalState.DISALLOWED
+        
+        # Escalation policy: Only block if leakage persists after confirmed quarantine
+        if block_on_leakage and cs_metrics.leakage_status == LeakageStatus.BLOCKED:
+            # Check if confirmed quarantine exists (dominance quarantine addressed the issue)
+            # If confirmed quarantine exists, allow with quarantine (don't block)
+            try:
+                from TRAINING.ranking.utils.dominance_quarantine import load_confirmed_quarantine
+                # Try to load confirmed quarantine (need output_dir, but we don't have it here)
+                # For now, we'll check in the metrics aggregator or store a flag
+                # This is a limitation - we need output_dir to check for quarantine
+                # For now, keep existing behavior but log that we're checking
+                logger.debug("Leakage BLOCKED detected, but escalation policy requires checking for confirmed quarantine")
+            except Exception as e:
+                logger.debug(f"Could not check for confirmed quarantine: {e}")
+            
+            # For now, keep existing behavior (block)
+            # TODO: Pass output_dir to router or store quarantine status in metrics
+            return SignalState.DISALLOWED
+        
+        # Check feature safety (if required)
+        if self.config.get("require_safe_features_only", False):
+            allowed_statuses = self.config.get("allowed_feature_leakage_status", ["SAFE"])
+            # This would need feature-level leakage status - for now, assume CS metrics
+            # already account for this
+        
+        # Check model family failures
+        require_min = self.config.get("require_min_successful_families", 1)
+        if len(cs_metrics.failed_model_families) >= require_min and len(cs_metrics.failed_model_families) > 0:
+            # This is a soft check - we'd need to know total families attempted
+            pass
+        
+        # Scoring / stability rules - task-type and horizon-aware thresholds
+        horizon_minutes = _resolve_horizon_minutes(cs_metrics.target)
+        strong_score = _get_score_threshold(cs_config["strong_score"], cs_metrics.task_type, horizon_minutes)
+        min_score = _get_score_threshold(cs_config["min_score"], cs_metrics.task_type, horizon_minutes)
+        
+        if (cs_metrics.score >= strong_score and
+            cs_metrics.stability.value in stability_allowlist):
+            return SignalState.STRONG
+        
+        if (cs_metrics.score >= min_score and
+            cs_metrics.stability.value in stability_allowlist):
+            return SignalState.WEAK_BUT_OK
+        
+        # Experimental lane
+        if enable_experimental:
+            exp_min_score_config = experimental_config.get("min_score", 0.52)
+            exp_min_score = _get_score_threshold(exp_min_score_config, cs_metrics.task_type, horizon_minutes) if isinstance(exp_min_score_config, dict) else exp_min_score_config
+            exp_allowed_stabilities = experimental_config.get("allowed_stabilities", ["DRIFTING", "UNKNOWN"])
+            if (cs_metrics.score >= exp_min_score and
+                cs_metrics.stability.value in exp_allowed_stabilities):
+                return SignalState.EXPERIMENTAL
+        
+        return SignalState.DISALLOWED
+    
+    def evaluate_symbol_eligibility(
+        self,
+        symbol_metrics: SymbolMetrics
+    ) -> SignalState:
+        """
+        Evaluate symbol-specific eligibility.
+        
+        Args:
+            symbol_metrics: Symbol metrics
+        
+        Returns:
+            SignalState
+        """
+        min_sample_size = self.config["min_sample_size"]["symbol"]
+        block_on_leakage = self.config.get("block_on_leakage", True)
+        symbol_config = self.config["symbol"]
+        stability_allowlist = self.config["stability_allowlist"]["symbol"]
+        experimental_config = self.config.get("experimental", {})
+        enable_experimental = self.config.get("enable_experimental_lane", False)
+        
+        # Hard blocks
+        if symbol_metrics.sample_size < min_sample_size:
+            return SignalState.DISALLOWED
+        
+        # Escalation policy: Only block if leakage persists after confirmed quarantine
+        # The check for confirmed quarantine is done in MetricsAggregator._load_leakage_status()
+        # which downgrades BLOCKED to SUSPECT if confirmed quarantine exists
+        if block_on_leakage and symbol_metrics.leakage_status == LeakageStatus.BLOCKED:
+            return SignalState.DISALLOWED
+        
+        # Model status check
+        if symbol_metrics.model_status == "FAILED":
+            # Check if all families failed
+            if len(symbol_metrics.failed_model_families) > 0:
+                # This is a soft check - would need total families attempted
+                pass
+        
+        # Scoring / stability rules - task-type and horizon-aware thresholds
+        horizon_minutes = _resolve_horizon_minutes(symbol_metrics.target)
+        strong_score = _get_score_threshold(symbol_config["strong_score"], symbol_metrics.task_type, horizon_minutes)
+        min_score = _get_score_threshold(symbol_config["min_score"], symbol_metrics.task_type, horizon_minutes)
+        
+        if (symbol_metrics.score >= strong_score and
+            symbol_metrics.stability.value in stability_allowlist):
+            return SignalState.STRONG
+        
+        if (symbol_metrics.score >= min_score and
+            symbol_metrics.stability.value in stability_allowlist):
+            return SignalState.WEAK_BUT_OK
+        
+        # Experimental lane
+        if enable_experimental:
+            exp_min_score_config = experimental_config.get("min_score", 0.52)
+            exp_min_score = _get_score_threshold(exp_min_score_config, symbol_metrics.task_type, horizon_minutes) if isinstance(exp_min_score_config, dict) else exp_min_score_config
+            exp_allowed_stabilities = experimental_config.get("allowed_stabilities", ["DRIFTING", "UNKNOWN"])
+            if (symbol_metrics.score >= exp_min_score and
+                symbol_metrics.stability.value in exp_allowed_stabilities):
+                return SignalState.EXPERIMENTAL
+        
+        return SignalState.DISALLOWED
+    
+    def route_target_symbol(
+        self,
+        target: str,
+        symbol: str,
+        cs_metrics: Optional[CrossSectionalMetrics],
+        symbol_metrics: Optional[SymbolMetrics]
+    ) -> RoutingDecision:
+        """
+        Route a (target, symbol) pair.
+        
+        Args:
+            target: Target name
+            symbol: Symbol name
+            cs_metrics: Cross-sectional metrics (None if not available)
+            symbol_metrics: Symbol metrics (None if not available)
+        
+        Returns:
+            RoutingDecision
+        """
+        reasons = []
+        
+        # Evaluate CS eligibility
+        if cs_metrics is None:
+            cs_state = SignalState.DISALLOWED
+            reasons.append("CS: No metrics available")
+        else:
+            cs_state = self.evaluate_cross_sectional_eligibility(cs_metrics)
+            reasons.append(f"CS: {cs_state.value} (score={cs_metrics.score:.3f}, stability={cs_metrics.stability.value})")
+        
+        # Evaluate symbol eligibility
+        if symbol_metrics is None:
+            local_state = SignalState.DISALLOWED
+            reasons.append("LOCAL: No metrics available")
+        else:
+            local_state = self.evaluate_symbol_eligibility(symbol_metrics)
+            reasons.append(f"LOCAL: {local_state.value} (score={symbol_metrics.score:.3f}, stability={symbol_metrics.stability.value})")
+        
+        # Combine into route decision (priority-ordered rules)
+        route, route_reasons = self._combine_states(cs_state, local_state, cs_metrics, symbol_metrics)
+        reasons.extend(route_reasons)
+        
+        return RoutingDecision(
+            target=target,
+            symbol=symbol,
+            route=route,
+            cs_state=cs_state,
+            local_state=local_state,
+            reasons=reasons,
+            cs_metrics=cs_metrics,
+            local_metrics=symbol_metrics
+        )
+    
+    def _combine_states(
+        self,
+        cs_state: SignalState,
+        local_state: SignalState,
+        cs_metrics: Optional[CrossSectionalMetrics],
+        symbol_metrics: Optional[SymbolMetrics]
+    ) -> Tuple[RouteState, List[str]]:
+        """
+        Combine CS and local states into route decision.
+        
+        Returns:
+            (RouteState, list of reason strings)
+        """
+        reasons = []
+        
+        # Rule 1: Hard blocks
+        cs_blocked = cs_state == SignalState.DISALLOWED
+        local_blocked = local_state == SignalState.DISALLOWED
+        
+        if cs_blocked and local_blocked:
+            reasons.append("Both CS and local disallowed")
+            return RouteState.ROUTE_BLOCKED, reasons
+        
+        if cs_blocked and not local_blocked:
+            reasons.append("CS disallowed, falling back to local-only")
+            return RouteState.ROUTE_SYMBOL_SPECIFIC, reasons
+        
+        if local_blocked and not cs_blocked:
+            reasons.append("Local disallowed, falling back to CS-only")
+            return RouteState.ROUTE_CROSS_SECTIONAL, reasons
+        
+        # Rule 2: CS strong, local disallowed
+        if cs_state in [SignalState.STRONG, SignalState.WEAK_BUT_OK] and local_blocked:
+            reasons.append("CS available, local not available")
+            return RouteState.ROUTE_CROSS_SECTIONAL, reasons
+        
+        # Rule 3: Local strong, CS disallowed
+        if local_state in [SignalState.STRONG, SignalState.WEAK_BUT_OK] and cs_blocked:
+            reasons.append("Local strong, CS not available")
+            return RouteState.ROUTE_SYMBOL_SPECIFIC, reasons
+        
+        # Rule 4: Both strong
+        if (cs_state in [SignalState.STRONG, SignalState.WEAK_BUT_OK] and
+            local_state in [SignalState.STRONG, SignalState.WEAK_BUT_OK]):
+            both_behavior = self.config["both_strong_behavior"]
+            if both_behavior == "ROUTE_BOTH":
+                reasons.append("Both CS and local strong → ROUTE_BOTH")
+                return RouteState.ROUTE_BOTH, reasons
+            elif both_behavior == "PREFER_CS":
+                reasons.append("Both strong, preferring CS")
+                return RouteState.ROUTE_CROSS_SECTIONAL, reasons
+            elif both_behavior == "PREFER_SYMBOL":
+                reasons.append("Both strong, preferring local")
+                return RouteState.ROUTE_SYMBOL_SPECIFIC, reasons
+        
+        # Rule 5: Experimental lane
+        enable_experimental = self.config.get("enable_experimental_lane", False)
+        if enable_experimental:
+            exp_config = self.config.get("experimental", {})
+            max_fraction = exp_config.get("max_fraction_symbols_per_target", 0.2)
+            
+            # Check if either side is experimental
+            if (cs_state == SignalState.EXPERIMENTAL or
+                local_state == SignalState.EXPERIMENTAL):
+                # Note: We'd need to know total symbols per target to enforce max_fraction
+                # For now, allow if either is experimental
+                reasons.append("Experimental lane enabled")
+                return RouteState.ROUTE_EXPERIMENTAL_ONLY, reasons
+        
+        # Fallback: blocked
+        reasons.append("NO_RULE_MATCH")
+        return RouteState.ROUTE_BLOCKED, reasons
+    
+    def generate_routing_plan(
+        self,
+        routing_candidates: pd.DataFrame,
+        output_dir: Path,
+        git_commit: Optional[str] = None,
+        config_hash: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Generate routing plan from routing candidates DataFrame.
+        
+        Args:
+            routing_candidates: DataFrame with columns: target, symbol (nullable), mode, score, etc.
+            output_dir: Output directory for plan artifacts
+            git_commit: Git commit hash
+            config_hash: Config hash
+        
+        Returns:
+            Routing plan dict
+        """
+        # SST: Determine view from actual symbols in routing_candidates (same pattern as resolve_write_scope validation)
+        from TRAINING.orchestration.utils.scope_resolution import View
+        # Extract unique symbols from routing_candidates DataFrame
+        unique_symbols = []
+        if "symbol" in routing_candidates.columns:
+            symbol_col = routing_candidates["symbol"]
+            unique_symbols = symbol_col[symbol_col.notna() & (~symbol_col.isin(["__AGG__"]))].unique().tolist()
+        
+        if unique_symbols and len(unique_symbols) > 1:
+            run_view = View.CROSS_SECTIONAL.value  # Multi-symbol → CROSS_SECTIONAL
+        elif unique_symbols and len(unique_symbols) == 1:
+            run_view = View.SYMBOL_SPECIFIC.value  # Single-symbol → SYMBOL_SPECIFIC
+        else:
+            # Fallback: try universe-specific view cache (already validated in get_view_for_universe)
+            run_view = View.CROSS_SECTIONAL.value  # Default
+            try:
+                from TRAINING.orchestration.utils.run_context import load_run_context
+                from TRAINING.orchestration.utils.target_first_paths import run_root
+                # Navigate to run root from output_dir (which is typically globals/routing_plan/)
+                run_root_dir = run_root(output_dir)
+                context = load_run_context(run_root_dir)
+                if context:
+                    # Try to get from first universe in cache (already validated)
+                    views = context.get("views", {})
+                    if views:
+                        # DETERMINISTIC: Prefer CROSS_SECTIONAL, then SYMBOL_SPECIFIC (SST view preference order)
+                        # This ensures stable selection even if dict construction order changes
+                        from TRAINING.orchestration.utils.scope_resolution import View
+                        PREFERRED_VIEW_ORDER = [View.CROSS_SECTIONAL.value, View.SYMBOL_SPECIFIC.value]
+                        cached_view = None
+                        for preferred_view in PREFERRED_VIEW_ORDER:
+                            if preferred_view in views:
+                                cached_view = views[preferred_view].get('view')
+                                if cached_view:
+                                    break
+                        # Fallback: sorted keys (deterministic)
+                        if not cached_view:
+                            first_key = sorted(views.keys())[0]
+                            cached_view = views[first_key].get('view')
+                        # Use cached view (get_view_for_universe already validated it)
+                        if cached_view:
+                            run_view = cached_view
+            except Exception as e:
+                logger.debug(f"Could not load view from run context: {e}, will use mode from routing candidates")
+        
+        if run_view:
+            logger.info(f"📋 Using view={run_view} (determined from {len(unique_symbols)} symbols) for routing plan generation")
+        
+        # Group by target
+        targets = routing_candidates["target"].unique()
+        
+        plan = {
+            "metadata": {
+                "generated_at": datetime.utcnow().isoformat() + "Z",
+                "git_commit": git_commit or "unknown",
+                "config_hash": config_hash or "unknown",
+                "metrics_snapshot": "routing_candidates.parquet",
+                "view": run_view  # Include in metadata (SST)
+            },
+            "targets": {}
+        }
+        
+        for target in targets:
+            target_rows = routing_candidates[routing_candidates["target"] == target]
+            
+            # Extract CS metrics - use view if available, otherwise fallback to CROSS_SECTIONAL
+            cs_mode_filter = run_view if run_view else "CROSS_SECTIONAL"
+            cs_rows = target_rows[target_rows["mode"] == cs_mode_filter]
+            cs_metrics = None
+            if len(cs_rows) > 0:
+                cs_row = cs_rows.iloc[0]
+                cs_metrics = CrossSectionalMetrics(
+                    target=target,
+                    score=cs_row.get("score", 0.0),
+                    score_ci_low=cs_row.get("score_ci_low"),
+                    score_ci_high=cs_row.get("score_ci_high"),
+                    stability=StabilityCategory(cs_row.get("stability", "UNKNOWN")),
+                    sample_size=int(cs_row.get("sample_size", 0)),
+                    leakage_status=LeakageStatus(cs_row.get("leakage_status", "UNKNOWN")),
+                    feature_set_id=cs_row.get("feature_set_id"),
+                    failed_model_families=cs_row.get("failed_model_families", []),
+                    stability_metrics=cs_row.get("stability_metrics"),
+                    task_type=cs_row.get("task_type"),  # For task-aware thresholds
+                    metric_name=cs_row.get("metric_name")
+                )
+                # Classify stability from metrics if needed
+                if cs_metrics.stability == StabilityCategory.UNKNOWN and cs_metrics.stability_metrics:
+                    cs_metrics.stability = self.classify_stability(cs_metrics.stability_metrics)
+            
+            # Extract symbol metrics - use view if available, otherwise fallback to SYMBOL_SPECIFIC
+            # NOTE: The fallback was incorrectly "SYMBOL" but routing_candidates uses "SYMBOL_SPECIFIC"
+            symbol_mode_filter = run_view if run_view else "SYMBOL_SPECIFIC"
+            symbol_rows = target_rows[target_rows["mode"] == symbol_mode_filter]
+            # Filter out symbol=None rows (these are CS-equivalent aggregates, not per-symbol metrics)
+            if "symbol" in symbol_rows.columns:
+                symbol_rows = symbol_rows[symbol_rows["symbol"].notna()]
+            symbols = symbol_rows["symbol"].unique() if "symbol" in symbol_rows.columns else []
+            
+            if len(symbols) == 0:
+                logger.warning(f"  [{target}]: No symbol metrics found in routing candidates (mode={symbol_mode_filter})")
+            
+            # Evaluate CS eligibility and get detailed reasons if disabled
+            cs_state_eval = None
+            if cs_metrics:
+                cs_state_eval = self.evaluate_cross_sectional_eligibility(cs_metrics)
+            
+            cs_route = "ENABLED" if cs_metrics and cs_state_eval != SignalState.DISALLOWED else "DISABLED"
+            
+            # Build detailed reason if disabled
+            if cs_route == "DISABLED":
+                reason_parts = []
+                if not cs_metrics:
+                    reason_parts.append("no_metrics")
+                else:
+                    # Use same adaptive logic as evaluate_cross_sectional_eligibility
+                    # SST: threshold from config (routing.auto_dev_mode_threshold)
+                    dev_mode = self.config.get("dev_mode", False)
+                    auto_threshold = _get_auto_dev_mode_threshold()
+                    if not dev_mode:
+                        try:
+                            max_samples = get_cfg("experiment.data.max_samples_per_symbol", default=None)
+                            if max_samples and max_samples < auto_threshold:
+                                logger.info(f"Auto-enabling dev_mode thresholds (dataset size: {max_samples} < {auto_threshold})")
+                                dev_mode = True
+                        except Exception:
+                            pass
+                    base_min_sample_size = self.config["min_sample_size"]["cross_sectional"]
+                    if dev_mode:
+                        dev_mode_min = self.config.get("dev_mode_min_sample_size", _get_dev_mode_min_sample_size())
+                        adaptive_min = max(dev_mode_min, int(cs_metrics.sample_size * 0.1), dev_mode_min)
+                        min_sample_size = min(adaptive_min, base_min_sample_size)
+                    else:
+                        min_sample_size = base_min_sample_size
+                    
+                    cs_config = self.config["cross_sectional"]
+                    stability_allowlist = self.config["stability_allowlist"]["cross_sectional"]
+                    # In dev_mode, allow UNKNOWN stability for small cohorts
+                    if dev_mode and cs_metrics.sample_size < base_min_sample_size:
+                        stability_allowlist = list(stability_allowlist) + ["UNKNOWN"]
+                    
+                    if cs_metrics.stability.value not in stability_allowlist:
+                        reason_parts.append(f"stability={cs_metrics.stability.value} not in {stability_allowlist}")
+                    # Use task-type and horizon-aware threshold for logging
+                    horizon_minutes_for_log = _resolve_horizon_minutes(cs_metrics.target)
+                    effective_min_score = _get_score_threshold(cs_config["min_score"], cs_metrics.task_type, horizon_minutes_for_log)
+                    if cs_metrics.score < effective_min_score:
+                        reason_parts.append(f"score={cs_metrics.score:.3f} < {effective_min_score}")
+                    if cs_metrics.sample_size < min_sample_size:
+                        reason_parts.append(f"sample_size={cs_metrics.sample_size} < {min_sample_size}")
+                    if self.config.get("block_on_leakage", True) and cs_metrics.leakage_status == LeakageStatus.BLOCKED:
+                        reason_parts.append(f"leakage_status=BLOCKED")
+                
+                detailed_reason = "; ".join(reason_parts) if reason_parts else "unknown_reason"
+                logger.info(f"    CS DISABLED: {detailed_reason}")
+            else:
+                logger.info(f"    CS ENABLED: score={cs_metrics.score:.3f}, stability={cs_metrics.stability.value}")
+            
+            target_plan = {
+                "cross_sectional": {
+                    "state": cs_metrics.stability.value if cs_metrics else "DISALLOWED",
+                    "route": cs_route,
+                    "reason": f"score={cs_metrics.score:.3f}, stability={cs_metrics.stability.value}, sample_size={cs_metrics.sample_size}" if cs_metrics else "No CS metrics"
+                },
+                "symbols": {}
+            }
+            
+            for symbol in symbols:
+                sym_rows = symbol_rows[symbol_rows["symbol"] == symbol]
+                if len(sym_rows) > 0:
+                    sym_row = sym_rows.iloc[0]
+                    sym_metrics = SymbolMetrics(
+                        target=target,
+                        symbol=symbol,
+                        score=sym_row.get("score", 0.0),
+                        score_ci_low=sym_row.get("score_ci_low"),
+                        score_ci_high=sym_row.get("score_ci_high"),
+                        stability=StabilityCategory(sym_row.get("stability", "UNKNOWN")),
+                        sample_size=int(sym_row.get("sample_size", 0)),
+                        leakage_status=LeakageStatus(sym_row.get("leakage_status", "UNKNOWN")),
+                        feature_set_id=sym_row.get("feature_set_id"),
+                        failed_model_families=sym_row.get("failed_model_families", []),
+                        model_status=sym_row.get("model_status", "UNKNOWN"),
+                        stability_metrics=sym_row.get("stability_metrics"),
+                        task_type=sym_row.get("task_type"),  # For task-aware thresholds
+                        metric_name=sym_row.get("metric_name")
+                    )
+                    # Classify stability from metrics if needed
+                    if sym_metrics.stability == StabilityCategory.UNKNOWN and sym_metrics.stability_metrics:
+                        sym_metrics.stability = self.classify_stability(sym_metrics.stability_metrics)
+                    
+                    # Route this (target, symbol)
+                    decision = self.route_target_symbol(target, symbol, cs_metrics, sym_metrics)
+                    
+                    target_plan["symbols"][symbol] = {
+                        "route": decision.route.value,
+                        "cs_state": decision.cs_state.value,
+                        "local_state": decision.local_state.value,
+                        "reason": decision.reasons
+                    }
+            
+            plan["targets"][target] = target_plan
+        
+        # Save plan
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        dump_formats = self.config.get("dump_plan_as", ["JSON"])
+        if "JSON" in dump_formats:
+            # SST: Sanitize plan data to normalize enums to strings before JSON serialization
+            from TRAINING.orchestration.utils.diff_telemetry import _sanitize_for_json
+            sanitized_plan = _sanitize_for_json(plan)
+            
+            # SST: Use write_atomic_json for atomic write with canonical serialization
+            from TRAINING.common.utils.file_utils import write_atomic_json
+            json_path = output_dir / "routing_plan.json"
+            write_atomic_json(json_path, sanitized_plan)
+            logger.info(f"✅ Saved routing plan JSON: {json_path}")
+        
+        if "YAML" in dump_formats:
+            yaml_path = output_dir / "routing_plan.yaml"
+            # DETERMINISM: Use canonical_yaml() for deterministic YAML output
+            from TRAINING.common.utils.determinism_serialization import write_canonical_yaml
+            write_canonical_yaml(yaml_path, plan)
+            logger.info(f"✅ Saved routing plan YAML: {yaml_path}")
+        
+        if "MARKDOWN" in dump_formats:
+            md_path = output_dir / "routing_plan.md"
+            self._write_markdown_report(plan, md_path)
+            logger.info(f"✅ Saved routing plan Markdown: {md_path}")
+        
+        return plan
+    
+    def _write_markdown_report(self, plan: Dict[str, Any], output_path: Path):
+        """Write human-readable Markdown report."""
+        with open(output_path, "w") as f:
+            f.write("# Training Routing Plan\n\n")
+            f.write(f"**Generated:** {plan['metadata']['generated_at']}\n")
+            f.write(f"**Git Commit:** {plan['metadata']['git_commit']}\n")
+            f.write(f"**Config Hash:** {plan['metadata']['config_hash']}\n\n")
+            
+            # Overall summary
+            # DETERMINISM: Use sorted_keys() instead of .values() for deterministic iteration
+            from TRAINING.common.utils.determinism_ordering import sorted_keys
+            total_targets = len(plan["targets"])
+            total_symbol_decisions = sum(
+                len(plan["targets"][k].get("symbols", {})) 
+                for k in sorted_keys(plan["targets"])
+            )
+            
+            route_counts_all = {}
+            for target_key in sorted_keys(plan["targets"]):
+                target_data = plan["targets"][target_key]
+                symbols = target_data.get("symbols", {})
+                for symbol_key in sorted_keys(symbols):
+                    sym_data = symbols[symbol_key]
+                    route = sym_data['route']
+                    route_counts_all[route] = route_counts_all.get(route, 0) + 1
+            
+            f.write("## Overall Summary\n\n")
+            f.write(f"- **Total Targets:** {total_targets}\n")
+            f.write(f"- **Total Symbol Decisions:** {total_symbol_decisions}\n\n")
+            f.write("**Route Distribution:**\n")
+            for route, count in sorted(route_counts_all.items(), key=lambda x: -x[1]):
+                f.write(f"- {route}: {count} symbols\n")
+            f.write("\n---\n\n")
+            
+            f.write("## Summary by Target\n\n")
+            
+            # DETERMINISM: Use sorted_items() for deterministic iteration
+            from TRAINING.common.utils.determinism_ordering import sorted_items
+            for target, target_data in sorted_items(plan["targets"]):
+                f.write(f"### {target}\n\n")
+                
+                cs_info = target_data["cross_sectional"]
+                f.write(f"**Cross-Sectional:** {cs_info['route']} ({cs_info['state']})\n")
+                f.write(f"- {cs_info['reason']}\n\n")
+                
+                symbols = target_data.get("symbols", {})
+                if symbols:
+                    f.write("**Symbol Routing:**\n\n")
+                    f.write("| Symbol | Route | CS State | Local State | Reasons |\n")
+                    f.write("|--------|-------|----------|-------------|----------|\n")
+                    
+                    # DETERMINISM: Use sorted_items() for deterministic iteration
+                    for symbol, sym_data in sorted_items(symbols):
+                        reasons_str = "; ".join(sym_data.get('reason', []))[:100]  # Truncate long reasons
+                        f.write(f"| {symbol} | {sym_data['route']} | {sym_data['cs_state']} | {sym_data['local_state']} | {reasons_str} |\n")
+                    
+                    f.write("\n")
+                    
+                    # Count routes
+                    # DETERMINISM: Use sorted_keys() instead of .values() for deterministic iteration
+                    from TRAINING.common.utils.determinism_ordering import sorted_keys
+                    route_counts = {}
+                    for symbol_key in sorted_keys(symbols):
+                        sym_data = symbols[symbol_key]
+                        route = sym_data['route']
+                        route_counts[route] = route_counts.get(route, 0) + 1
+                    
+                    f.write("**Route Distribution:**\n")
+                    for route, count in sorted(route_counts.items()):
+                        f.write(f"- {route}: {count} symbols\n")
+                    f.write("\n")
+                
+                f.write("\n")

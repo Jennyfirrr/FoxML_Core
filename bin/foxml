@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# FoxML Dashboard Launcher
+# ========================
+#
+# Single command to launch the dashboard.
+# Auto-starts IPC bridge if not running.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+DASHBOARD_DIR="$PROJECT_ROOT/DASHBOARD"
+BRIDGE_PORT=8765
+
+# Check if IPC bridge is running
+check_bridge() {
+    if curl -s "http://127.0.0.1:$BRIDGE_PORT/health" > /dev/null 2>&1; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Start IPC bridge in background
+start_bridge() {
+    echo "Starting IPC bridge..."
+    cd "$DASHBOARD_DIR/bridge"
+    
+    # Check if virtual environment exists
+    if [ ! -d "venv" ]; then
+        python3 -m venv venv
+        source venv/bin/activate
+        pip install -r requirements.txt
+    else
+        source venv/bin/activate
+    fi
+    
+    # Start bridge in background, redirecting output to log file
+    LOG_DIR="$PROJECT_ROOT/state/logs"
+    mkdir -p "$LOG_DIR"
+    LOG_FILE="$LOG_DIR/bridge.log"
+    
+    # Start bridge, redirecting stdout/stderr to log file
+    python server.py >> "$LOG_FILE" 2>&1 &
+    BRIDGE_PID=$!
+    echo "IPC bridge started (PID: $BRIDGE_PID, logs: $LOG_FILE)"
+    
+    # Wait for bridge to be ready
+    echo "Waiting for bridge to be ready..."
+    for i in {1..10}; do
+        if check_bridge; then
+            echo "Bridge is ready!"
+            return 0
+        fi
+        sleep 1
+    done
+    
+    echo "Warning: Bridge may not be ready yet"
+    return 1
+}
+
+# Main
+main() {
+    # Check if bridge is running
+    if ! check_bridge; then
+        start_bridge
+    else
+        echo "IPC bridge is already running"
+    fi
+    
+    # Launch Rust dashboard
+    # Run from project root so RESULTS/ is accessible
+    cd "$PROJECT_ROOT"
+    
+    # Check if Rust project is built
+    if [ ! -f "$DASHBOARD_DIR/dashboard/target/release/foxml-dashboard" ]; then
+        echo "Building dashboard..."
+        cd "$DASHBOARD_DIR/dashboard"
+        cargo build --release
+        cd "$PROJECT_ROOT"
+    fi
+    
+    # Run dashboard from project root
+    "$DASHBOARD_DIR/dashboard/target/release/foxml-dashboard" "$@"
+}
+
+main "$@"

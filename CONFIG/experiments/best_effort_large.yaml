@@ -1,0 +1,111 @@
+# ============================================================================
+# BEST EFFORT LARGE - Extended Sample Size Training
+# ============================================================================
+# Extended training with larger sample sizes (~90k per symbol).
+# GPU enabled but memory-conscious for 10GB VRAM.
+#
+# Memory estimate (128GB RAM):
+# - 90k rows x 728 symbols x 100 cols x 4 bytes (float32) = ~26GB stable
+# - With 2x build spike = ~52GB peak (comfortable)
+#
+# Usage:
+#   bin/run_deterministic.sh python TRAINING/orchestration/intelligent_trainer.py \
+#     --experiment-config best_effort_large \
+#     --output-dir TRAINING/results/large_run
+# ============================================================================
+
+experiment:
+  name: best_effort_large
+  description: "Extended sample sizes with GPU support (10GB VRAM safe)"
+
+# ============================================================================
+# DATA CONFIGURATION - Extended samples
+# ============================================================================
+data:
+  data_dir: data/data_labeled/interval=5m
+  interval: 5m
+  # Extended sample sizes: ~90k rows per symbol
+  # 90k rows = ~4.5 years of 5m data per symbol
+  max_samples_per_symbol: 90000
+  max_rows_per_symbol: 90000
+  max_rows_train: 65000000  # 65M total rows max
+  max_cs_samples: 90000
+  min_cs: 10
+
+# ============================================================================
+# TARGET SELECTION
+# ============================================================================
+intelligent_training:
+  auto_targets: true
+  top_n_targets: 999
+  max_targets_to_evaluate: 999
+
+  exclude_target_patterns:
+    - "_raw$"
+    - "^debug_"
+
+  auto_features: true
+  top_m_features: 150
+
+  strategy: default
+  run_leakage_diagnostics: true
+
+  # Lazy loading for memory efficiency
+  lazy_loading:
+    enabled: true
+    verify_memory_release: false
+    log_memory_usage: true
+    fail_on_fallback: true
+    probe_features: true
+    probe_top_n: 100
+    probe_rows: 10000
+    # Use float32 for 50% memory reduction
+    use_float32: true
+
+# ============================================================================
+# TARGET ROUTING - CROSS-SECTIONAL ONLY
+# ============================================================================
+target_routing:
+  max_symbols_for_ss: 0
+  ss_fallback_route: CROSS_SECTIONAL
+
+# ============================================================================
+# MODEL TRAINING - GPU enabled where beneficial
+# ============================================================================
+training:
+  model_families:
+    - lightgbm
+    - xgboost
+    - catboost
+    - ridge
+    - elasticnet
+    - random_forest
+
+  # GPU settings (10GB VRAM safe)
+  gpu:
+    enabled: true
+    # For 10GB VRAM, use conservative settings:
+    # - XGBoost/LightGBM: hist method with smaller bins
+    # - CatBoost: task_type=GPU with grow_policy=Lossguide
+    device: cuda
+    max_bin: 128  # Reduce from default 256 for VRAM savings
+
+feature_selection:
+  model_families:
+    - lightgbm
+    - xgboost
+    - random_forest
+
+# ============================================================================
+# PARALLEL EXECUTION
+# ============================================================================
+multi_target:
+  parallel_targets: true
+  skip_on_error: true
+  save_summary: true
+
+threading:
+  parallel:
+    enabled: true
+    # Reduce parallel jobs when using GPU to avoid VRAM contention
+    max_workers: 2

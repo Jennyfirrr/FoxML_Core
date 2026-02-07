@@ -1,0 +1,221 @@
+# ============================================================================
+# EXPERIMENT CONFIG TEMPLATE
+# ============================================================================
+# This is a SELF-CONTAINED config file - everything you need is here!
+# Copy this file and rename it to create a new experiment config.
+# Example: cp _template.yaml my_experiment.yaml
+#
+# IMPORTANT: Experiment configs OVERRIDE all other configs (highest priority)
+# You don't need to edit any other files - just this one!
+#
+# Uncomment sections as needed. Commented = use defaults from base configs.
+# ============================================================================
+
+experiment:
+  name: my_experiment  # Change this to your experiment name
+  description: "Description of your experiment"
+
+# ============================================================================
+# DATA CONFIGURATION
+# ============================================================================
+data:
+  data_dir: data/data_labeled/interval=5m
+
+  # Option 1: Explicit symbols list
+  symbols: [AAPL, MSFT, GOOGL, TSLA, NVDA]
+
+  # Option 2: Auto-discover symbols from data_dir
+  # symbols: []  # Empty = auto-discover all symbols
+  # symbol_batch_size: 15  # Optional: limit to N symbols (random sample)
+
+  interval: 5m
+
+  # Data limits (adjust for memory/speed tradeoff)
+  max_samples_per_symbol: 50000
+  max_rows_per_symbol: 50000
+  max_rows_train: 100000
+  max_cs_samples: 10000
+  min_cs: 10
+
+# ============================================================================
+# INTELLIGENT TRAINING
+# ============================================================================
+intelligent_training:
+  # Target selection
+  auto_targets: true
+  top_n_targets: 10
+  max_targets_to_evaluate: 50
+  # manual_targets: [fwd_ret_60m]  # When auto_targets: false
+
+  # Exclude patterns (substring match)
+  exclude_target_patterns:
+    - "_raw$"
+    - "^debug_"
+    # - "will_peak"
+    # - "will_valley"
+
+  # Feature selection
+  auto_features: true
+  top_m_features: 50
+  # manual_features: [feature1, feature2]  # When auto_features: false
+
+  # Training
+  strategy: single_task  # single_task | multi_task | cascade
+  run_leakage_diagnostics: false
+
+  # ---------------------------------------------------------------------------
+  # LAZY LOADING (memory optimization)
+  # ---------------------------------------------------------------------------
+  # lazy_loading:
+  #   enabled: true
+  #   verify_memory_release: false
+  #   log_memory_usage: true
+  #   fail_on_fallback: false  # true = fail if lazy loading unavailable
+  #   # Feature probing: single-symbol importance filtering
+  #   probe_features: true
+  #   probe_top_n: 100
+  #   probe_rows: 10000
+
+# ============================================================================
+# TARGET ROUTING
+# ============================================================================
+# target_routing:
+#   max_symbols_for_ss: 0  # 0 = force cross-sectional only
+#   ss_fallback_route: CROSS_SECTIONAL  # CROSS_SECTIONAL | SYMBOL_SPECIFIC
+
+# ============================================================================
+# TARGET RANKING OVERRIDES
+# ============================================================================
+# target_ranking_overrides:
+#   auto_rerun:
+#     enabled: true
+#     max_reruns: 3
+#     rerun_on_perfect_train_acc: true
+#     rerun_on_high_auc_only: false
+
+# ============================================================================
+# MODEL FAMILIES
+# ============================================================================
+# Feature selection families (comprehensive)
+# feature_selection:
+#   model_families:
+#     - lightgbm
+#     - xgboost
+#     - random_forest
+#     - catboost
+#     - neural_network
+#     - lasso
+#     - mutual_information
+#     - univariate_selection
+
+# Training families (fast CPU models recommended)
+# training:
+#   model_families:
+#     - lightgbm
+#     - xgboost
+#     - ridge
+#     - elasticnet
+#     - random_forest
+#     - catboost
+#     # GPU families (slower):
+#     # - mlp
+#     # - neural_network
+
+# ============================================================================
+# PARALLEL EXECUTION
+# ============================================================================
+# multi_target:
+#   parallel_targets: true
+#   skip_on_error: true
+#   save_summary: true
+
+# multi_model_feature_selection:
+#   parallel_symbols: true
+
+# threading:
+#   parallel:
+#     enabled: true
+#     max_workers_process: null  # null = auto-detect
+#     max_workers_thread: null
+
+# ============================================================================
+# DETERMINISM (disable parallelism for reproducibility)
+# ============================================================================
+# For bitwise reproducible runs, uncomment this section:
+# multi_target:
+#   parallel_targets: false
+# multi_model_feature_selection:
+#   parallel_symbols: false
+# threading:
+#   parallel:
+#     enabled: false
+#     max_workers_process: 1
+#     max_workers_thread: 1
+
+# ============================================================================
+# SAFETY & LEAKAGE DETECTION
+# ============================================================================
+# safety:
+#   leakage_detection:
+#     policy: drop  # strict | drop | warn
+#     over_budget_action: drop  # drop | hard_stop | warn
+#     lookback_budget:
+#       mode: auto  # auto | fixed
+#       auto_rule: k_times_horizon
+#       k: 10.0
+#       min_minutes: 240.0
+#       max_minutes: 28800.0
+#       # For fixed mode:
+#       # mode: fixed
+#       # fixed_minutes: 7200.0
+
+# ============================================================================
+# DECISIONS (auto-config application)
+# ============================================================================
+# decisions:
+#   apply_mode: "off"  # off | dry_run | apply
+#   min_level_to_apply: 2
+#   use_bayesian: false
+#   bayesian:
+#     min_runs_for_learning: 5
+#     p_improve_threshold: 0.8
+#     min_expected_gain: 0.01
+#     reward_metric: "cs_auc"
+#     recency_decay: 0.95
+
+# ============================================================================
+# QUICK REFERENCE - COMMON PRESETS
+# ============================================================================
+#
+# QUICK E2E TEST (~2-5 min):
+#   data:
+#     symbols: [AAPL, MSFT, GOOGL, TSLA, NVDA]
+#     max_samples_per_symbol: 2000
+#   intelligent_training:
+#     top_n_targets: 3
+#     max_targets_to_evaluate: 5
+#     top_m_features: 30
+#     lazy_loading:
+#       enabled: true
+#       probe_features: true
+#   training:
+#     model_families: [lightgbm, ridge]
+#
+# PRODUCTION BASELINE:
+#   data:
+#     symbols: []  # all symbols
+#     max_samples_per_symbol: 75000
+#   intelligent_training:
+#     top_n_targets: 999
+#     max_targets_to_evaluate: 999
+#     top_m_features: 150
+#     lazy_loading:
+#       enabled: true
+#       fail_on_fallback: true
+#   target_routing:
+#     max_symbols_for_ss: 0
+#   training:
+#     model_families: [lightgbm, xgboost, catboost, ridge, elasticnet, random_forest]
+#
+# DETERMINISM TEST:
+#   Add the determinism section above + single worker threading

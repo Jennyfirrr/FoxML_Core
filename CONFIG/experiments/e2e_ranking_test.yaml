@@ -1,0 +1,167 @@
+# E2E Ranking Test Configuration
+# Quick test configuration for end-to-end ranking pipeline
+
+experiment:
+  name: e2e_ranking_test
+  description: "E2E test: 5 symbols, 23 targets, 50 features, reduced data limits"
+
+data:
+  data_dir: data/data_labeled/interval=5m
+  symbols: [AAPL, MSFT, GOOGL, TSLA, NVDA]
+  interval: 5m
+  max_samples_per_symbol: 1000 # Reduced for faster testing
+  max_rows_per_symbol: 1000 # Reduced for faster testing
+  max_rows_train: 5000 # Reduced for faster testing
+  max_cs_samples: 1000 # Max cross-sectional samples per timestamp (reduced for faster testing)
+  min_cs: 3 # Reduced for faster testing
+
+# ============================================================================
+# TARGET RANKING CONFIGURATION (Per-Experiment Control)
+# ============================================================================
+target_ranking:
+  # Enable SYMBOL_SPECIFIC view evaluation (evaluates each symbol separately)
+  # If false, only CROSS_SECTIONAL view will be evaluated
+  enable_symbol_specific: true
+
+  # Enable LOSO (Leave-One-Symbol-Out) evaluation (optional, slower)
+  # LOSO evaluates each symbol by training on all other symbols
+  enable_loso: false
+
+# ============================================================================
+# LOOK-AHEAD BIAS FIXES CONFIGURATION (Per-Experiment Control)
+# ============================================================================
+# These flags control look-ahead bias fixes to prevent data leakage
+# All flags default to false for backward compatibility
+# Enable gradually to test impact on model performance
+safety:
+  leakage_detection:
+    lookahead_bias_fixes:
+      # Fix #1: Exclude current bar from rolling windows
+      # When enabled, adds .shift(1) before rolling operations (rolling_mean, rolling_std, etc.)
+      # This prevents features from including the current bar's price, which leaks current information
+      # Default: false (maintains current behavior for backward compatibility)
+      exclude_current_bar_from_rolling: false
+
+      # Fix #2: Normalize inside CV loops (fit on train, transform test)
+      # When enabled, moves scaler/imputer fitting inside CV loops
+      # This prevents leaking future statistics into training (global normalization leak)
+      # Default: false (maintains current behavior for backward compatibility)
+      # NOTE: This fix requires refactoring call sites to pass train/test separately
+      normalize_inside_cv: false
+
+      # Fix #3: Verify pct_change excludes current bar
+      # When enabled, uses explicit shift for pct_change calculations to ensure current bar is excluded
+      # Default: false (maintains current behavior for backward compatibility)
+      # NOTE: Fix #1 already handles this via shifted columns, but this flag provides explicit verification
+      verify_pct_change_shift: false
+
+      # Migration mode: controls how fixes are applied and validated
+      # - "off": All fixes disabled (current behavior, default)
+      # - "test": Enable fixes but log differences for comparison
+      # - "warn": Enable fixes and warn on discrepancies
+      # - "enforce": Enable fixes and fail on discrepancies (strict mode)
+      migration_mode: "off" # Start with "off", then "test" to compare, then "enforce" when validated
+
+# Intelligent training settings
+intelligent_training:
+  auto_targets: true
+  top_n_targets: 5
+  max_targets_to_evaluate: 10 # Limit evaluation for faster testing
+  auto_features: true
+  top_m_features: 50
+  strategy: single_task
+  run_leakage_diagnostics: false
+  # Exclude target patterns (targets matching any pattern will be excluded)
+  # Patterns are matched as substrings (e.g., "will_peak" matches "y_will_peak_60m_0.8")
+  exclude_target_patterns:
+    - "will_peak"
+    - "will_valley"
+
+# Feature selection model families
+# Note: mutual_information and univariate_selection are feature selectors only (not trainers)
+feature_selection:
+  model_families:
+    - lightgbm
+    - xgboost
+    - neural_network
+    # Note: random_forest, catboost, lasso are not implemented as trainers (only feature selectors)
+    # mutual_information and univariate_selection are feature selectors only
+
+# Training model families
+# Only include actual trainer families (mutual_information, univariate_selection, random_forest, catboost, lasso are NOT trainers)
+# Available trainers: lightgbm, xgboost, mlp, neural_network, ensemble, quantile_lightgbm, ngboost, reward_based, etc.
+# GPU families: mlp, vae, gan, multitask (TensorFlow), cnn1d, lstm, transformer (PyTorch/TensorFlow)
+training:
+  model_families:
+    # CPU families (fast, reliable)
+    - lightgbm
+    - xgboost
+    - ensemble
+    - quantile_lightgbm
+    # GPU families (TensorFlow) - requires TensorFlow
+    - mlp # MLP/Neural Network (GPU-enabled)
+    # GPU families (PyTorch/TensorFlow) - requires TensorFlow or PyTorch
+    # Note: Uncomment these for comprehensive GPU testing (requires GPU setup):
+    # - cnn1d
+    # - lstm
+    # - transformer
+    # Additional CPU families (experimental/advanced):
+    # - ngboost
+    # - reward_based
+    # - gmm_regime
+    # - change_point
+    # Note: random_forest, catboost, lasso, mutual_information, univariate_selection are NOT trainers
+    # They are feature selectors only and will be automatically skipped during training
+
+# Decision configuration (SST: all values config-driven)
+decisions:
+  # Application mode: "off" (assist mode only), "dry_run" (show patch), "apply" (auto-apply)
+  apply_mode: "dry_run" # Test with dry_run first
+
+  # Minimum decision level to apply (0=no action, 1=warning, 2=recommendation, 3=action)
+  min_level_to_apply: 2
+
+  # Bayesian patch policy (Thompson sampling over discrete patch templates)
+  use_bayesian: true # Enable for testing
+  bayesian:
+    # Minimum runs before recommending patches (reduced for testing)
+    min_runs_for_learning: 3 # Lower threshold for faster testing
+    # Minimum P(improve) to auto-apply
+    p_improve_threshold: 0.8
+    # Minimum expected gain to recommend
+    min_expected_gain: 0.01
+    # Reward metric to optimize
+    reward_metric: "cs_auc"
+    # Recency decay factor (higher = more weight on recent runs)
+    recency_decay: 0.95
+    # Decision level thresholds (all config-driven, no hardcoded values)
+    level_3_threshold: 0.8 # P(improve) for auto-apply (level 3)
+    level_3_gain: 0.01 # Expected gain for auto-apply (level 3)
+    level_2_threshold: 0.6 # P(improve) for recommend (level 2)
+    level_2_gain: 0.005 # Expected gain for recommend (level 2)
+    level_1_threshold: 0.4 # P(improve) for warning (level 1)
+    # Baseline window size (number of recent runs for baseline computation)
+    baseline_window: 10
+
+# Parallel execution configuration (for faster testing)
+# These settings override defaults in target_configs.yaml and multi_model_feature_selection.yaml
+multi_target:
+  parallel_targets: true # Enable parallel target evaluation (ProcessPoolExecutor)
+  skip_on_error: true # Continue to next target if one fails
+  save_summary: true # Save multi_target_summary.json
+
+# Feature selection parallel execution
+multi_model_feature_selection:
+  parallel_symbols: true # Enable parallel symbol processing (ProcessPoolExecutor)
+
+# Threading/parallel worker configuration
+# These override threading_config.yaml settings
+threading:
+  parallel:
+    # Max workers for ProcessPoolExecutor (CPU-bound tasks like target evaluation)
+    # Set to 4 for testing to balance speed vs system load
+    max_workers_process: 4 # Conservative for testing (null = auto-detect)
+    # Max workers for ThreadPoolExecutor (I/O-bound tasks)
+    max_workers_thread: 4 # Conservative for testing (null = auto-detect)
+    # Master switch for parallel execution
+    enabled: true

@@ -1,0 +1,639 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later OR Commercial
+# Copyright (c) 2025-2026 Fox ML Infrastructure LLC
+
+"""
+Target Predictability Ranking
+
+Uses multiple model families to evaluate which of your 63 targets are most predictable.
+This helps prioritize compute: train models on high-predictability targets first.
+
+Methodology:
+1. For each target, train multiple model families on sample data
+2. Calculate predictability scores:
+   - Model R² scores (cross-validated)
+   - Feature importance magnitude (mean absolute SHAP/importance)
+   - Consistency across models (low std = high confidence)
+3. Rank targets by composite predictability score
+4. Output ranked list with recommendations
+
+Usage:
+  # Rank all enabled targets
+  python SCRIPTS/rank_target_predictability.py
+  
+  # Test on specific symbols first
+  python SCRIPTS/rank_target_predictability.py --symbols AAPL,MSFT,GOOGL
+  
+  # Rank specific targets
+  python SCRIPTS/rank_target_predictability.py --targets peak_60m,valley_60m,swing_high_15m
+"""
+
+
+import argparse
+import logging
+import sys
+from pathlib import Path
+from typing import List, Dict, Any, Tuple, Optional, Union, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from TRAINING.ranking.utils.registry_coverage import CoverageBreakdown
+import pandas as pd
+import numpy as np
+from dataclasses import dataclass
+import yaml
+import json
+from collections import defaultdict
+import warnings
+
+# Add project root FIRST (before any scripts.* imports)
+# TRAINING/ranking/rank_target_predictability.py -> parents[2] = repo root
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+# Add CONFIG directory to path for centralized config loading
+_CONFIG_DIR = _REPO_ROOT / "CONFIG"
+if str(_CONFIG_DIR) not in sys.path:
+    sys.path.insert(0, str(_CONFIG_DIR))
+
+# Try to import config loader
+_CONFIG_AVAILABLE = False
+try:
+    from config_loader import get_cfg, get_safety_config
+    _CONFIG_AVAILABLE = True
+except ImportError:
+    pass  # Logger not yet initialized, will be set up below
+
+# Import logging config utilities
+try:
+    from CONFIG.logging_config_utils import get_module_logging_config, get_backend_logging_config
+    _LOGGING_CONFIG_AVAILABLE = True
+except ImportError:
+    _LOGGING_CONFIG_AVAILABLE = False
+    # Fallback: create a simple config-like object
+    class _DummyLoggingConfig:
+        def __init__(self):
+            self.gpu_detail = False
+            self.cv_detail = False
+            self.edu_hints = False
+            self.detail = False
+
+# Import checkpoint utility (after path is set)
+from TRAINING.orchestration.utils.checkpoint import CheckpointManager
+
+# Import unified task type system
+from TRAINING.common.utils.task_types import (
+    TaskType, TargetConfig, ModelConfig, 
+    is_compatible, create_model_configs_from_yaml
+)
+from TRAINING.common.utils.task_metrics import evaluate_by_task, compute_composite_score
+from TRAINING.ranking.utils.target_validation import validate_target, check_cv_compatibility
+
+# Suppress expected warnings (harmless)
+warnings.filterwarnings('ignore', message='X does not have valid feature names')
+warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
+warnings.filterwarnings('ignore', category=RuntimeWarning, module='sklearn')
+warnings.filterwarnings('ignore', message='invalid value encountered in divide')
+warnings.filterwarnings('ignore', message='invalid value encountered in true_divide')
+
+# Setup logging with journald support
+from TRAINING.orchestration.utils.logging_setup import setup_logging
+logger = setup_logging(
+    script_name="rank_target_predictability",
+    level=logging.INFO,
+    use_journald=True
+)
+
+# Composite score calculation
+
+from TRAINING.ranking.predictability.scoring import TargetPredictabilityScore
+
+
+def validate_slice(
+    y_slice: np.ndarray,
+    y_pred_slice: Optional[np.ndarray] = None,
+    task_type: TaskType = TaskType.REGRESSION,
+    min_samples: int = 10,
+) -> Tuple[bool, Optional[str]]:
+    """
+    Validate a single slice (timestamp or symbol) for metric computation.
+    
+    Foundation function for Phase 3.1.1 per-slice tracking. Currently used
+    as a reference implementation; full per-slice tracking requires architectural
+    changes to compute metrics per-slice.
+    
+    Args:
+        y_slice: True labels for this slice
+        y_pred_slice: Optional predictions for this slice (for NaN checking)
+        task_type: Task type (affects validation rules)
+        min_samples: Minimum samples required per slice
+    
+    Returns:
+        (is_valid, reason) where:
+        - is_valid: True if slice is valid for metric computation
+        - reason: None if valid, or error code if invalid:
+            - "too_few_samples": n < min_samples
+            - "nan_label": NaNs in labels
+            - "nan_pred": NaNs in predictions (if provided)
+            - "single_class": Classification with only one class
+            - "constant_vector": Regression with constant values (spearman undefined)
+    """
+    # Common checks: NaNs, too few samples
+    if len(y_slice) < min_samples:
+        return False, "too_few_samples"
+    
+    if np.any(np.isnan(y_slice)):
+        return False, "nan_label"
+    
+    if y_pred_slice is not None and np.any(np.isnan(y_pred_slice)):
+        return False, "nan_pred"
+    
+    # Task-specific checks
+    if task_type == TaskType.REGRESSION:
+        # Regression: check for constant vector (spearman undefined)
+        if len(y_slice) < 3:
+            return False, "too_few_samples"  # Need at least 3 for spearman
+        if np.std(y_slice) == 0.0:
+            return False, "constant_vector"
+    elif task_type in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION):
+        # Classification: check for single class
+        unique_labels = np.unique(y_slice)
+        if len(unique_labels) < 2:
+            return False, "single_class"
+    
+    return True, None
+
+
+def calculate_composite_score(
+    auc: float,
+    std_score: float,
+    mean_importance: float,
+    n_models: int,
+    task_type: TaskType = TaskType.REGRESSION
+) -> Tuple[float, str, str]:
+    """
+    Calculate composite predictability score with definition and version
+    
+    Components:
+    - Mean score: Higher is better (R² for regression, ROC-AUC/Accuracy for classification)
+    - Consistency: Lower std is better
+    - Importance magnitude: Higher is better
+    - Model agreement: More models = more confidence
+    
+    Returns:
+        Tuple of (composite_score, definition, version)
+    """
+    
+    # Normalize components based on task type
+    if task_type == TaskType.REGRESSION:
+        # R² can be negative, so normalize to 0-1 range
+        score_component = max(0, auc)  # Clamp negative R² to 0
+        consistency_component = 1.0 / (1.0 + std_score)
+        
+        # R²-weighted importance
+        if auc > 0:
+            importance_component = mean_importance * (1.0 + auc)
+        else:
+            penalty = abs(auc) * 0.67
+            importance_component = mean_importance * max(0.5, 1.0 - penalty)
+        
+        definition = "0.50 * score_component + 0.25 * consistency_component + 0.25 * importance_component * (1 + model_bonus)"
+    else:
+        # Classification: ROC-AUC and Accuracy are already 0-1
+        score_component = auc  # Already 0-1
+        consistency_component = 1.0 / (1.0 + std_score)
+        
+        # Score-weighted importance (similar logic but for 0-1 scores)
+        importance_component = mean_importance * (1.0 + auc)
+        
+        definition = "0.50 * score_component + 0.25 * consistency_component + 0.25 * importance_component * (1 + model_bonus)"
+    
+    # Weighted average
+    composite = (
+        0.50 * score_component +        # 50% weight on score
+        0.25 * consistency_component + # 25% on consistency
+        0.25 * importance_component    # 25% on score-weighted importance
+    )
+    
+    # Bonus for more models (up to 10% boost)
+    model_bonus = min(0.1, n_models * 0.02)
+    composite = composite * (1.0 + model_bonus)
+    
+    version = "v1"
+    
+    return composite, definition, version
+
+
+def calculate_composite_score_tstat(
+    primary_mean: float,  # Already centered: IC for regression, AUC-excess for classification
+    primary_std: float,
+    n_slices_valid: int,  # Number of valid slices (renamed from n_cs_valid for clarity)
+    n_slices_total: int,  # Total slices before filtering (renamed from n_cs_total)
+    task_type: TaskType = TaskType.REGRESSION,
+    scoring_config: Optional[Dict[str, Any]] = None,
+    registry_coverage_rate: Optional[float] = None,  # DEPRECATED: Use coverage_breakdown instead
+    coverage_breakdown: Optional['CoverageBreakdown'] = None,  # NEW: CoverageBreakdown from canonical function (SST)
+    run_intent: Optional[str] = None,  # NEW: "smoke", "eval", or None (defaults to "eval")
+    view: Optional[str] = None,  # NEW: View for view-aware checks (CROSS_SECTIONAL or SYMBOL_SPECIFIC)
+    coverage_computation_error: bool = False,  # NEW: True if coverage computation failed (error), False if missing (genuine lack)
+) -> Tuple[float, str, str, Dict[str, float], str, Dict[str, Any]]:  # NEW: Added eligibility dict
+    """
+    Calculate composite score using t-stat based skill normalization (Phase 3.1).
+    
+    Phase 3.1 fixes:
+    - SE-based stability (not std-based) for cross-family comparability
+    - Skill-gated composite (skill * quality, not additive) to prevent no-skill ranking high
+    - Classification centering (primary_mean must be AUC-excess, not raw AUC)
+    - Deterministic guards (n_valid < 2, se_floor, tcap)
+    
+    This provides a bounded [0,1] composite score that's comparable across
+    task types and aggregation methods, using t-stat as the universal
+    "signal above null" measure.
+    
+    Args:
+        primary_mean: Mean of primary metric, ALREADY CENTERED:
+            - Regression: spearman_ic (null baseline ≈ 0)
+            - Classification: auc_excess = auc - 0.5 (null baseline ≈ 0)
+        primary_std: Std of primary metric
+        n_slices_valid: Number of valid slices used
+        n_slices_total: Total slices before filtering
+        task_type: Task type for se_ref selection
+        scoring_config: Optional override for scoring params (loaded from yaml if None)
+    
+    Returns:
+        Tuple of:
+        - composite_score_01: Bounded [0,1] composite score
+        - definition: Formula string
+        - version: Scoring schema version
+        - components: Dict of individual component values (for debugging/audit) - strictly numeric
+        - scoring_signature: SHA256 hash of scoring params for determinism
+        - eligibility: Dict with valid_for_ranking, invalid_reasons, run_intent (separate from numeric components)
+    """
+    import numpy as np
+    import hashlib
+    import json
+    
+    # Load scoring config from yaml if not provided
+    if scoring_config is None:
+        try:
+            from TRAINING.ranking.predictability.metrics_schema import _load_metrics_schema
+            schema = _load_metrics_schema()
+            scoring_config = schema.get("scoring", {})
+        except Exception as e:
+            import logging
+            fallback_logger = logging.getLogger(__name__)  # Use different name to avoid shadowing module logger
+            fallback_logger.warning(f"Failed to load scoring config from metrics_schema.yaml: {e}, using defaults")
+            scoring_config = {}
+    
+    # Extract params with defaults (ensure numeric types)
+    skill_squash_k = float(scoring_config.get("skill_squash_k", 3.0))
+    tcap = float(scoring_config.get("tcap", 12.0))
+    se_floor = float(scoring_config.get("se_floor", 1e-6))  # Ensure float, not string
+    default_se_ref = float(scoring_config.get("se_ref", 0.02))
+    se_ref_by_task = scoring_config.get("se_ref_by_task", {})
+    weights = scoring_config.get("weights", {"w_cov": 0.3, "w_stab": 0.7})
+    model_bonus_cfg = scoring_config.get("model_bonus", {"enabled": True, "max_bonus": 0.10, "per_model": 0.02})
+    version = scoring_config.get("version", "1.2")  # Bump to 1.2 for eligibility gates
+    composite_form = scoring_config.get("composite_form", "skill_times_quality_v1")
+    
+    # Extract eligibility params from scoring_config (SST: all from config, no hardcoded defaults)
+    eligibility_config = scoring_config.get("eligibility", {})
+    # FIX ISSUE-019: Add error handling for float conversion
+    # Backwards compatibility: read new key first, fallback to old key
+    try:
+        if "registry_coverage_warn_threshold" in eligibility_config:
+            base_min_registry_coverage = float(eligibility_config.get("registry_coverage_warn_threshold", 0.95))
+        elif "min_registry_coverage" in eligibility_config:
+            # Deprecated: old key name
+            import warnings
+            warnings.warn(
+                "Config key 'min_registry_coverage' is deprecated. Use 'registry_coverage_warn_threshold' instead.",
+                DeprecationWarning,
+                stacklevel=2
+            )
+            base_min_registry_coverage = float(eligibility_config.get("min_registry_coverage", 0.95))
+        else:
+            base_min_registry_coverage = 0.95
+    except (ValueError, TypeError) as e:
+        logger.warning(f"Invalid registry_coverage_warn_threshold in config: {eligibility_config.get('registry_coverage_warn_threshold') or eligibility_config.get('min_registry_coverage')}, using default 0.95. Error: {e}")
+        base_min_registry_coverage = 0.95
+    
+    require_registry_coverage_in_eval = bool(eligibility_config.get("require_registry_coverage_in_eval", True))
+    enforce_registry_coverage_gate = bool(eligibility_config.get("enforce_registry_coverage_gate", False))
+    min_n_for_ranking = int(eligibility_config.get("min_n_for_ranking", 20))
+    min_n_for_full_quality = int(eligibility_config.get("min_n_for_full_quality", 30))
+    
+    # FIX ISSUE-016: Initialize min_registry_coverage BEFORE try block to prevent UnboundLocalError
+    # This ensures the variable is always defined, even when dev_mode is False and no exception occurs
+    min_registry_coverage = base_min_registry_coverage
+    
+    # CRITICAL: Relax registry coverage threshold in dev_mode (compute effective threshold once)
+    dev_mode = False
+    try:
+        from CONFIG.dev_mode import get_dev_mode, get_dev_mode_eligibility_overrides
+        dev_mode = get_dev_mode()
+        if dev_mode:
+            # Get dev_mode overrides from config
+            dev_mode_overrides = get_dev_mode_eligibility_overrides(eligibility_config)
+            # Use dev_mode override if provided (support both key names for compatibility)
+            if "dev_mode_min_registry_coverage" in dev_mode_overrides:
+                # FIX ISSUE-019: Add error handling for float conversion
+                try:
+                    min_registry_coverage = float(dev_mode_overrides["dev_mode_min_registry_coverage"])
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"Invalid dev_mode_min_registry_coverage in overrides: {dev_mode_overrides.get('dev_mode_min_registry_coverage')}, using base threshold. Error: {e}")
+                    min_registry_coverage = base_min_registry_coverage
+            elif "min_registry_coverage" in dev_mode_overrides:
+                # Backward compatibility: accept min_registry_coverage as alias
+                # FIX ISSUE-019: Add error handling for float conversion
+                try:
+                    min_registry_coverage = float(dev_mode_overrides["min_registry_coverage"])
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"Invalid min_registry_coverage in overrides: {dev_mode_overrides.get('min_registry_coverage')}, using base threshold. Error: {e}")
+                    min_registry_coverage = base_min_registry_coverage
+            else:
+                # Default relaxation: apply delta to base threshold
+                # FIX ISSUE-021: Ensure dev_mode never makes threshold stricter than base
+                # If base < 0.50, don't apply delta (would make it stricter)
+                if base_min_registry_coverage < 0.50:
+                    min_registry_coverage = base_min_registry_coverage
+                else:
+                    # delta = -0.15 (relax by 15 percentage points), clamped to minimum 0.50
+                    min_registry_coverage = max(0.50, base_min_registry_coverage - 0.15)
+    except Exception as e:
+        # FIX ISSUE-008: Log exception instead of silently swallowing
+        logger.warning(f"Failed to load dev_mode overrides: {e}, using base threshold")
+        # Fallback to base threshold if dev_mode helper unavailable (already initialized above)
+        min_registry_coverage = base_min_registry_coverage
+        dev_mode = False
+    
+    # Get task-specific se_ref
+    task_key = {
+        TaskType.REGRESSION: "regression",
+        TaskType.BINARY_CLASSIFICATION: "binary_classification",
+        TaskType.MULTICLASS_CLASSIFICATION: "multiclass_classification",
+    }.get(task_type, "regression")
+    se_ref = se_ref_by_task.get(task_key, default_se_ref)
+    
+    # Compute scoring_signature (hash of all effective params for determinism)
+    scoring_params = {
+        "k": skill_squash_k,
+        "tcap": tcap,
+        "se_floor": se_floor,
+        "se_ref": se_ref,
+        "weights": weights,
+        "composite_form": composite_form,
+        "model_bonus": model_bonus_cfg,
+        "version": version,
+    }
+    
+    # Include eligibility params in scoring signature for determinism (SST: canonical JSON with sorted keys)
+    # Note: Do NOT include observed registry_coverage_rate in signature (only config/logic)
+    scoring_params_with_eligibility = {
+        **scoring_params,
+        "eligibility": {
+            "registry_coverage_warn_threshold": min_registry_coverage,  # Updated key name
+            "enforce_registry_coverage_gate": enforce_registry_coverage_gate,  # NEW
+            "require_registry_coverage_in_eval": require_registry_coverage_in_eval,
+            "min_n_for_ranking": min_n_for_ranking,
+            "min_n_for_full_quality": min_n_for_full_quality,
+        }
+    }
+    
+    # Canonical JSON (sorted keys) for deterministic hashing (SST pattern)
+    scoring_params_json = json.dumps(scoring_params_with_eligibility, sort_keys=True, separators=(',', ':'))
+    scoring_signature = hashlib.sha256(scoring_params_json.encode()).hexdigest()
+    
+    # 1. Compute SE (standard error) from std and n
+    # SE = std / sqrt(n)
+    if n_slices_valid > 1:
+        primary_se = primary_std / np.sqrt(n_slices_valid)
+        primary_se = max(primary_se, se_floor)  # Guard: prevent division by zero
+    elif n_slices_valid == 1:
+        # With only one observation, use a conservative SE estimate
+        primary_se = max(primary_std, se_floor)
+    else:
+        primary_se = se_floor  # No valid slices
+    
+    # 2. Skill normalization via t-stat
+    # t-stat = mean / se
+    # Guards: n_valid < 2 → t = 0.0, clamp to [-tcap, tcap]
+    if n_slices_valid < 2:
+        skill_tstat = 0.0
+    elif primary_se > 0:
+        skill_tstat = primary_mean / primary_se
+        skill_tstat = max(-tcap, min(tcap, skill_tstat))  # Clamp to prevent extreme values
+    else:
+        skill_tstat = 0.0
+    
+    # 3. Squash t-stat to [0,1] using sigmoid
+    # sigmoid(x/k) where k controls compression
+    skill_score_01 = 1.0 / (1.0 + np.exp(-skill_tstat / skill_squash_k))
+    
+    # 4. Coverage: fraction of valid slices
+    coverage01 = n_slices_valid / n_slices_total if n_slices_total > 0 else 1.0
+    
+    # 5. Eligibility gates (computed before quality/score)
+    invalid_reasons = []
+    warnings = []  # NEW: Non-blocking quality flags (e.g., LOW_REGISTRY_COVERAGE when enforce=false)
+    
+    # Determine effective run_intent (default to "eval" if None)
+    effective_run_intent = run_intent if run_intent is not None else "eval"
+    
+    # Gate 1: Run intent
+    if effective_run_intent == "smoke":
+        invalid_reasons.append("SMOKE_INTENT")
+    
+    # Gate 2: Registry coverage (hard gate)
+    # CRITICAL: Use coverage_breakdown if available (canonical), fallback to registry_coverage_rate for backward compat
+    effective_coverage_rate = None
+    effective_coverage_mode = None
+    
+    if coverage_breakdown is not None:
+        # Use canonical coverage breakdown
+        effective_coverage_mode = coverage_breakdown.coverage_mode
+        # CRITICAL: membership_only coverage must NOT feed eligibility gate (different metric)
+        if effective_coverage_mode == "horizon_ok":
+            effective_coverage_rate = coverage_breakdown.coverage_total
+            # DIAGNOSTIC: Log what coverage rate is being used for eligibility gate with full context
+            if coverage_breakdown:
+                blocked = coverage_breakdown.blocked_feature_ids_by_reason
+                logger.info(
+                    f"[COVERAGE_DIAG] Registry coverage advisory: {effective_coverage_rate:.2%} "
+                    f"(threshold={min_registry_coverage:.2%}, n_total={coverage_breakdown.n_total}, "
+                    f"n_in_registry={coverage_breakdown.n_in_registry}, "
+                    f"n_horizon_ok={coverage_breakdown.n_in_registry_horizon_ok}, "
+                    f"rejected={len(blocked.get('effective_rejected', []))}, "
+                    f"disabled={len(blocked.get('raw_explicit_disabled', []))})"
+                )
+        elif effective_coverage_mode == "membership_only":
+            # In prod: treat as None (fail gate). In dev_mode: allow but log WARNING
+            effective_coverage_rate = None
+            # Check dev_mode using centralized helper
+            dev_mode = False
+            try:
+                from CONFIG.dev_mode import get_dev_mode
+                dev_mode = get_dev_mode()
+            except Exception:
+                # Fallback to False (strict behavior)
+                pass
+            
+            if dev_mode:
+                # In dev_mode: allow but log WARNING and stamp
+                logger.warning(
+                    f"[DEV_MODE] Target has membership_only coverage (coverage_in_registry={coverage_breakdown.coverage_in_registry:.2%}), "
+                    f"but horizon validation failed. Not using for eligibility gate (different metric)."
+                )
+                invalid_reasons.append("[DEV_MODE: membership_only_coverage]")
+            else:
+                # In prod: treat as missing (fail gate)
+                effective_coverage_rate = None
+        else:  # unknown
+            effective_coverage_rate = None
+            # FIX ISSUE-014: Explicit None mode handling for clarity
+            effective_coverage_mode = "unknown"
+    elif registry_coverage_rate is not None:
+        # Backward compatibility: use old float value
+        effective_coverage_rate = registry_coverage_rate
+        effective_coverage_mode = None  # Unknown mode for legacy path
+    else:
+        # FIX ISSUE-014: Explicit None mode handling - no coverage data available
+        # This occurs when both coverage_breakdown and registry_coverage_rate are None
+        effective_coverage_rate = None
+        effective_coverage_mode = None
+    
+    # Apply eligibility gate based on effective_coverage_rate
+    # FIX ISSUE-020: Document and log when coverage gate is bypassed
+    # CRITICAL: Distinguish computation error from genuine missing coverage
+    if effective_run_intent == "eval":
+        if require_registry_coverage_in_eval:
+            # In eval mode: require registry coverage (None fails gate)
+            if effective_coverage_rate is None:
+                # Check if this is a computation error or genuine missing
+                if coverage_computation_error:
+                    # Computation failed - log warning but don't block ranking
+                    # Registry coverage errors are infrastructure issues, not target quality issues
+                    # Use module-level logger (not local variable)
+                    import logging
+                    log = logging.getLogger(__name__)
+                    log.warning(
+                        "Registry coverage computation failed (infrastructure issue). "
+                        "Target will be ranked but coverage metrics unavailable. "
+                        "Check logs for traceback."
+                    )
+                    # Don't add to invalid_reasons - allow ranking to proceed
+                elif effective_coverage_mode == "membership_only":
+                    invalid_reasons.append("MISSING_REGISTRY_COVERAGE (membership_only mode, horizon validation failed)")
+                elif effective_coverage_mode == "unknown":
+                    invalid_reasons.append("MISSING_REGISTRY_COVERAGE (unknown mode, invalid interval/horizon)")
+                else:
+                    invalid_reasons.append("MISSING_REGISTRY_COVERAGE (required in eval mode)")
+            elif effective_coverage_rate < min_registry_coverage:
+                # Semantics: coverage is 0.0+ but below threshold → warn (unless enforce=true)
+                if enforce_registry_coverage_gate:
+                    invalid_reasons.append(f"LOW_REGISTRY_COVERAGE (coverage={effective_coverage_rate:.2%} < {min_registry_coverage:.2%})")
+                else:
+                    warnings.append(f"LOW_REGISTRY_COVERAGE (coverage={effective_coverage_rate:.2%} < {min_registry_coverage:.2%})")
+        else:
+            # FIX ISSUE-020: Log warning when gate is explicitly disabled (once per run, not per target)
+            # Note: This is logged once per call to calculate_composite_score_tstat, which may be per target
+            # For true "once per run" logging, would need to track at higher level
+            logger.warning(
+                f"SECURITY: Registry coverage gate explicitly DISABLED for eval mode "
+                f"(require_registry_coverage_in_eval=False). Target may be processed with 0% coverage."
+            )
+    elif effective_coverage_rate is not None and effective_coverage_rate < min_registry_coverage:
+        # In smoke mode: gate only if provided (None passes, but smoke gate will still invalidate)
+        if enforce_registry_coverage_gate:
+            invalid_reasons.append(f"LOW_REGISTRY_COVERAGE (coverage={effective_coverage_rate:.2%} < {min_registry_coverage:.2%})")
+        else:
+            warnings.append(f"LOW_REGISTRY_COVERAGE (coverage={effective_coverage_rate:.2%} < {min_registry_coverage:.2%})")
+    
+    # Gate 3: Sample size (hard gate) - only for CROSS_SECTIONAL view
+    # FIX 4: Make LOW_N_CS check view-aware (only applies to CROSS_SECTIONAL)
+    # Handle both string and View enum
+    view_str = view.value if hasattr(view, 'value') else (view if isinstance(view, str) else None)
+    if view_str != "SYMBOL_SPECIFIC" and n_slices_valid < min_n_for_ranking:
+        invalid_reasons.append(f"LOW_N_CS (n_timestamps={n_slices_valid} < {min_n_for_ranking})")
+    elif view_str == "SYMBOL_SPECIFIC" and n_slices_valid < min_n_for_ranking:
+        # For SYMBOL_SPECIFIC, use different error message (not "CS")
+        invalid_reasons.append(f"LOW_N_SAMPLES (n_timestamps={n_slices_valid} < {min_n_for_ranking})")
+    
+    valid_for_ranking = len(invalid_reasons) == 0
+    
+    # 6. Stability: SE-based (not std-based) for cross-family comparability
+    # stability = 1 / (1 + se/se_ref) - reciprocal decay (gentler than exp)
+    # Optional: still compute for debugging, but don't use in quality (SE already in t-stat)
+    stability01 = 1.0 / (1.0 + primary_se / se_ref)
+    
+    # 7. Quality score: coverage × registry × sample_size (no stability, SE already in skill)
+    # Use effective_coverage_rate (from breakdown if available, else legacy float)
+    # FIX ISSUE-009: Document fallback behavior - 1.0 assumes missing coverage is acceptable
+    # This fallback applies when coverage_breakdown is None and registry_coverage_rate is None
+    # Rationale: Missing coverage should not penalize quality score (assume full coverage)
+    # Alternative would be 0.0 to penalize, but that would make targets with missing coverage
+    # unrankable, which may be too strict for development/debugging scenarios
+    reg_coverage01 = effective_coverage_rate if effective_coverage_rate is not None else 1.0
+    
+    # Sample size penalty (for near-threshold cases only, n >= min_n_for_ranking)
+    if n_slices_valid >= min_n_for_ranking and n_slices_valid < min_n_for_full_quality:
+        # Soft penalty for near-threshold: linear interpolation from 0.7 to 1.0
+        sample_size_penalty = 0.7 + 0.3 * (n_slices_valid - min_n_for_ranking) / (min_n_for_full_quality - min_n_for_ranking)
+    else:
+        sample_size_penalty = 1.0
+    
+    # Quality as product (multiplicative) - coverage × registry × sample_size
+    quality01 = coverage01 * reg_coverage01 * sample_size_penalty
+    
+    # 8. Composite: skill-gated quality (prevents no-skill targets from ranking high)
+    # composite = skill * quality (multiplicative, not additive)
+    composite_base = skill_score_01 * quality01
+    
+    # 9. Model bonus (multiplicative)
+    if model_bonus_cfg.get("enabled", True):
+        max_bonus = model_bonus_cfg.get("max_bonus", 0.10)
+        per_model = model_bonus_cfg.get("per_model", 0.02)
+        # Note: n_models not passed in current signature, skip for now
+        # Will be added when model_evaluation.py is updated
+        model_bonus = 0.0  # Placeholder until n_models is passed
+    else:
+        model_bonus = 0.0
+    
+    composite_score_01 = composite_base * (1.0 + model_bonus)
+    
+    # Clamp to [0,1] (defensive)
+    composite_score_01 = max(0.0, min(1.0, composite_score_01))
+    
+    definition = (
+        f"composite = skill * quality * (1 + model_bonus); "
+        f"skill = sigmoid(tstat/{skill_squash_k}); "  # SE already in t-stat
+        f"quality = coverage * registry_coverage * sample_size_penalty; "  # No stability (SE already in skill)
+        f"sample_size_penalty = linear_interp(n_valid, [{min_n_for_ranking}, {min_n_for_full_quality}], [0.7, 1.0]); "
+        f"eligibility_gates: registry_coverage >= {min_registry_coverage:.2%}, n_valid >= {min_n_for_ranking}; "
+        f"tstat = mean / max(se, {se_floor})"
+    )
+    
+    # Components dict: strictly numeric (for JSON/typing compatibility)
+    components = {
+        "skill_tstat": skill_tstat,
+        "skill_score_01": skill_score_01,
+        "primary_se": primary_se,
+        "coverage01": coverage01,
+        "stability01": stability01,  # Optional: still compute for debugging, but not in quality
+        "registry_coverage01": reg_coverage01,  # NEW
+        "sample_size_penalty": sample_size_penalty,  # NEW
+        "quality01": quality01,
+        "model_bonus": model_bonus,
+        "composite_base": composite_base,
+        # Note: valid_for_ranking and invalid_reasons are in eligibility dict, not components
+    }
+    
+    # Eligibility object: separate from numeric components (for type safety)
+    eligibility = {
+        "valid_for_ranking": valid_for_ranking,
+        "invalid_reasons": invalid_reasons,
+        "warnings": warnings,  # NEW: Non-blocking quality flags
+        "run_intent": effective_run_intent,
+    }
+    
+    return composite_score_01, definition, f"v{version}", components, scoring_signature, eligibility
+

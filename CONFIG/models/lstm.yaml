@@ -1,0 +1,48 @@
+# LSTM Model Configuration
+# Long Short-Term Memory for sequential data
+
+model_family: "LSTM"
+description: "LSTM model for time-series prediction"
+
+hyperparameters:
+  # Training
+  epochs: 30  # Reduced from 50 to prevent timeouts
+  batch_size: 256  # Reduced from 512 to speed up training
+  patience: 5  # Reduced from 10 for faster early stopping
+  learning_rate: 0.001
+
+  # Dynamic batch size/epoch reduction for long sequences
+  # NOTE: These thresholds are in BAR COUNT (not time). Memory usage scales with:
+  #   O(batch_size * seq_len * hidden_dim)
+  # At different intervals, the same bar count represents different time periods:
+  #   - 1m: 200 bars = 200 min (3.3 hours)
+  #   - 5m: 200 bars = 1000 min (16.7 hours)
+  #   - 15m: 200 bars = 3000 min (50 hours)
+  max_seq_for_full_batch: 200  # Reduce batch size if sequence > this (bars)
+  epoch_reduction_threshold: 300  # Reduce epochs if sequence > this (bars)
+  
+  # Architecture
+  lstm_units: 128
+  dropout: 0.2
+  recurrent_dropout: 0.1
+  
+  # Sequence
+  sequence_length: null  # Auto-detected from input
+
+# Variants
+variants:
+  small:
+    lstm_units: 64
+    dropout: 0.1
+    recurrent_dropout: 0.05
+    
+  medium:
+    lstm_units: 128
+    dropout: 0.2
+    recurrent_dropout: 0.1
+    
+  large:
+    lstm_units: 256
+    dropout: 0.3
+    recurrent_dropout: 0.2
+

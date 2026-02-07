@@ -1,0 +1,531 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later OR Commercial
+# Copyright (c) 2025-2026 Fox ML Infrastructure LLC
+
+"""
+Feature Importance Stability Analysis
+
+Compute stability metrics and generate reports for feature importance snapshots.
+"""
+
+import logging
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
+import numpy as np
+
+try:
+    from scipy.stats import kendalltau
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+    logging.warning("scipy not available, Kendall tau will be unavailable")
+
+from .schema import FeatureImportanceSnapshot
+from .io import load_snapshots
+
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# GROUP VALIDATION (for strict/replicate modes)
+# =============================================================================
+
+class ValidationResult:
+    """Result of group signature validation."""
+    
+    __slots__ = ('ok', 'reason')
+    
+    def __init__(self, ok: bool, reason: Optional[str] = None):
+        self.ok = ok
+        self.reason = reason
+    
+    def __bool__(self) -> bool:
+        return self.ok
+
+
+def validate_group_signatures(
+    snapshots: List[FeatureImportanceSnapshot],
+    mode: str = "legacy"
+) -> ValidationResult:
+    """
+    Validate that snapshots in a group have consistent signatures.
+    
+    CRITICAL: In "strict" and "replicate" modes, this performs HARD REFUSAL:
+    - All required signatures must be present
+    - All signatures must be identical across the group
+    - Routing signatures must be consistent
+    
+    Args:
+        snapshots: List of snapshots to validate
+        mode: "strict" (all signatures must match, including train_seed grouping),
+              "replicate" (all signatures must match, exclude train_seed),
+              "legacy" (best-effort, only filter by universe_sig)
+    
+    Returns:
+        ValidationResult with ok=True if valid, ok=False with reason if invalid
+    """
+    if len(snapshots) < 2:
+        return ValidationResult(ok=True)
+    
+    if mode == "legacy":
+        # Legacy mode: no strict validation, just check basic universe_sig
+        return ValidationResult(ok=True)
+    
+    # Required signatures for strict/replicate modes
+    required_sigs = [
+        "dataset_signature",
+        "split_signature", 
+        "target_signature",
+        "feature_signature",
+        "hparams_signature",
+        "routing_signature",
+    ]
+    
+    # Check that all required signatures are present in every snapshot
+    for sig_name in required_sigs:
+        for i, snapshot in enumerate(snapshots):
+            sig_value = getattr(snapshot, sig_name, None)
+            if not sig_value:
+                return ValidationResult(
+                    ok=False,
+                    reason=f"Snapshot {i} (run_id={snapshot.run_id}) missing required {sig_name}. "
+                           f"In {mode} mode, all signatures must be present."
+                )
+    
+    # Check that all signatures are identical across the group
+    for sig_name in required_sigs:
+        values = {getattr(s, sig_name) for s in snapshots}
+        if len(values) > 1:
+            return ValidationResult(
+                ok=False,
+                reason=f"Multiple {sig_name} values in group: {values}. "
+                       f"Refusing to compare snapshots with different signatures."
+            )
+    
+    # In strict mode, verify train_seed is consistent (for diff telemetry)
+    # In replicate mode, train_seed can vary (that's the point)
+    if mode == "strict":
+        seeds = {s.train_seed for s in snapshots}
+        if len(seeds) > 1:
+            return ValidationResult(
+                ok=False,
+                reason=f"Multiple train_seed values in strict mode: {seeds}. "
+                       f"Use 'replicate' mode to compare across different seeds."
+            )
+    
+    return ValidationResult(ok=True)
+
+
+def top_k_overlap(s1: FeatureImportanceSnapshot, s2: FeatureImportanceSnapshot, k: int = 20) -> float:
+    """
+    Compute Jaccard similarity of top-K features between two snapshots.
+    
+    **IMPORTANT**: This compares features by NAME, not by importance magnitude.
+    Features are already sorted by importance (descending) in the snapshot.
+    
+    For stability analysis, this should only be called on snapshots from the SAME
+    model family and importance method (e.g., LightGBM gain across runs).
+    Comparing across different methods (RFE vs Boruta) will naturally have low overlap.
+    
+    Args:
+        s1: First snapshot
+        s2: Second snapshot
+        k: Number of top features to compare
+    
+    Returns:
+        Jaccard similarity (intersection / union) of top-K features
+    """
+    # Features are already sorted by importance (descending)
+    # Take top k (or all if fewer than k)
+    k1 = min(k, len(s1.features))
+    k2 = min(k, len(s2.features))
+    top1 = set(s1.features[:k1])
+    top2 = set(s2.features[:k2])
+    
+    if not top1 and not top2:
+        return 1.0  # Both empty = perfect match
+    
+    intersection = len(top1 & top2)
+    union = len(top1 | top2)
+    
+    return intersection / union if union > 0 else 0.0
+
+
+def rank_correlation(s1: FeatureImportanceSnapshot, s2: FeatureImportanceSnapshot) -> float:
+    """
+    Compute Kendall tau rank correlation between two snapshots.
+    
+    Args:
+        s1: First snapshot
+        s2: Second snapshot
+    
+    Returns:
+        Kendall tau correlation coefficient, or NaN if insufficient common features
+    """
+    if not SCIPY_AVAILABLE:
+        logger.warning("scipy not available, cannot compute Kendall tau")
+        return np.nan
+    
+    # Find common features
+    common = set(s1.features) & set(s2.features)
+    if len(common) < 3:
+        return np.nan  # Need at least 3 features for meaningful correlation
+    
+    # Get ranks for common features (lower rank = higher importance)
+    # Features are sorted by importance (descending), so rank = position
+    rank1 = {feat: i for i, feat in enumerate(s1.features)}
+    rank2 = {feat: i for i, feat in enumerate(s2.features)}
+    
+    # Extract ranks for common features
+    ranks1 = [rank1[feat] for feat in common]
+    ranks2 = [rank2[feat] for feat in common]
+    
+    # Compute Kendall tau
+    tau, _ = kendalltau(ranks1, ranks2)
+    return float(tau) if not np.isnan(tau) else np.nan
+
+
+def selection_frequency(
+    snapshots: List[FeatureImportanceSnapshot],
+    top_k: int = 20
+) -> Dict[str, float]:
+    """
+    Compute how often each feature appears in top-K across snapshots.
+    
+    Args:
+        snapshots: List of snapshots
+        top_k: Number of top features to consider
+    
+    Returns:
+        Dictionary mapping feature names to selection frequency (0.0 to 1.0)
+    """
+    counts: Dict[str, int] = {}
+    total = len(snapshots)
+    
+    if total == 0:
+        return {}
+    
+    for snapshot in snapshots:
+        # Features are already sorted by importance (descending)
+        top_features = set(snapshot.features[:top_k])
+        for feat in top_features:
+            counts[feat] = counts.get(feat, 0) + 1
+    
+    # Convert to frequencies
+    return {feat: count / total for feat, count in counts.items()}
+
+
+def compute_stability_metrics(
+    snapshots: List[FeatureImportanceSnapshot],
+    top_k: int = 20,
+    filter_by_universe_sig: bool = True,  # Filter by universe_sig to avoid cross-symbol comparisons
+    filter_mode: str = "replicate",  # "strict", "replicate", or "legacy" - defaults to replicate
+) -> Dict[str, float]:
+    """
+    Compute stability metrics for a list of snapshots.
+
+    **CRITICAL**: This function assumes all snapshots are from the SAME model family
+    and importance method (e.g., all LightGBM with "native" importance).
+    Comparing snapshots from different methods (RFE vs Boruta vs Lasso) will
+    naturally have low overlap because they use different importance definitions.
+
+    **CRITICAL**: For SYMBOL_SPECIFIC mode, snapshots should be from the SAME symbol.
+    Comparing snapshots across different symbols (AAPL vs MSFT) will show low overlap
+    due to symbol heterogeneity, not instability. Use filter_by_universe_sig=True to
+    filter snapshots by the symbol part of universe_sig.
+
+    The snapshots should be sorted by importance (descending) already, so we
+    compare top-K by feature name (not magnitude, since magnitudes are not comparable
+    across different importance definitions).
+
+    Args:
+        snapshots: List of snapshots to analyze (must be same method/family)
+        top_k: Number of top features to consider for overlap
+        filter_by_universe_sig: If True, filter snapshots to only include those with
+            the same universe_sig (or same symbol prefix if universe_sig format is "SYMBOL:...")
+        filter_mode: Grouping/validation mode:
+            - "strict": All signatures must match (including train_seed grouping)
+            - "replicate": All signatures must match (exclude train_seed for cross-seed stability)
+            - "legacy": Best-effort grouping by universe_sig only (backward compatible)
+
+    Returns:
+        Dictionary with stability metrics:
+        - mean_overlap: Mean Jaccard similarity of top-K features
+        - std_overlap: Std dev of overlap
+        - mean_tau: Mean Kendall tau rank correlation
+        - std_tau: Std dev of tau
+        - n_snapshots: Number of snapshots
+        - n_comparisons: Number of pairwise comparisons
+        - status: "stable", "drifting", "diverged", or "insufficient"
+        - validation_error: If present, reason why validation failed (strict/replicate modes)
+        - n_legacy_ignored: Number of legacy snapshots ignored in strict/replicate mode
+    """
+    n_legacy_ignored = 0
+    
+    # In strict/replicate mode, first filter out legacy snapshots (those without required signatures)
+    # This allows graceful coexistence of old and new snapshots
+    if filter_mode in ("strict", "replicate"):
+        required_sigs = ["dataset_signature", "split_signature", "target_signature",
+                        "feature_signature", "hparams_signature", "routing_signature"]
+        
+        valid_snapshots = []
+        for s in snapshots:
+            has_all_sigs = all(getattr(s, sig, None) for sig in required_sigs)
+            if has_all_sigs:
+                valid_snapshots.append(s)
+            else:
+                n_legacy_ignored += 1
+        
+        if n_legacy_ignored > 0:
+            logger.debug(
+                f"Filtered out {n_legacy_ignored} legacy snapshots without required signatures "
+                f"in {filter_mode} mode. Remaining: {len(valid_snapshots)} snapshots."
+            )
+        
+        snapshots = valid_snapshots
+        
+        if len(snapshots) < 2:
+            return {
+                "mean_overlap": np.nan,
+                "std_overlap": np.nan,
+                "mean_tau": np.nan,
+                "std_tau": np.nan,
+                "n_snapshots": len(snapshots),
+                "n_comparisons": 0,
+                "status": "insufficient",
+                "n_legacy_ignored": n_legacy_ignored,
+            }
+    
+    # Validate group signatures for strict/replicate modes (after filtering)
+    if filter_mode in ("strict", "replicate"):
+        validation = validate_group_signatures(snapshots, mode=filter_mode)
+        if not validation:
+            logger.error(
+                f"❌ Stability computation REFUSED in {filter_mode} mode: {validation.reason}"
+            )
+            return {
+                "mean_overlap": np.nan,
+                "std_overlap": np.nan,
+                "mean_tau": np.nan,
+                "std_tau": np.nan,
+                "n_snapshots": len(snapshots),
+                "n_comparisons": 0,
+                "status": "invalid",
+                "validation_error": validation.reason,
+                "n_legacy_ignored": n_legacy_ignored,
+            }
+    
+    # Filter snapshots by universe_sig if requested (for SYMBOL_SPECIFIC mode)
+    if filter_by_universe_sig and len(snapshots) > 0:
+        # Extract symbol from universe_sig if format is "SYMBOL:..."
+        # Group snapshots by symbol (first part before ":")
+        universe_sig_groups = {}
+        for snapshot in snapshots:
+            if snapshot.universe_sig:
+                # Extract symbol part (before ":")
+                symbol_part = snapshot.universe_sig.split(":")[0] if ":" in snapshot.universe_sig else snapshot.universe_sig
+                if symbol_part not in universe_sig_groups:
+                    universe_sig_groups[symbol_part] = []
+                universe_sig_groups[symbol_part].append(snapshot)
+            else:
+                # No universe_sig - treat as separate group
+                if "NO_UNIVERSE" not in universe_sig_groups:
+                    universe_sig_groups["NO_UNIVERSE"] = []
+                universe_sig_groups["NO_UNIVERSE"].append(snapshot)
+        
+        # If we have multiple groups (different symbols), use the largest group
+        # and log a warning that we're filtering to avoid cross-symbol comparisons
+        if len(universe_sig_groups) > 1:
+            largest_group = max(universe_sig_groups.values(), key=len)
+            symbol_for_group = [k for k, v in universe_sig_groups.items() if v == largest_group][0]
+            logger.warning(
+                f"⚠️  Stability computation: Found snapshots from {len(universe_sig_groups)} different symbols/universes. "
+                f"Filtering to largest group (symbol={symbol_for_group}, n={len(largest_group)} snapshots) to avoid "
+                f"cross-symbol comparisons. Low overlap across symbols is expected (symbol heterogeneity), not instability."
+            )
+            snapshots = largest_group
+    
+    if len(snapshots) < 2:
+        return {
+            "mean_overlap": np.nan,
+            "std_overlap": np.nan,
+            "mean_tau": np.nan,
+            "std_tau": np.nan,
+            "n_comparisons": 0,
+        }
+    
+    # Compute pairwise metrics (adjacent runs)
+    overlaps = []
+    taus = []
+    
+    # Prediction hash comparison tracking
+    pred_hash_matches = []       # For strict hash equality
+    pred_hash_live_matches = []  # For live drift detection
+    
+    for i in range(len(snapshots) - 1):
+        s1 = snapshots[i]
+        s2 = snapshots[i + 1]
+        
+        overlap = top_k_overlap(s1, s2, k=top_k)
+        overlaps.append(overlap)
+        
+        tau = rank_correlation(s1, s2)
+        if not np.isnan(tau):
+            taus.append(tau)
+        
+        # Compare prediction hashes if available
+        if s1.prediction_hash and s2.prediction_hash:
+            # Check row_ids_hash to ensure comparability
+            if s1.prediction_row_ids_hash == s2.prediction_row_ids_hash:
+                pred_hash_matches.append(s1.prediction_hash == s2.prediction_hash)
+                if s1.prediction_hash_live and s2.prediction_hash_live:
+                    pred_hash_live_matches.append(s1.prediction_hash_live == s2.prediction_hash_live)
+    
+    # Compute statistics
+    overlaps_array = np.array(overlaps)
+    taus_array = np.array(taus) if taus else np.array([np.nan])
+    
+    result = {
+        "mean_overlap": float(np.nanmean(overlaps_array)),
+        "std_overlap": float(np.nanstd(overlaps_array)),
+        "mean_tau": float(np.nanmean(taus_array)) if len(taus) > 0 else np.nan,
+        "std_tau": float(np.nanstd(taus_array)) if len(taus) > 0 else np.nan,
+        "n_comparisons": len(overlaps),
+        "n_snapshots": len(snapshots),
+    }
+    
+    # Add prediction hash comparison metrics if available
+    if pred_hash_matches:
+        result["n_pred_hash_comparisons"] = len(pred_hash_matches)
+        result["pred_hash_match_rate"] = sum(pred_hash_matches) / len(pred_hash_matches)
+        if pred_hash_live_matches:
+            result["pred_hash_live_match_rate"] = sum(pred_hash_live_matches) / len(pred_hash_live_matches)
+        
+        # Flag if strict hashes mismatch in strict mode (determinism failure)
+        if filter_mode == "strict" and result["pred_hash_match_rate"] < 1.0:
+            mismatches = len(pred_hash_matches) - sum(pred_hash_matches)
+            logger.warning(
+                f"⚠️  Strict mode: {mismatches} prediction hash mismatches detected "
+                f"(determinism failure). Match rate: {result['pred_hash_match_rate']:.1%}"
+            )
+    
+    return result
+
+
+def analyze_stability_auto(
+    base_dir: Path,
+    target: str,
+    method: str,
+    min_snapshots: int = 2,
+    top_k: int = 20,
+    log_to_console: bool = True,
+    save_report: bool = True,
+    report_path: Optional[Path] = None,
+    min_overlap_threshold: float = 0.7,
+    min_tau_threshold: float = 0.6,
+) -> Optional[Dict[str, float]]:
+    """
+    Automatically analyze stability if enough snapshots exist.
+    
+    This is the main hook function that can be called from pipeline endpoints.
+    
+    Args:
+        base_dir: Base directory for snapshots
+        target: Target name
+        method: Method name
+        min_snapshots: Minimum snapshots required for analysis
+        top_k: Number of top features to consider
+        log_to_console: If True, log metrics to console
+        save_report: If True, save text report to disk
+        report_path: Optional path for report (defaults to base_dir/stability_reports/)
+        min_overlap_threshold: Warning threshold for overlap (default: 0.7)
+        min_tau_threshold: Warning threshold for tau (default: 0.6)
+    
+    Returns:
+        Dictionary with stability metrics, or None if insufficient snapshots
+    """
+    snapshots = load_snapshots(base_dir, target, method)
+    
+    if len(snapshots) < min_snapshots:
+        logger.debug(
+            f"Insufficient snapshots for {target}/{method}: "
+            f"{len(snapshots)} < {min_snapshots}"
+        )
+        return None
+    
+    metrics = compute_stability_metrics(snapshots, top_k=top_k)
+    
+    if log_to_console:
+        logger.info(f"📊 Stability for {target}/{method}:")
+        logger.info(f"   Snapshots: {metrics['n_snapshots']}")
+        logger.info(f"   Top-{top_k} overlap: {metrics['mean_overlap']:.3f} ± {metrics['std_overlap']:.3f}")
+        if not np.isnan(metrics['mean_tau']):
+            logger.info(f"   Kendall tau: {metrics['mean_tau']:.3f} ± {metrics['std_tau']:.3f}")
+        
+        # Warn if stability is low
+        if metrics['mean_overlap'] < min_overlap_threshold:
+            logger.warning(
+                f"   ⚠️  Low stability detected (overlap {metrics['mean_overlap']:.3f} < {min_overlap_threshold})"
+            )
+        if not np.isnan(metrics['mean_tau']) and metrics['mean_tau'] < min_tau_threshold:
+            logger.warning(
+                f"   ⚠️  Low rank correlation (tau {metrics['mean_tau']:.3f} < {min_tau_threshold})"
+            )
+    
+    if save_report:
+        if report_path is None:
+            report_dir = base_dir / "stability_reports"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            report_path = report_dir / f"{target}_{method}.txt"
+        
+        save_stability_report(metrics, snapshots, report_path, top_k=top_k)
+    
+    return metrics
+
+
+def save_stability_report(
+    metrics: Dict[str, float],
+    snapshots: List[FeatureImportanceSnapshot],
+    report_path: Path,
+    top_k: int = 20
+) -> None:
+    """
+    Save stability report to text file.
+    
+    Args:
+        metrics: Stability metrics dictionary
+        snapshots: List of snapshots analyzed
+        report_path: Path to save report
+        top_k: Number of top features to include in report
+    """
+    try:
+        with report_path.open("w") as f:
+            f.write(f"Feature Importance Stability Report\n")
+            f.write(f"{'='*60}\n\n")
+            
+            if len(snapshots) > 0:
+                f.write(f"Target: {snapshots[0].target}\n")
+                f.write(f"Method: {snapshots[0].method}\n")
+                f.write(f"Universe: {snapshots[0].universe_sig or 'N/A'}\n")
+            
+            f.write(f"\nMetrics:\n")
+            f.write(f"  Snapshots analyzed: {metrics['n_snapshots']}\n")
+            f.write(f"  Comparisons: {metrics['n_comparisons']}\n")
+            f.write(f"  Top-{top_k} overlap: {metrics['mean_overlap']:.3f} ± {metrics['std_overlap']:.3f}\n")
+            if not np.isnan(metrics['mean_tau']):
+                f.write(f"  Kendall tau: {metrics['mean_tau']:.3f} ± {metrics['std_tau']:.3f}\n")
+            
+            # Selection frequency
+            freq = selection_frequency(snapshots, top_k=top_k)
+            if freq:
+                f.write(f"\nTop-{top_k} Selection Frequency:\n")
+                sorted_freq = sorted(freq.items(), key=lambda x: -x[1])
+                for feat, p in sorted_freq[:30]:  # Top 30
+                    f.write(f"  {feat:40s} {p:5.2%}\n")
+            
+            f.write(f"\nSnapshot History:\n")
+            for i, snapshot in enumerate(snapshots, 1):
+                f.write(f"  {i}. {snapshot.run_id} ({snapshot.created_at.isoformat()})\n")
+        
+        logger.debug(f"Saved stability report: {report_path}")
+    except Exception as e:
+        logger.warning(f"Failed to save stability report to {report_path}: {e}")

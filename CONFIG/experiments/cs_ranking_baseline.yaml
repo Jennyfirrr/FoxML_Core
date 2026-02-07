@@ -1,0 +1,76 @@
+# Cross-Sectional Ranking Baseline Experiment
+# Trains models using ranking objectives aligned with actual trading strategy:
+# "At each timestamp t, rank symbols, long top decile, short bottom decile"
+#
+# See .claude/plans/cross-sectional-ranking-objective.md for design details
+
+name: cs_ranking_baseline
+
+# Use raw OHLCV sequences (no computed features)
+pipeline:
+  input_mode: "raw_sequence"
+
+  # Raw OHLCV sequence settings
+  sequence:
+    default_length_minutes: 320  # 64 bars @ 5m interval
+    default_channels:
+      - open
+      - high
+      - low
+      - close
+      - volume
+    normalization: "log_returns"  # log(price / first_close)
+
+  # Cross-sectional ranking mode (enable the full ranking objective)
+  cross_sectional_ranking:
+    enabled: true
+
+    # Target construction (Phase 1)
+    # Transform raw returns to cross-sectional percentile ranks
+    target:
+      type: "cs_percentile"      # Rank [0, 1] across symbols at each timestamp
+      return_col: "fwd_ret_5m"   # 5-minute forward return
+      residualize: true          # Subtract market mean first
+      winsorize_pct: [0.01, 0.99]  # Clip extreme returns
+      min_symbols: 20            # Need at least 20 symbols per timestamp
+
+    # Loss function (Phase 3)
+    # Pairwise logistic: winners should score higher than losers
+    loss:
+      type: "pairwise_logistic"
+      top_pct: 0.2               # Top 20% = winners
+      bottom_pct: 0.2            # Bottom 20% = losers
+      max_pairs: 100             # Max pairs per timestamp (controls compute)
+      margin: 0.0                # 0 = logistic, >0 = hinge margin
+
+    # Batching (Phase 2)
+    # Group by timestamp, batch multiple timestamps
+    batching:
+      timestamps_per_batch: 32   # B dimension
+      symbols_per_timestamp: null # null = all symbols (M dimension)
+      min_symbols_per_timestamp: 50
+      shuffle_timestamps: true
+
+    # Metrics (Phase 4)
+    # Ranking-aligned metrics for model selection
+    metrics:
+      primary: "spearman_ic"     # Spearman rank correlation
+      top_pct: 0.1               # For spread: top/bottom 10%
+      bottom_pct: 0.1
+      cost_per_trade_bps: 5.0    # Transaction cost for net spread
+
+# Only train sequence-compatible models
+training:
+  model_families:
+    - LSTM
+    - Transformer
+    - CNN1D
+
+# Intelligent training settings
+intelligent_training:
+  auto_targets: false           # Disabled - use manual targets for CS ranking
+  manual_targets:
+    - "fwd_ret_5m"
+    - "fwd_ret_15m"
+    - "fwd_ret_30m"
+  auto_features: false          # Disabled - uses raw OHLCV sequences

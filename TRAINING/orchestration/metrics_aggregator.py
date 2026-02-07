@@ -1,0 +1,1133 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later OR Commercial
+# Copyright (c) 2025-2026 Fox ML Infrastructure LLC
+
+"""
+Metrics Aggregator
+
+Collects metrics from feature selection, stability analysis, and leakage detection
+outputs and aggregates them into a routing_candidates DataFrame for the training router.
+"""
+
+# DETERMINISM: Bootstrap reproducibility BEFORE any ML libraries
+import TRAINING.common.repro_bootstrap  # noqa: F401 - MUST be first ML import
+
+import json
+import logging
+import re
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple, Union
+import pandas as pd
+import numpy as np
+
+# SST: Import View enum for consistent view handling
+from TRAINING.orchestration.utils.scope_resolution import View
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+# DETERMINISTIC: Semantic path sorting utilities
+_COHORT_RE = re.compile(r"^cohort=(.+)$")
+
+def _find_repo_root(start: Optional[Path] = None) -> Path:
+    """
+    Find repo root by walking up looking for CONFIG/.git markers.
+    
+    Uses existing pattern from leakage_filtering.py for robustness.
+    """
+    if start is None:
+        start = Path(__file__)
+    start = start.resolve()
+    current = start
+    
+    # Walk up from start path
+    for _ in range(10):
+        if (current / "CONFIG").is_dir() or (current / ".git").exists():
+            return current
+        if current.parent == current:  # Reached filesystem root
+            break
+        current = current.parent
+    
+    # Fallback: try from __file__ location
+    script_file = Path(__file__).resolve()
+    script_parent = script_file.parent
+    for _ in range(10):
+        if (script_parent / "CONFIG").is_dir() or (script_parent / ".git").exists():
+            return script_parent
+        if script_parent.parent == script_parent:
+            break
+        script_parent = script_parent.parent
+    
+    # Last resort: use cwd (but don't use as absolute tie-breaker)
+    return Path.cwd().resolve()
+
+def _parse_cohort_id_from_dirname(name: str) -> str:
+    """Parse cohort_id from directory name (e.g., 'cohort=abc123' -> 'abc123')."""
+    if not name.startswith("cohort="):
+        return f"__INVALID__{name}"  # Sentinel to expose bugs early
+    return name.split("cohort=", 1)[1]
+
+def _stable_relpath(p: Path, root: Path) -> str:
+    """Get repo-relative path for deterministic sorting (avoids absolute path issues)."""
+    try:
+        return p.resolve().relative_to(root.resolve()).as_posix()
+    except Exception:
+        # Fallback: use tail parts (deterministic across machines if layout matches)
+        # Never use absolute path in sort keys
+        return "/".join(p.resolve().parts[-6:])
+
+# Module-level cache for allow_mode_fallback config (evaluated once, not per target)
+_allow_mode_fallback = None
+
+
+def _get_allow_mode_fallback():
+    """Get cached config value for routing.allow_mode_fallback."""
+    global _allow_mode_fallback
+    if _allow_mode_fallback is None:
+        try:
+            from CONFIG.config_loader import get_cfg
+            _allow_mode_fallback = get_cfg("training_config.routing.allow_mode_fallback", default=False)
+        except Exception:
+            _allow_mode_fallback = False
+    return _allow_mode_fallback
+
+
+class MetricsAggregator:
+    """
+    Aggregates metrics from various pipeline stages into routing candidates.
+    """
+    
+    def __init__(self, output_dir: Path):
+        """
+        Initialize aggregator.
+        
+        Args:
+            output_dir: Base output directory (e.g., feature_selections/)
+        """
+        self.output_dir = Path(output_dir)
+        # DETERMINISTIC: Compute repo root for stable relative path sorting
+        self._repo_root = Path(__file__).resolve().parents[3]  # TRAINING -> trader root
+    
+    def aggregate_routing_candidates(
+        self,
+        targets: List[str],
+        symbols: List[str],
+        git_commit: Optional[str] = None
+    ) -> pd.DataFrame:
+        """
+        Aggregate routing candidates from all available metrics.
+        
+        Args:
+            targets: List of target names
+            symbols: List of symbol names
+            git_commit: Git commit hash
+        
+        Returns:
+            DataFrame with routing candidates (one row per target or (target, symbol))
+        """
+        # SST: Determine view from actual symbols count (same pattern as resolve_write_scope validation)
+        from TRAINING.orchestration.utils.scope_resolution import View
+        if symbols and len(symbols) > 1:
+            view = View.CROSS_SECTIONAL.value  # Multi-symbol → CROSS_SECTIONAL
+        elif symbols and len(symbols) == 1:
+            view = View.SYMBOL_SPECIFIC.value  # Single-symbol → SYMBOL_SPECIFIC
+        else:
+            # Fallback: try universe-specific view cache (already validated in get_view_for_universe)
+            view = View.CROSS_SECTIONAL.value  # Default
+            try:
+                from TRAINING.orchestration.utils.run_context import load_run_context
+                context = load_run_context(self.output_dir)
+                if context:
+                    # Try to get from first universe in cache (already validated)
+                    views = context.get("views", {})
+                    if views:
+                        # DETERMINISTIC: Prefer CROSS_SECTIONAL, then SYMBOL_SPECIFIC (SST view preference order)
+                        # This ensures stable selection even if dict construction order changes
+                        PREFERRED_VIEW_ORDER = [View.CROSS_SECTIONAL.value, View.SYMBOL_SPECIFIC.value]
+                        cached_view = None
+                        for preferred_view in PREFERRED_VIEW_ORDER:
+                            if preferred_view in views:
+                                cached_view = views[preferred_view].get('view')
+                                if cached_view:
+                                    break
+                        # Fallback: sorted keys (deterministic)
+                        if not cached_view:
+                            first_key = sorted(views.keys())[0]
+                            cached_view = views[first_key].get('view')
+                        # Use cached view (get_view_for_universe already validated it)
+                        if cached_view:
+                            view = cached_view
+            except Exception as e:
+                logger.debug(f"Could not load view from run context: {e}, will use inferred view")
+        
+        if view:
+            logger.info(f"📋 Using view={view} (determined from {len(symbols)} symbols) for metrics aggregation")
+        
+        rows = []
+        
+        for target in targets:
+            # Cross-sectional metrics (use view for mode field and path construction)
+            cs_metrics = self._load_cross_sectional_metrics(target, view=view)
+            if cs_metrics:
+                rows.append(cs_metrics)
+                logger.debug(f"✅ Loaded CS metrics for {target}")
+            else:
+                logger.warning(f"⚠️  No CS metrics found for {target}")
+            
+            # Symbol-specific metrics (use view for mode field)
+            symbols_found = 0
+            symbols_missing = []
+            for symbol in symbols:
+                sym_metrics = self._load_symbol_metrics(target, symbol, view=view)
+                if sym_metrics:
+                    rows.append(sym_metrics)
+                    symbols_found += 1
+                else:
+                    symbols_missing.append(symbol)
+            
+            if symbols_found > 0:
+                logger.debug(f"✅ Loaded symbol metrics for {target}: {symbols_found}/{len(symbols)} symbols")
+            if symbols_missing:
+                logger.warning(f"⚠️  No symbol metrics found for {target}: {len(symbols_missing)}/{len(symbols)} symbols missing: {symbols_missing[:5]}{'...' if len(symbols_missing) > 5 else ''}")
+            
+            # Fallback: if SYMBOL_SPECIFIC view but no symbol metrics, try CS metrics (config-gated)
+            # Normalize view to enum for comparison
+            view_enum = View.from_string(view) if isinstance(view, str) else view
+            if symbols_found == 0 and symbols_missing and view_enum == View.SYMBOL_SPECIFIC and _get_allow_mode_fallback():
+                # Check if CS metrics exist for this target (we may have already loaded them above)
+                if cs_metrics:
+                    # Already loaded, add a fallback-tagged version for symbol routing
+                    fallback_metrics = cs_metrics.copy()
+                    fallback_metrics["mode"] = View.CROSS_SECTIONAL.value  # Explicit mode for downstream
+                    fallback_metrics["mode_fallback"] = "SYMBOL_SPECIFIC->CROSS_SECTIONAL"
+                    fallback_metrics["fallback_reason"] = f"No symbol metrics found ({len(symbols_missing)} missing)"
+                    rows.append(fallback_metrics)
+                    logger.warning(f"Fallback: Using CS metrics for {target} (symbol metrics missing)")
+        
+        if not rows:
+            logger.warning("No routing candidates found")
+            return pd.DataFrame()
+        
+        df = pd.DataFrame(rows)
+        
+        # Add metadata
+        df["timestamp"] = datetime.utcnow().isoformat()
+        df["git_commit"] = git_commit or "unknown"
+        
+        return df
+    
+    def _load_cross_sectional_metrics(self, target: str, view: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """
+        Load cross-sectional metrics for a target.
+        
+        Args:
+            target: Target name
+        
+        Returns:
+            Dict with metrics or None if not found
+        """
+        # Determine base output directory (walk up from REPRODUCIBILITY/FEATURE_SELECTION)
+        base_output_dir = self.output_dir
+        while base_output_dir.name in ["FEATURE_SELECTION", "TARGET_RANKING", "REPRODUCIBILITY", View.CROSS_SECTIONAL.value, "feature_selections", "target_rankings"]:
+            base_output_dir = base_output_dir.parent
+            if not base_output_dir.parent.exists() or base_output_dir.name == "RESULTS":
+                break
+        
+        from TRAINING.orchestration.utils.target_first_paths import normalize_target_name
+        target_clean = normalize_target_name(target)
+        
+        # SST Architecture: Read from canonical location (reproducibility/cohort) first
+        # Then check reference pointer, then legacy locations
+        from TRAINING.orchestration.utils.target_first_paths import (
+            get_target_reproducibility_dir, get_target_metrics_dir
+        )
+        target_repro_dir = get_target_reproducibility_dir(base_output_dir, target_clean)
+        # Use view for path construction (SST) - normalize to enum
+        view_enum = View.from_string(view) if isinstance(view, str) else (view if view else View.CROSS_SECTIONAL)
+        view_for_path = view_enum if isinstance(view_enum, View) else View.CROSS_SECTIONAL
+        target_fs_dir = target_repro_dir / str(view_for_path)
+        metadata_path = target_fs_dir / "multi_model_metadata.json"
+        confidence_path = target_fs_dir / "target_confidence.json"
+        
+        score = None
+        sample_size = None
+        failed_families = []
+        leakage_status = "UNKNOWN"
+        metrics_data = None
+        
+        # 1. Try canonical location: find latest cohort in reproducibility/CROSS_SECTIONAL
+        # Use SST-aware cohort scanner that handles stage= and universe= scoping
+        from TRAINING.orchestration.utils.target_first_paths import find_cohort_dirs
+        cohort_dirs = find_cohort_dirs(base_output_dir, target=target_clean, view=View.CROSS_SECTIONAL)
+        if not cohort_dirs and target_fs_dir.exists():
+            # Fallback: direct scan (legacy structure without universe= scoping)
+            # DETERMINISTIC: Use rglob_sorted for deterministic iteration with relative paths
+            from TRAINING.common.utils.determinism_ordering import rglob_sorted
+            cohort_dirs = rglob_sorted(
+                target_fs_dir, 
+                "cohort=*", 
+                filter_fn=lambda p: p.is_dir() and p.name.startswith("cohort=")
+            )
+        if cohort_dirs:
+                # DETERMINISTIC: Use semantic sort key (not just name) for "latest" selection
+                from TRAINING.orchestration.utils.target_first_paths import parse_attempt_id_from_cohort_dir
+                cohort_dirs_sorted = sorted(
+                    cohort_dirs,
+                    key=lambda x: (
+                        parse_attempt_id_from_cohort_dir(x),  # attempt_0 first (numeric)
+                        _parse_cohort_id_from_dirname(x.name),  # cohort_id for tie-breaking
+                        _stable_relpath(x, self._repo_root)  # repo-relative path (machine-stable)
+                    ),
+                    reverse=True
+                )
+                latest_cohort = cohort_dirs_sorted[0]
+                canonical_parquet = latest_cohort / "metrics.parquet"
+                canonical_json = latest_cohort / "metrics.json"
+                
+                # Try parquet first (canonical)
+                if canonical_parquet.exists():
+                    try:
+                        import pandas as pd
+                        df = pd.read_parquet(canonical_parquet)
+                        if len(df) > 0:
+                            metrics_data = df.iloc[0].to_dict()
+                            from TRAINING.orchestration.utils.reproducibility.utils import extract_n_effective, extract_auc
+                            score = extract_auc(metrics_data)  # SST accessor - handles both old and new structures
+                            sample_size = extract_n_effective(metrics_data)  # SST accessor
+                            logger.debug(f"✅ Loaded metrics from canonical location: {canonical_parquet}")
+                    except Exception as e:
+                        logger.debug(f"Failed to load metrics from canonical parquet: {e}")
+                
+                # Fallback to JSON in canonical location
+                if metrics_data is None and canonical_json.exists():
+                    try:
+                        with open(canonical_json, 'r') as f:
+                            metrics_data = json.load(f)
+                            from TRAINING.orchestration.utils.reproducibility.utils import extract_n_effective, extract_auc
+                            score = extract_auc(metrics_data)  # SST accessor - handles both old and new structures
+                            sample_size = extract_n_effective(metrics_data)  # SST accessor
+                            logger.debug(f"✅ Loaded metrics from canonical JSON: {canonical_json}")
+                    except Exception as e:
+                        logger.debug(f"Failed to load metrics from canonical JSON: {e}")
+        
+        # 2. Fallback to reference pointer in metrics/ directory
+        if metrics_data is None:
+            target_metrics_dir = get_target_metrics_dir(base_output_dir, target_clean)
+            view_metrics_dir = target_metrics_dir / "view=CROSS_SECTIONAL"
+            ref_file = view_metrics_dir / "latest_ref.json"
+            
+            if ref_file.exists():
+                try:
+                    with open(ref_file, 'r') as f:
+                        ref_data = json.load(f)
+                    canonical_path = Path(ref_data.get("canonical_path", ""))
+                    if canonical_path.exists():
+                        from TRAINING.common.utils.metrics import MetricsWriter
+                        metrics_data = MetricsWriter.export_metrics_json_from_parquet(canonical_path)
+                        from TRAINING.orchestration.utils.reproducibility.utils import extract_n_effective
+                        from TRAINING.orchestration.utils.reproducibility.utils import extract_auc
+                        score = extract_auc(metrics_data)  # SST accessor - handles both old and new structures
+                        sample_size = extract_n_effective(metrics_data)  # SST accessor
+                        logger.debug(f"✅ Loaded metrics via reference pointer: {canonical_path}")
+                except Exception as e:
+                    logger.debug(f"Failed to follow reference pointer: {e}")
+            
+            # Also try direct read from metrics/ (legacy compatibility)
+            if metrics_data is None:
+                metrics_parquet = view_metrics_dir / "metrics.parquet"
+                metrics_file = view_metrics_dir / "metrics.json"
+                
+                if metrics_parquet.exists():
+                    try:
+                        import pandas as pd
+                        df = pd.read_parquet(metrics_parquet)
+                        if len(df) > 0:
+                            metrics_data = df.iloc[0].to_dict()
+                            from TRAINING.orchestration.utils.reproducibility.utils import extract_n_effective, extract_auc
+                            score = extract_auc(metrics_data)  # SST accessor - handles both old and new structures
+                            sample_size = extract_n_effective(metrics_data)  # SST accessor
+                    except Exception as e:
+                        logger.debug(f"Failed to load metrics from parquet: {e}")
+                elif metrics_file.exists():
+                    try:
+                        with open(metrics_file, 'r') as f:
+                            metrics_data = json.load(f)
+                            from TRAINING.orchestration.utils.reproducibility.utils import extract_n_effective, extract_auc
+                            score = extract_auc(metrics_data)  # SST accessor - handles both old and new structures
+                            sample_size = extract_n_effective(metrics_data)  # SST accessor
+                    except Exception as e:
+                        logger.debug(f"Failed to load metrics from JSON: {e}")
+        
+        # 3. Last resort: legacy structure
+        if metrics_data is None:
+            legacy_fs_dir = base_output_dir / "REPRODUCIBILITY" / "FEATURE_SELECTION" / View.CROSS_SECTIONAL.value / target_clean
+            legacy_metrics_file = legacy_fs_dir / "metrics.json"
+            if legacy_metrics_file.exists():
+                try:
+                    with open(legacy_metrics_file, 'r') as f:
+                        metrics_data = json.load(f)
+                        from TRAINING.orchestration.utils.reproducibility.utils import extract_n_effective
+                        from TRAINING.orchestration.utils.reproducibility.utils import extract_auc
+                        score = extract_auc(metrics_data)  # SST accessor - handles both old and new structures
+                        sample_size = extract_n_effective(metrics_data)  # SST accessor
+                except Exception as e:
+                    logger.debug(f"Failed to load metrics from legacy location: {e}")
+        
+        if not metadata_path.exists() and not confidence_path.exists():
+            legacy_fs_dir = base_output_dir / "REPRODUCIBILITY" / "FEATURE_SELECTION" / View.CROSS_SECTIONAL.value / target_clean
+            if not metadata_path.exists():
+                metadata_path = legacy_fs_dir / "multi_model_metadata.json"
+            if not confidence_path.exists():
+                confidence_path = legacy_fs_dir / "target_confidence.json"
+        
+        # Load from model_metadata.json (aggregated across symbols) - fallback if metrics not found
+        if metadata_path.exists():
+            try:
+                with open(metadata_path) as f:
+                    metadata = json.load(f)
+                
+                # Aggregate scores across all symbols
+                scores = []
+                for key, data in metadata.items():
+                    if isinstance(data, dict) and "score" in data:
+                        score_val = data["score"]
+                        if score_val is not None and not np.isnan(score_val):
+                            scores.append(score_val)
+                
+                if scores:
+                    score = np.mean(scores)
+            except Exception as e:
+                logger.debug(f"Failed to load CS metrics from {metadata_path}: {e}")
+        
+        # Load from target_confidence.json
+        if confidence_path.exists():
+            try:
+                with open(confidence_path) as f:
+                    conf = json.load(f)
+                
+                # Extract score
+                if score is None:
+                    score = conf.get("auc", None)
+                
+                # Extract sample size (if available)
+                sample_size = conf.get("sample_size", None)
+            except Exception as e:
+                logger.debug(f"Failed to load CS metrics from {confidence_path}: {e}")
+        
+        # FIX: Extract universe_sig from SST (cohort metadata) before loading stability metrics
+        universe_sig = None
+        
+        # FIX: If sample_size still None, try to load from cohort metadata.json
+        if sample_size is None or sample_size == 0:
+            try:
+                # Look for latest cohort directory using SST-aware scanner
+                cohort_dirs_for_sample = find_cohort_dirs(base_output_dir, target=target_clean, view=View.CROSS_SECTIONAL)
+                if not cohort_dirs_for_sample:
+                    # Fallback: direct glob (legacy structure)
+                    # DETERMINISM: Use glob_sorted for deterministic iteration order
+                    from TRAINING.common.utils.determinism_ordering import glob_sorted
+                    cohort_dirs_for_sample = glob_sorted(target_fs_dir, "cohort=*", filter_fn=lambda p: p.is_dir())
+                if cohort_dirs_for_sample:
+                    # DETERMINISTIC: Semantic sort key (attempt_id, cohort_id, repo-relative path)
+                    # Prefer attempt_0 (first attempt), then cohort_id, then stable relative path
+                    from TRAINING.orchestration.utils.target_first_paths import parse_attempt_id_from_cohort_dir
+                    cohort_dirs_sorted = sorted(
+                        cohort_dirs_for_sample,
+                        key=lambda x: (
+                            parse_attempt_id_from_cohort_dir(x),  # attempt_0 first (numeric)
+                            _parse_cohort_id_from_dirname(x.name),  # cohort_id for tie-breaking
+                            _stable_relpath(x, self._repo_root)  # repo-relative path (machine-stable)
+                        )
+                    )
+                    latest_cohort = cohort_dirs_sorted[0]
+                    cohort_metadata_file = latest_cohort / "metadata.json"
+                    if cohort_metadata_file.exists():
+                        with open(cohort_metadata_file) as f:
+                            cohort_meta = json.load(f)
+                            from TRAINING.orchestration.utils.reproducibility.utils import extract_n_effective, extract_universe_sig
+                            sample_size = extract_n_effective(cohort_meta)
+                            if sample_size:
+                                logger.debug(f"Loaded sample_size={sample_size} from cohort metadata: {latest_cohort.name}")
+                            
+                            # FIX: Extract universe_sig from cohort metadata (SST)
+                            universe_sig = extract_universe_sig(cohort_meta)
+                            if universe_sig:
+                                logger.debug(f"Loaded universe_sig={universe_sig[:8]}... from cohort metadata: {latest_cohort.name}")
+            except Exception as e:
+                logger.debug(f"Failed to load sample_size/universe_sig from cohort metadata: {e}")
+        
+        # FIX: Fallback chain for universe_sig (SST → "ALL" as last resort)
+        if universe_sig is None:
+            # Try to extract from run context as fallback
+            try:
+                from TRAINING.orchestration.utils.run_context import load_run_context
+                context = load_run_context(base_output_dir)
+                if context:
+                    # Check if context has universe_sig or can derive from symbols
+                    if 'universe_sig' in context:
+                        universe_sig = context['universe_sig']
+                    elif 'symbols' in context:
+                        from TRAINING.orchestration.utils.run_context import compute_universe_signature
+                        symbols = context.get('symbols', [])
+                        if symbols:
+                            universe_sig = compute_universe_signature(symbols)
+            except Exception as e:
+                logger.debug(f"Could not extract universe_sig from run context: {e}")
+        
+        # FIX: Use SST universe_sig, fallback to "ALL" only as last resort
+        if universe_sig is None:
+            logger.warning(
+                f"Could not determine universe_sig for {target} from SST (cohort metadata or run context). "
+                f"Using 'ALL' as fallback. This may load stability metrics from wrong universe scope."
+            )
+            universe_sig = "ALL"  # Last resort fallback
+        
+        # Load stability metrics with SST-resolved universe_sig
+        stability_metrics = self._load_stability_metrics(target, universe_sig=universe_sig)
+        
+        # Classify stability
+        stability = self._classify_stability_from_metrics(stability_metrics)
+        
+        # Load leakage status
+        leakage_status = self._load_leakage_status(target, symbol=None)
+        
+        if score is None:
+            return None
+        
+        # CRITICAL: CS-equivalent rows always use mode=CROSS_SECTIONAL, never SYMBOL_SPECIFIC
+        # Using mode=SYMBOL_SPECIFIC with symbol=None is semantically invalid and breaks routing
+        # The view indicates the run's view, but this row is aggregate data
+        mode_for_row = View.CROSS_SECTIONAL.value  # Always CS for aggregate rows with symbol=None
+        
+        # Extract task_type and metric_name for task-aware routing thresholds
+        task_type = metrics_data.get("task_type") if metrics_data else None
+        metric_name = metrics_data.get("metric_name") if metrics_data else None
+        
+        return {
+            "target": target,
+            "symbol": None,  # CS has no symbol
+            "mode": mode_for_row,
+            "score": float(score),
+            "score_ci_low": None,  # Would need to compute from CV
+            "score_ci_high": None,
+            "stability": stability,
+            "sample_size": int(sample_size) if sample_size else 0,
+            "leakage_status": leakage_status,
+            "feature_set_id": None,  # Would need to hash feature set
+            "failed_model_families": failed_families,
+            "stability_metrics": stability_metrics,
+            "task_type": task_type,  # For task-aware routing thresholds
+            "metric_name": metric_name  # For task-aware routing thresholds
+        }
+    
+    def _load_symbol_metrics(self, target: str, symbol: str, view: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """
+        Load symbol-specific metrics for a (target, symbol) pair.
+        
+        Args:
+            target: Target name
+            symbol: Symbol name
+            view: View type (CROSS_SECTIONAL, SYMBOL_SPECIFIC)
+        
+        Returns:
+            Dict with metrics or None if not found
+        """
+        # Determine base output directory (walk up from REPRODUCIBILITY/FEATURE_SELECTION)
+        base_output_dir = self.output_dir
+        while base_output_dir.name in ["FEATURE_SELECTION", "TARGET_RANKING", "REPRODUCIBILITY", View.SYMBOL_SPECIFIC.value, View.CROSS_SECTIONAL.value, "feature_selections", "target_rankings"]:
+            base_output_dir = base_output_dir.parent
+            if not base_output_dir.parent.exists() or base_output_dir.name == "RESULTS":
+                break
+        
+        from TRAINING.orchestration.utils.target_first_paths import normalize_target_name
+        target_clean = normalize_target_name(target)
+        
+        # Try target-first structure first: targets/<target>/reproducibility/{view}/symbol=<symbol>/
+        # Use view for path construction (SST)
+        from TRAINING.orchestration.utils.target_first_paths import get_target_reproducibility_dir
+        target_repro_dir = get_target_reproducibility_dir(base_output_dir, target_clean)
+        # Normalize view to enum
+        view_enum = View.from_string(view) if isinstance(view, str) else (view if view else View.SYMBOL_SPECIFIC)
+        view_for_path = view_enum if isinstance(view_enum, View) else View.SYMBOL_SPECIFIC
+        target_fs_dir = target_repro_dir / view_for_path / f"symbol={symbol}"
+        
+        score = None
+        sample_size = None
+        failed_families = []
+        model_status = "UNKNOWN"
+        leakage_status = "UNKNOWN"
+        metrics_data = None
+        cohort_used = None
+        
+        # NEW: Look for metrics in cohort subdirectories first (matches how metrics are actually written)
+        # Use SST-aware cohort scanner that handles stage= and universe= scoping
+        from TRAINING.orchestration.utils.target_first_paths import find_cohort_dirs
+        ss_cohort_dirs = find_cohort_dirs(base_output_dir, target=target_clean, view=View.SYMBOL_SPECIFIC)
+        if not ss_cohort_dirs and target_fs_dir.exists():
+            # Fallback: direct scan (legacy structure)
+            # DETERMINISM: Use iterdir_sorted for deterministic iteration
+            from TRAINING.common.utils.determinism_ordering import iterdir_sorted
+            ss_cohort_dirs = [d for d in iterdir_sorted(target_fs_dir)
+                              if d.is_dir() and d.name.startswith("cohort=")]
+        if ss_cohort_dirs:
+            cohort_dirs = ss_cohort_dirs
+            # DETERMINISTIC: Semantic sort key (attempt_id, cohort_id, repo-relative path)
+            # Prefer attempt_0 (first attempt), then cohort_id, then stable relative path
+            from TRAINING.orchestration.utils.target_first_paths import parse_attempt_id_from_cohort_dir
+            cohort_dirs_sorted = sorted(
+                cohort_dirs,
+                key=lambda x: (
+                    parse_attempt_id_from_cohort_dir(x),  # attempt_0 first (numeric)
+                    _parse_cohort_id_from_dirname(x.name),  # cohort_id for tie-breaking
+                    _stable_relpath(x, self._repo_root)  # repo-relative path (machine-stable)
+                )
+            )
+            latest_cohort = cohort_dirs_sorted[0]
+            
+            # Log cohorts missing metrics.json (for debugging)
+            missing_metrics = [d.name for d in cohort_dirs if not (d / "metrics.json").exists()]
+            if missing_metrics:
+                logger.debug(f"Cohorts missing metrics.json: {len(missing_metrics)} of {len(cohort_dirs)}")
+            cohort_metrics_path = latest_cohort / "metrics.json"
+            
+            if cohort_metrics_path.exists():
+                    try:
+                        with open(cohort_metrics_path) as f:
+                            metrics_data = json.load(f)
+                        
+                        # DEFENSIVE: Try multiple key names, log what we found
+                        from TRAINING.orchestration.utils.reproducibility.utils import extract_n_effective, extract_auc
+                        score = extract_auc(metrics_data)  # SST accessor - handles both old and new structures
+                        if score is None:
+                            # Fallback to other score keys
+                            score = metrics_data.get('score') or metrics_data.get('composite_score')
+                        sample_size = extract_n_effective(metrics_data)  # SST accessor
+                        cohort_used = latest_cohort.name
+                        
+                        # Always log which cohort we selected (even if score missing - aids debugging)
+                        if score is None:
+                            logger.warning(
+                                f"Loaded cohort metrics.json but missing score key; "
+                                f"cohort={latest_cohort.name}, keys={list(metrics_data.keys())[:10]}, path={cohort_metrics_path}"
+                            )
+                        else:
+                            # INFO log (not debug) - core pipeline health, don't lose this
+                            # Guard formatting in case score isn't a float
+                            try:
+                                score_str = f"{float(score):.4f}"
+                            except (ValueError, TypeError):
+                                score_str = str(score)
+                            logger.info(
+                                f"Loaded symbol metrics: target={target}, symbol={symbol}, "
+                                f"cohort={latest_cohort.name}, score={score_str}, path={cohort_metrics_path}"
+                            )
+                            model_status = "OK"
+                    except Exception as e:
+                        logger.debug(f"Failed to load cohort metrics from {cohort_metrics_path}: {e}")
+        
+        # Fallback to multi_model_metadata.json (legacy structure)
+        metadata_path = None
+        if score is None:
+            # Look for multi_model_metadata.json in target-first structure
+            metadata_path = target_fs_dir / "multi_model_metadata.json"
+            
+            # Fallback to legacy structure if not found
+            if not metadata_path.exists():
+                legacy_fs_dir = base_output_dir / "REPRODUCIBILITY" / "FEATURE_SELECTION" / View.SYMBOL_SPECIFIC.value / target_clean / f"symbol={symbol}"
+                if legacy_fs_dir.exists():
+                    metadata_path = legacy_fs_dir / "multi_model_metadata.json"
+                else:
+                    metadata_path = None
+        
+        # Fallback to CROSS_SECTIONAL cohort metadata for sample_size when symbol metrics missing
+        if score is None and (not metadata_path or not metadata_path.exists()):
+            # Try to get sample_size from CROSS_SECTIONAL cohort metadata using SST-aware scanner
+            cs_cohort_dirs = find_cohort_dirs(base_output_dir, target=target_clean, view=View.CROSS_SECTIONAL)
+            if not cs_cohort_dirs:
+                # Fallback: direct scan (legacy structure)
+                cs_target_fs_dir = target_repro_dir / View.CROSS_SECTIONAL.value
+                if cs_target_fs_dir.exists():
+                    # DETERMINISTIC: Use rglob_sorted for deterministic iteration with relative paths
+                    from TRAINING.common.utils.determinism_ordering import rglob_sorted
+                    cs_cohort_dirs = rglob_sorted(
+                        cs_target_fs_dir, 
+                        "cohort=*", 
+                        filter_fn=lambda p: p.is_dir() and p.name.startswith("cohort=")
+                    )
+            if cs_cohort_dirs:
+                cohort_dirs = cs_cohort_dirs
+                # DETERMINISTIC: Semantic sort key (attempt_id, cohort_id, repo-relative path)
+                # Prefer attempt_0 (first attempt), then cohort_id, then stable relative path
+                from TRAINING.orchestration.utils.target_first_paths import parse_attempt_id_from_cohort_dir
+                cohort_dirs_sorted = sorted(
+                    cohort_dirs,
+                    key=lambda x: (
+                        parse_attempt_id_from_cohort_dir(x),  # attempt_0 first (numeric)
+                        _parse_cohort_id_from_dirname(x.name),  # cohort_id for tie-breaking
+                        _stable_relpath(x, self._repo_root)  # repo-relative path (machine-stable)
+                    )
+                )
+                latest_cohort = cohort_dirs_sorted[0]
+                metadata_file = latest_cohort / "metadata.json"
+                if metadata_file.exists():
+                    try:
+                        with open(metadata_file) as f:
+                            cohort_meta = json.load(f)
+                            # Extract sample_size from cohort metadata
+                            sample_size = cohort_meta.get('n_samples', cohort_meta.get('N', None))
+                            if sample_size:
+                                logger.debug(f"Using CROSS_SECTIONAL cohort metadata for sample_size: {sample_size}")
+                    except Exception as e:
+                        logger.debug(f"Failed to load CROSS_SECTIONAL cohort metadata: {e}")
+        
+        if score is None and metadata_path and metadata_path.exists():
+            try:
+                with open(metadata_path) as f:
+                    metadata = json.load(f)
+                
+                # Extract scores per model family
+                scores = []
+                for key, data in metadata.items():
+                    if isinstance(data, dict):
+                        if "score" in data:
+                            score_val = data["score"]
+                            if score_val is not None and not np.isnan(score_val):
+                                scores.append(score_val)
+                        
+                        # Check for failed families
+                        if "reproducibility" in data:
+                            repro = data["reproducibility"]
+                            if isinstance(repro, dict):
+                                # Check for failure indicators
+                                if repro.get("status") == "FAILED":
+                                    # Extract family from key
+                                    parts = key.split(":")
+                                    if len(parts) >= 3:
+                                        family = parts[2]
+                                        failed_families.append(family)
+                
+                if scores:
+                    score = np.mean(scores)
+                    model_status = "OK"
+                else:
+                    model_status = "FAILED"
+            except Exception as e:
+                logger.debug(f"Failed to load symbol metrics from {metadata_path}: {e}")
+        
+        # Load stability metrics
+        stability_metrics = self._load_stability_metrics(target, universe_sig=symbol)
+        
+        # Classify stability
+        stability = self._classify_stability_from_metrics(stability_metrics)
+        
+        # Load leakage status
+        leakage_status = self._load_leakage_status(target, symbol=symbol, view=view)
+        
+        if score is None:
+            return None
+        
+        # Extract task_type and metric_name for task-aware routing thresholds
+        task_type = metrics_data.get("task_type") if metrics_data else None
+        metric_name = metrics_data.get("metric_name") if metrics_data else None
+        
+        return {
+            "target": target,
+            "symbol": symbol,
+            "mode": view if view else "SYMBOL",  # Use view (SST)
+            "score": float(score),
+            "score_ci_low": None,
+            "score_ci_high": None,
+            "stability": stability,
+            "sample_size": int(sample_size) if sample_size else 0,
+            "leakage_status": leakage_status,
+            "feature_set_id": None,
+            "failed_model_families": failed_families,
+            "model_status": model_status,
+            "stability_metrics": stability_metrics,
+            "task_type": task_type,  # For task-aware routing thresholds
+            "metric_name": metric_name  # For task-aware routing thresholds
+        }
+    
+    def _load_stability_metrics(
+        self,
+        target: str,
+        universe_sig: Optional[str] = None
+    ) -> Optional[Dict[str, float]]:
+        """
+        Load stability metrics from feature importance snapshots.
+        
+        Args:
+            target: Target name
+            universe_sig: Universe ID (symbol name or "ALL" for CS)
+        
+        Returns:
+            Dict with stability metrics or None
+        """
+        try:
+            from TRAINING.stability.feature_importance.io import load_snapshots, get_snapshot_base_dir
+            from TRAINING.stability.feature_importance.analysis import compute_stability_metrics
+            
+            # Determine method based on universe
+            if universe_sig == "ALL" or universe_sig is None:
+                method = "multi_model_aggregated"
+            else:
+                method = "lightgbm"  # Default per-symbol method
+            
+            # Determine base output directory (RESULTS/{run}/)
+            # output_dir might be: REPRODUCIBILITY/FEATURE_SELECTION or REPRODUCIBILITY/TARGET_RANKING
+            # Walk up to find the run-level directory
+            base_output_dir = self.output_dir
+            while base_output_dir.name in ["FEATURE_SELECTION", "TARGET_RANKING", "REPRODUCIBILITY", "feature_selections", "target_rankings"]:
+                base_output_dir = base_output_dir.parent
+                if not base_output_dir.parent.exists() or base_output_dir.name == "RESULTS":
+                    break
+            
+            # Determine view and symbol from context
+            # For metrics aggregator, we need to search both CROSS_SECTIONAL and SYMBOL_SPECIFIC
+            # Try CROSS_SECTIONAL first (for universe_sig == "ALL" or None)
+            view = View.CROSS_SECTIONAL if (universe_sig == "ALL" or universe_sig is None) else View.SYMBOL_SPECIFIC
+            symbol = None if view == View.CROSS_SECTIONAL else universe_sig
+            
+            # Build paths for snapshots (target-first with view scoping + legacy fallback)
+            from TRAINING.orchestration.utils.target_first_paths import normalize_target_name
+            target_clean = normalize_target_name(target)
+            
+            # Try target-first structure with view scoping (new path)
+            # NOTE: ensure_exists=False to avoid creating empty directories when reading
+            try:
+                snapshot_base_dir_scoped = get_snapshot_base_dir(
+                    base_output_dir, target=target_clean, view=view, symbol=symbol,
+                    ensure_exists=False
+                )
+            except Exception:
+                snapshot_base_dir_scoped = None
+            
+            # Fallback: target-first without view scoping (old target-first path)
+            try:
+                from TRAINING.orchestration.utils.target_first_paths import get_target_reproducibility_dir
+                target_repro_dir = get_target_reproducibility_dir(base_output_dir, target_clean)
+                snapshot_base_dir_unscoped = target_repro_dir / "feature_importance_snapshots"
+            except Exception:
+                snapshot_base_dir_unscoped = None
+            
+            # Legacy REPRODUCIBILITY paths - view is already View enum at this point (set at line 656)
+            view_str = str(view)  # Convert enum to string for path construction
+            if view == View.SYMBOL_SPECIFIC and symbol:
+                repro_base_fs = base_output_dir / "REPRODUCIBILITY" / "FEATURE_SELECTION" / view_str / target_clean / f"symbol={symbol}"
+                repro_base_tr = base_output_dir / "REPRODUCIBILITY" / "TARGET_RANKING" / view_str / target_clean / f"symbol={symbol}"
+            else:
+                repro_base_fs = base_output_dir / "REPRODUCIBILITY" / "FEATURE_SELECTION" / view_str / target_clean
+                repro_base_tr = base_output_dir / "REPRODUCIBILITY" / "TARGET_RANKING" / view_str / target_clean
+            snapshot_base_dir_fs = repro_base_fs / "feature_importance_snapshots" if repro_base_fs.exists() else None
+            snapshot_base_dir_tr = repro_base_tr / "feature_importance_snapshots" if repro_base_tr.exists() else None
+            
+            # Try loading from all possible locations
+            snapshots = []
+            for snapshot_base_dir in [snapshot_base_dir_scoped, snapshot_base_dir_unscoped, snapshot_base_dir_fs, snapshot_base_dir_tr]:
+                if snapshot_base_dir is None:
+                    continue
+                if snapshot_base_dir.exists():
+                    try:
+                        found = load_snapshots(snapshot_base_dir, target, method)
+                        snapshots.extend(found)
+                    except Exception as e:
+                        logger.debug(f"Failed to load snapshots from {snapshot_base_dir}: {e}")
+            
+            if len(snapshots) < 2:
+                return None
+            
+            # Filter snapshots by universe_sig (symbol) if in SYMBOL_SPECIFIC mode
+            # This prevents comparing stability across different symbols (which is expected to have low overlap)
+            # view is already View enum at this point (set at line 656)
+            if view == View.SYMBOL_SPECIFIC and symbol:
+                # Filter to snapshots with matching symbol in universe_sig
+                symbol_prefix = f"{symbol}:"
+                filtered_snapshots = [
+                    s for s in snapshots
+                    if s.universe_sig and (s.universe_sig.startswith(symbol_prefix) or s.universe_sig == symbol)
+                ]
+                if len(filtered_snapshots) >= 2:
+                    snapshots = filtered_snapshots
+                    logger.debug(f"Filtered stability snapshots to symbol={symbol}: {len(filtered_snapshots)} snapshots")
+                elif len(snapshots) >= 2:
+                    # Fallback: use all snapshots but warn
+                    logger.warning(
+                        f"⚠️  Stability computation: Could not filter snapshots by symbol={symbol}. "
+                        f"Using all {len(snapshots)} snapshots (may include cross-symbol comparisons). "
+                        f"Low overlap may be due to symbol heterogeneity, not instability."
+                    )
+            
+            # Compute stability metrics (with filtering enabled)
+            metrics = compute_stability_metrics(snapshots, top_k=20, filter_by_universe_sig=True)
+            return metrics
+        except Exception as e:
+            logger.debug(f"Failed to load stability metrics for {target}/{universe_sig}: {e}")
+            return None
+    
+    def _classify_stability_from_metrics(
+        self,
+        stability_metrics: Optional[Dict[str, float]]
+    ) -> str:
+        """
+        Classify stability category from metrics.
+        
+        Args:
+            stability_metrics: Dict with mean_overlap, std_overlap, mean_tau, std_tau
+        
+        Returns:
+            Stability category string
+        """
+        if stability_metrics is None:
+            return "UNKNOWN"
+        
+        mean_overlap = stability_metrics.get("mean_overlap", np.nan)
+        std_overlap = stability_metrics.get("std_overlap", np.nan)
+        mean_tau = stability_metrics.get("mean_tau", np.nan)
+        std_tau = stability_metrics.get("std_tau", np.nan)
+        
+        # Check for divergence
+        if not np.isnan(std_overlap) and std_overlap > 0.20:
+            return "DIVERGED"
+        if not np.isnan(std_tau) and std_tau > 0.25:
+            return "DIVERGED"
+        
+        # Check for stability
+        if (not np.isnan(mean_overlap) and mean_overlap >= 0.70 and
+            not np.isnan(mean_tau) and mean_tau >= 0.60):
+            return "STABLE"
+        
+        # Check for drifting
+        if (not np.isnan(mean_overlap) and mean_overlap >= 0.50 and
+            not np.isnan(mean_tau) and mean_tau >= 0.40):
+            return "DRIFTING"
+        
+        return "UNKNOWN"
+    
+    def _load_leakage_status(
+        self,
+        target: str,
+        symbol: Optional[str] = None,
+        view: Optional[str] = None
+    ) -> str:
+        """
+        Load leakage status for target (and optionally symbol).
+        
+        Escalation policy: If leakage is BLOCKED but confirmed quarantine exists,
+        downgrade to SUSPECT (allow with quarantine) since the issue has been addressed.
+        
+        Args:
+            target: Target name
+            symbol: Optional symbol name
+            view: View type (CROSS_SECTIONAL, SYMBOL_SPECIFIC, etc.)
+        
+        Returns:
+            Leakage status string (SAFE, SUSPECT, BLOCKED, UNKNOWN)
+        """
+        # Look for leakage detection outputs
+        # This would depend on where leakage detection stores its results
+        # For now, default to UNKNOWN
+        
+        # Could check for:
+        # - leakage_detection/{target}/results.json
+        # - feature_selections/{target}/leakage_status.json
+        # etc.
+        
+        leakage_status = "UNKNOWN"  # Placeholder
+        
+        # Small-panel leniency: Check if we're in a small panel scenario
+        # Load small-panel config and check n_symbols from run context
+        n_symbols = None
+        try:
+            from TRAINING.orchestration.utils.run_context import load_run_context
+            context = load_run_context(self.output_dir)
+            if context:
+                n_symbols = context.get("n_symbols")
+        except Exception as e:
+            logger.debug(f"Could not load n_symbols from run context: {e}")
+        
+        # Load small-panel config
+        small_panel_cfg = {}
+        try:
+            from CONFIG.config_loader import get_safety_config
+            safety_cfg = get_safety_config()
+            safety_section = safety_cfg.get('safety', {})
+            leakage_cfg = safety_section.get('leakage_detection', {})
+            small_panel_cfg = leakage_cfg.get('small_panel', {})
+        except Exception as e:
+            logger.debug(f"Could not load small-panel config: {e}")
+        
+        # Apply small-panel leniency if enabled and conditions are met
+        if (small_panel_cfg.get('enabled', False) and 
+            n_symbols is not None and 
+            leakage_status in ["BLOCKED", "HIGH_SCORE", "SUSPICIOUS"]):
+            min_symbols_threshold = small_panel_cfg.get('min_symbols_threshold', 10)
+            downgrade_enabled = small_panel_cfg.get('downgrade_block_to_suspect', True)
+            log_warning = small_panel_cfg.get('log_warning', True)
+            
+            if n_symbols < min_symbols_threshold and downgrade_enabled:
+                if log_warning:
+                    logger.warning(
+                        f"🔒 Small panel detected (n_symbols={n_symbols} < {min_symbols_threshold}), "
+                        f"downgrading leakage severity from {leakage_status} to SUSPECT. "
+                        f"This allows dominance quarantine to attempt recovery before blocking."
+                    )
+                # Downgrade to SUSPECT (allows training to proceed, but with warning)
+                leakage_status = "SUSPECT"
+        
+        # Escalation policy: Check for confirmed quarantine
+        # If confirmed quarantine exists, leakage has been addressed via feature-level quarantine
+        # Downgrade BLOCKED to SUSPECT (or allow) to prevent blocking target/view
+        if leakage_status == "BLOCKED" and self.output_dir:
+            try:
+                from TRAINING.ranking.utils.dominance_quarantine import load_confirmed_quarantine
+                
+                # Determine view for quarantine lookup, default to CROSS_SECTIONAL
+                # Normalize view to enum
+                view_enum = View.from_string(view) if isinstance(view, str) else view
+                quarantine_view = view_enum if view_enum in (View.CROSS_SECTIONAL, View.SYMBOL_SPECIFIC) else View.CROSS_SECTIONAL
+                
+                confirmed_quarantine = load_confirmed_quarantine(
+                    output_dir=self.output_dir,
+                    target=target,
+                    view=quarantine_view,
+                    symbol=symbol
+                )
+                
+                if confirmed_quarantine:
+                    # Confirmed quarantine exists - leakage has been addressed
+                    # Downgrade BLOCKED to SUSPECT (allow with quarantine)
+                    logger.info(
+                        f"🔒 Escalation policy: Leakage BLOCKED for {target}/{quarantine_view}/{symbol or 'ALL'}, "
+                        f"but confirmed quarantine exists ({len(confirmed_quarantine)} features). "
+                        f"Downgrading to SUSPECT (allow with quarantine)."
+                    )
+                    return "SUSPECT"  # Allow with quarantine, don't block
+            except Exception as e:
+                logger.debug(f"Could not check for confirmed quarantine: {e}")
+        
+        return leakage_status
+    
+    def save_routing_candidates(
+        self,
+        candidates_df: pd.DataFrame,
+        output_path: Optional[Path] = None
+    ) -> Path:
+        """
+        Save routing candidates to disk.
+        
+        Args:
+            candidates_df: DataFrame with routing candidates
+            output_path: Optional output path (defaults to METRICS/routing_candidates.parquet)
+        
+        Returns:
+            Path where file was saved
+        """
+        if output_path is None:
+            # Use globals/routing/ (new structure)
+            from TRAINING.orchestration.utils.target_first_paths import run_root, globals_dir
+            # Find base run directory
+            base_dir = self.output_dir
+            while base_dir.name in ["FEATURE_SELECTION", "TARGET_RANKING", "REPRODUCIBILITY", "feature_selections", "target_rankings"]:
+                if not base_dir.parent.exists():
+                    break
+                base_dir = base_dir.parent
+            
+            run_root_dir = run_root(base_dir)
+            routing_dir = globals_dir(run_root_dir, "routing")
+            routing_dir.mkdir(parents=True, exist_ok=True)
+            output_path = routing_dir / "routing_candidates.parquet"
+        
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # SCOPE INVARIANT CHECK: Catch semantic violations before saving
+        # This prevents "0 jobs" failures from reaching the router
+        if "mode" in candidates_df.columns and "symbol" in candidates_df.columns:
+            # Invariant 1: No SYMBOL_SPECIFIC rows with symbol=None
+            ss_null = candidates_df[
+                (candidates_df["mode"] == View.SYMBOL_SPECIFIC.value) & 
+                (candidates_df["symbol"].isna())
+            ]
+            if len(ss_null) > 0:
+                raise ValueError(
+                    f"SCOPE INVARIANT VIOLATION: {len(ss_null)} rows have mode=SYMBOL_SPECIFIC "
+                    f"but symbol=None. This is semantically invalid. "
+                    f"Targets affected: {ss_null['target'].unique().tolist()}"
+                )
+            
+            # Invariant 2: If view=SYMBOL_SPECIFIC, must have real symbol rows
+            # SST: Determine view from actual symbols in candidates_df (same pattern as resolve_write_scope validation)
+            from TRAINING.orchestration.utils.scope_resolution import View
+            # Extract unique symbols from candidates_df
+            unique_symbols = []
+            if "symbol" in candidates_df.columns:
+                symbol_col = candidates_df["symbol"]
+                unique_symbols = symbol_col[symbol_col.notna() & (~symbol_col.isin(["__AGG__"]))].unique().tolist()
+            
+            if unique_symbols and len(unique_symbols) > 1:
+                run_view = View.CROSS_SECTIONAL.value  # Multi-symbol → CROSS_SECTIONAL
+            elif unique_symbols and len(unique_symbols) == 1:
+                run_view = View.SYMBOL_SPECIFIC.value  # Single-symbol → SYMBOL_SPECIFIC
+            else:
+                # Fallback: try universe-specific view cache (already validated in get_view_for_universe)
+                run_view = View.CROSS_SECTIONAL.value  # Default
+                try:
+                    from TRAINING.orchestration.utils.run_context import load_run_context
+                    from TRAINING.orchestration.utils.target_first_paths import run_root
+                    run_root_dir = run_root(self.output_dir)
+                    context = load_run_context(run_root_dir)
+                    if context:
+                        # Try to get from first universe in cache (already validated)
+                        views = context.get("views", {})
+                        if views:
+                            # DETERMINISTIC: Prefer CROSS_SECTIONAL, then SYMBOL_SPECIFIC (SST view preference order)
+                            # This ensures stable selection even if dict construction order changes
+                            PREFERRED_VIEW_ORDER = [View.CROSS_SECTIONAL.value, View.SYMBOL_SPECIFIC.value]
+                            cached_view = None
+                            for preferred_view in PREFERRED_VIEW_ORDER:
+                                if preferred_view in views:
+                                    cached_view = views[preferred_view].get('view')
+                                    if cached_view:
+                                        break
+                            # Fallback: sorted keys (deterministic)
+                            if not cached_view:
+                                first_key = sorted(views.keys())[0]
+                                cached_view = views[first_key].get('view')
+                            # Use cached view (get_view_for_universe already validated it)
+                            if cached_view:
+                                run_view = cached_view
+                except Exception:
+                    pass
+            
+            # Normalize run_view to enum for comparison
+            run_view_enum = View.from_string(run_view) if isinstance(run_view, str) else run_view
+            if run_view_enum == View.SYMBOL_SPECIFIC:
+                real_symbol_rows = candidates_df[
+                    (candidates_df["symbol"].notna()) & 
+                    (~candidates_df["symbol"].isin(["__AGG__"]))
+                ]
+                if len(real_symbol_rows) == 0:
+                    raise ValueError(
+                        f"SEMANTIC CONTRACT VIOLATION: view=SYMBOL_SPECIFIC but no "
+                        f"per-symbol candidate rows exist (all symbols are None or __AGG__). "
+                        f"Upstream must produce per-symbol metrics when running in SYMBOL_SPECIFIC mode."
+                    )
+            
+            logger.info(f"✅ Scope invariant check passed: {len(candidates_df)} rows, view={run_view}")
+        
+        # Save as parquet (with fallback to CSV if parquet not available)
+        try:
+            candidates_df.to_parquet(output_path, index=False)
+            logger.info(f"✅ Saved routing candidates: {output_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save as parquet ({e}), falling back to CSV")
+            csv_path = output_path.with_suffix(".csv")
+            candidates_df.to_csv(csv_path, index=False)
+            output_path = csv_path
+            logger.info(f"✅ Saved routing candidates: {output_path}")
+        
+        # Also save as JSON for human inspection
+        json_path = output_path.with_suffix(".json")
+        candidates_df.to_json(json_path, orient="records", indent=2)
+        logger.info(f"✅ Saved routing candidates JSON: {json_path}")
+        
+        return output_path

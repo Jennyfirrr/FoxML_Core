@@ -1,0 +1,128 @@
+# Feature Inference Configuration
+# Defines regex patterns and inference rules for auto-inferring feature metadata
+# Patterns are matched in priority order (highest priority wins)
+# This config is part of the reproducibility identity (hash included in run identity)
+
+feature_inference:
+  # Pattern Groups (matched in priority order: highest priority wins, ties break lexicographically)
+  patterns:
+    # Rejection patterns (highest priority - always reject)
+    rejection_patterns:
+      priority: 200  # Highest priority - rejections always win
+      patterns:
+        - pattern: "^(ret_future_|fwd_ret_)"
+          description: "Forward returns (leaky)"
+          source: "price"
+          lag_bars: -1
+          allowed_horizons: []
+          rejected: true
+        - pattern: "^tth_"
+          description: "Time-to-hit (requires future path)"
+          source: "derived"
+          lag_bars: 0
+          allowed_horizons: []
+          rejected: true
+        - pattern: "^(mfe|mdd)_"
+          description: "MFE/MDD (requires future path)"
+          source: "derived"
+          lag_bars: 0
+          allowed_horizons: []
+          rejected: true
+        - pattern: "^barrier_"
+          description: "Barrier features (encode barrier logic)"
+          source: "derived"
+          lag_bars: 0
+          allowed_horizons: []
+          rejected: true
+        - pattern: "^(y_|target_)"
+          description: "Target columns (leaky)"
+          source: "target"
+          lag_bars: 0
+          allowed_horizons: []
+          rejected: true
+        - pattern: "^p_"
+          description: "Prediction/probability features (leaky)"
+          source: "derived"
+          lag_bars: 0
+          allowed_horizons: []
+          rejected: true
+    
+    # Metadata columns (exact match - highest priority)
+    metadata_columns:
+      priority: 200  # Same as rejections (always reject)
+      exact_matches:
+        - "ts"
+        - "timestamp"
+        - "symbol"
+        - "time"
+      source: "metadata"
+      lag_bars: 0
+      allowed_horizons: []
+      rejected: true
+    
+    # Lagged returns (high priority - most specific)
+    lagged_returns:
+      priority: 100
+      pattern: "^ret_(\\d+)$"
+      description: "Lagged returns"
+      source: "price"
+      # lag_bars extracted from pattern group 1
+      # allowed_horizons computed as [lag, lag*3, lag*5, lag*12] if lag > 0
+      allowed_horizons_multipliers: [1, 3, 5, 12]
+    
+    # Technical indicators (medium priority)
+    technical_indicators:
+      priority: 50
+      patterns:
+        - pattern: "^(stoch_d|stoch_k|williams_r)_(\\d+)$"
+          group_idx: 2  # Lookback is in group 2
+          description: "Stochastic/Williams indicators"
+        - pattern: "^(rsi|cci|mfi|atr|adx|macd|bb|mom|std|var)_(\\d+)$"
+          group_idx: 2
+          description: "RSI, CCI, MFI, ATR, ADX, MACD, Bollinger Bands, Momentum, Std, Var"
+        - pattern: "^(ret|sma|ema|vol)_(\\d+)$"
+          group_idx: 2
+          description: "Returns, SMA, EMA, Volatility"
+      source: "derived"
+      default_allowed_horizons: [1, 3, 5, 12, 24, 60]
+    
+    # Volume/volatility features (same priority as technical indicators)
+    volume_volatility:
+      priority: 50
+      patterns:
+        - pattern: "^volume_(ema|sma)_(\\d+)$"
+          group_idx: 2
+          description: "Volume EMA/SMA"
+        - pattern: "^realized_vol_(\\d+)$"
+          group_idx: 1
+          description: "Realized volatility"
+        - pattern: "^vol_(ema|sma|std)_(\\d+)$"
+          group_idx: 2
+          description: "Volatility EMA/SMA/Std"
+      source: "derived"
+      default_allowed_horizons: [1, 3, 5, 12, 24, 60]
+    
+    # Compound indicators (lower priority - more complex patterns)
+    compound_indicators:
+      priority: 30
+      patterns:
+        - pattern: "^bb_(upper|lower|width|percent_b|middle)_(\\d+)$"
+          group_idx: 2
+          description: "Bollinger Bands components"
+        - pattern: "^macd_(signal|hist|diff)_(\\d+)$"
+          group_idx: 2
+          description: "MACD components"
+        - pattern: "^(stoch_k|stoch_d|rsi|cci|mfi|atr|adx|mom|std|var)_(fast|slow|wilder|smooth|upper|lower|width)_(\\d+)$"
+          group_idx: 3
+          description: "Compound technical indicators"
+      source: "derived"
+      default_allowed_horizons: [1, 3, 5, 12, 24, 60]
+    
+    # Unknown features (lowest priority - reject by default)
+    unknown:
+      priority: 0
+      description: "Unknown features (reject by default for safety)"
+      source: "unknown"
+      lag_bars: 0
+      allowed_horizons: []
+      rejected: true

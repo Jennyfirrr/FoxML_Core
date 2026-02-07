@@ -1,0 +1,79 @@
+# FoxML Live Trading Service
+#
+# This service runs the live trading engine autonomously.
+# It handles market hours internally and gracefully shuts down on SIGTERM.
+#
+# Installation:
+#   sudo cp deploy/systemd/foxml-trading.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable foxml-trading
+#   sudo systemctl start foxml-trading
+#
+# Logs:
+#   journalctl -u foxml-trading -f
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later OR Commercial
+# Copyright (c) 2025-2026 Fox ML Infrastructure LLC
+
+[Unit]
+Description=FoxML Live Trading Engine
+Documentation=https://github.com/foxmlinfra/trader
+After=network-online.target
+Wants=network-online.target
+
+# Optional: wait for time sync (important for trading)
+After=time-sync.target
+Wants=time-sync.target
+
+[Service]
+Type=simple
+User=Jennifer
+Group=Jennifer
+WorkingDirectory=/home/Jennifer/trader
+
+# Environment setup
+Environment="PATH=/home/Jennifer/miniconda3/envs/trader_env/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONPATH=/home/Jennifer/trader"
+Environment="HOME=/home/Jennifer"
+
+# Determinism settings (optional - remove for faster non-deterministic trading)
+# Environment="PYTHONHASHSEED=42"
+# Environment="REPRO_MODE=strict"
+# Environment="OMP_NUM_THREADS=1"
+# Environment="MKL_NUM_THREADS=1"
+
+# Production settings (faster, best-effort determinism)
+Environment="REPRO_MODE=best_effort"
+Environment="OMP_NUM_THREADS=4"
+Environment="MKL_NUM_THREADS=4"
+
+# The main command
+ExecStart=/home/Jennifer/trader/deploy/systemd/foxml-trading-launcher.sh
+
+# Graceful shutdown
+ExecStop=/bin/kill -SIGTERM $MAINPID
+TimeoutStopSec=30
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Restart policy
+Restart=on-failure
+RestartSec=60
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/Jennifer/trader/TRAINING/results
+ReadWritePaths=/home/Jennifer/trader/LIVE_TRADING/state
+ReadWritePaths=/home/Jennifer/trader/LIVE_TRADING/logs
+PrivateTmp=true
+
+# Resource limits
+MemoryMax=8G
+CPUQuota=200%
+
+[Install]
+WantedBy=multi-user.target

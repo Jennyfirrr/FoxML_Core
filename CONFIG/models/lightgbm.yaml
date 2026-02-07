@@ -1,0 +1,80 @@
+# LightGBM Model Configuration
+# Optimized for large-scale datasets (10M+ rows)
+
+model_family: "LightGBM"
+description: "Gradient Boosting Decision Tree - large-scale optimized"
+
+# LARGE-SCALE NOTES (70M rows):
+# - Higher min_data_in_leaf prevents overfitting
+# - More trees with early stopping = better generalization
+# - Slower learning rate = more trees = better ensemble
+# - Strong regularization is critical at scale
+
+hyperparameters:
+  # Tree structure - moderate capacity, prevent overfitting
+  num_leaves: 127         # 2^7-1, good capacity
+  max_depth: 10           # Deep enough for patterns, not too deep
+  min_data_in_leaf: 500   # HIGH - prevents overfitting on large data
+  min_child_weight: 1.0   # Additional leaf constraint
+
+  # Feature/sample sampling - critical for generalization
+  feature_fraction: 0.7   # Column subsampling (colsample_bytree)
+  bagging_fraction: 0.8   # Row subsampling (subsample)
+  bagging_freq: 1         # Enable bagging every iteration
+
+  # Regularization - strong for large datasets
+  lambda_l1: 0.1          # L1 regularization
+  lambda_l2: 1.0          # L2 regularization (stronger)
+
+  # Learning - slow and steady wins
+  learning_rate: 0.02     # Slower = more trees = better
+  n_estimators: 2000      # High limit, early stopping will cap
+  early_stopping_rounds: 50
+
+  # Performance
+  num_threads: -1         # Use all available cores
+  verbose: -1             # Suppress output
+
+# Variants for different use cases
+variants:
+  # For quick ranking/feature selection (not final training)
+  lightweight:
+    num_leaves: 31
+    max_depth: 6
+    min_data_in_leaf: 200
+    learning_rate: 0.05
+    n_estimators: 300
+    early_stopping_rounds: 20
+    lambda_l2: 0.1
+
+  # Small datasets (<1M rows)
+  small_data:
+    num_leaves: 63
+    max_depth: 8
+    min_data_in_leaf: 100
+    learning_rate: 0.03
+    n_estimators: 1000
+    early_stopping_rounds: 50
+    lambda_l2: 0.5
+
+  # Large datasets (10M+ rows) - DEFAULT behavior
+  large_scale:
+    num_leaves: 127
+    max_depth: 10
+    min_data_in_leaf: 500
+    learning_rate: 0.02
+    n_estimators: 2000
+    early_stopping_rounds: 50
+    lambda_l2: 1.0
+
+  # Very large datasets (50M+ rows) - maximum regularization
+  very_large:
+    num_leaves: 127
+    max_depth: 12
+    min_data_in_leaf: 1000
+    learning_rate: 0.01
+    n_estimators: 3000
+    early_stopping_rounds: 100
+    lambda_l1: 0.5
+    lambda_l2: 2.0
+

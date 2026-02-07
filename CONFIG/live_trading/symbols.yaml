@@ -1,0 +1,81 @@
+# Trading Universe Configuration
+# ==============================
+#
+# Symbol lists for the live trading engine.
+# Access via: get_cfg("live_trading.symbols.xyz")
+
+symbols:
+  # Core universe - highly liquid ETFs
+  universe:
+    - SPY    # S&P 500
+    - QQQ    # NASDAQ 100
+    - IWM    # Russell 2000
+    - DIA    # Dow Jones
+
+  # Sector ETFs
+  sectors:
+    - XLF    # Financials
+    - XLK    # Technology
+    - XLE    # Energy
+    - XLV    # Healthcare
+    - XLI    # Industrials
+    - XLY    # Consumer Discretionary
+    - XLP    # Consumer Staples
+    - XLU    # Utilities
+    - XLRE   # Real Estate
+    - XLB    # Materials
+    - XLC    # Communication Services
+
+  # Individual stocks - mega caps
+  stocks:
+    - AAPL   # Apple
+    - MSFT   # Microsoft
+    - GOOGL  # Alphabet
+    - AMZN   # Amazon
+    - NVDA   # NVIDIA
+    - META   # Meta
+    - TSLA   # Tesla
+    - BRK.B  # Berkshire Hathaway
+    - JPM    # JPMorgan
+    - V      # Visa
+
+  # Volatility products
+  volatility:
+    - VXX    # VIX Short-Term Futures
+    - UVXY   # 2x VIX Short-Term Futures
+
+  # Bond ETFs
+  bonds:
+    - TLT    # 20+ Year Treasury
+    - IEF    # 7-10 Year Treasury
+    - HYG    # High Yield Corporate
+    - LQD    # Investment Grade Corporate
+
+  # Commodity ETFs
+  commodities:
+    - GLD    # Gold
+    - SLV    # Silver
+    - USO    # Oil
+    - DBA    # Agriculture
+
+  # International ETFs
+  international:
+    - EFA    # EAFE (Developed Markets)
+    - EEM    # Emerging Markets
+    - FXI    # China
+    - EWJ    # Japan
+
+  # Default list for paper trading
+  # Used when no symbols specified
+  default:
+    - SPY
+    - QQQ
+    - AAPL
+    - MSFT
+    - GOOGL
+    - NVDA
+
+  # Small test list for quick runs
+  test:
+    - SPY
+    - AAPL

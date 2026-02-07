@@ -1,0 +1,141 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later OR Commercial
+# Copyright (c) 2025-2026 Fox ML Infrastructure LLC
+
+"""
+Configuration Loading for Reproducibility Tracker
+
+Functions for loading configuration values from config files.
+"""
+
+import logging
+from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+
+def load_thresholds(override: Optional[Dict[str, Dict[str, float]]] = None) -> Dict[str, Dict[str, float]]:
+    """Load reproducibility thresholds from config."""
+    if override:
+        return override
+    
+    try:
+        from CONFIG.config_loader import get_safety_config
+        safety_cfg = get_safety_config()
+        safety_section = safety_cfg.get('safety', {})
+        repro_cfg = safety_section.get('reproducibility', {})
+        thresholds_cfg = repro_cfg.get('thresholds', {})
+        
+        # Default thresholds if config missing
+        defaults = {
+            'roc_auc': {'abs': 0.005, 'rel': 0.02, 'z_score': 1.0},
+            'composite': {'abs': 0.02, 'rel': 0.05, 'z_score': 1.5},
+            'importance': {'abs': 0.05, 'rel': 0.20, 'z_score': 2.0}
+        }
+        
+        # Merge config with defaults
+        thresholds = {}
+        for metric in ['roc_auc', 'composite', 'importance']:
+            thresholds[metric] = defaults[metric].copy()
+            if metric in thresholds_cfg:
+                thresholds[metric].update(thresholds_cfg[metric])
+        
+        return thresholds
+    except Exception as e:
+        logger.debug(f"Could not load reproducibility thresholds from config: {e}, using defaults")
+        # Return defaults
+        return {
+            'roc_auc': {'abs': 0.005, 'rel': 0.02, 'z_score': 1.0},
+            'composite': {'abs': 0.02, 'rel': 0.05, 'z_score': 1.5},
+            'importance': {'abs': 0.05, 'rel': 0.20, 'z_score': 2.0}
+        }
+
+
+def load_use_z_score(override: Optional[bool] = None) -> bool:
+    """Load use_z_score setting from config."""
+    if override is not None:
+        return override
+    
+    try:
+        from CONFIG.config_loader import get_safety_config
+        safety_cfg = get_safety_config()
+        safety_section = safety_cfg.get('safety', {})
+        repro_cfg = safety_section.get('reproducibility', {})
+        return repro_cfg.get('use_z_score', True)
+    except Exception as e:
+        logger.debug(f"Could not load use_z_score from config: {e}, using default=True")
+        return True  # Default: use z-score
+
+
+def load_audit_mode() -> str:
+    """Load audit mode from config. Defaults to 'off'."""
+    try:
+        from CONFIG.config_loader import get_safety_config
+        safety_cfg = get_safety_config()
+        safety_section = safety_cfg.get('safety', {})
+        repro_cfg = safety_section.get('reproducibility', {})
+        return repro_cfg.get('audit_mode', 'off')
+    except Exception as e:
+        logger.debug(f"Could not load audit_mode from config: {e}, using default='off'")
+        return 'off'  # Default: audit mode off
+
+
+def load_cohort_aware() -> bool:
+    """
+    Load cohort_aware setting from config.
+    
+    Defaults to True (cohort-aware mode enabled) for all new installations.
+    Set to False in config only if you need legacy flat-file structure.
+    """
+    try:
+        from CONFIG.config_loader import get_safety_config
+        safety_cfg = get_safety_config()
+        safety_section = safety_cfg.get('safety', {})
+        repro_cfg = safety_section.get('reproducibility', {})
+        # Default to True (cohort-aware mode) if not specified
+        return repro_cfg.get('cohort_aware', True)
+    except Exception as e:
+        logger.debug(f"Could not load cohort_aware from config: {e}, using default=True")
+        return True  # Default: cohort-aware mode
+
+
+def load_n_ratio_threshold() -> float:
+    """Load n_ratio_threshold from config. Defaults to 0.5."""
+    try:
+        from CONFIG.config_loader import get_safety_config
+        safety_cfg = get_safety_config()
+        safety_section = safety_cfg.get('safety', {})
+        repro_cfg = safety_section.get('reproducibility', {})
+        return float(repro_cfg.get('n_ratio_threshold', 0.5))
+    except Exception as e:
+        logger.debug(f"Could not load n_ratio_threshold from config: {e}, using default=0.5")
+        return 0.5  # Default: 0.5
+
+
+def load_cohort_config_keys() -> List[str]:
+    """Load cohort_config_keys from config. Defaults to standard keys."""
+    try:
+        from CONFIG.config_loader import get_safety_config
+        safety_cfg = get_safety_config()
+        safety_section = safety_cfg.get('safety', {})
+        repro_cfg = safety_section.get('reproducibility', {})
+        keys = repro_cfg.get('cohort_config_keys', [
+            'n_effective_cs',
+            'n_symbols',
+            'date_range',
+            'cs_config'
+        ])
+        return keys if isinstance(keys, list) else [
+            'n_effective_cs',
+            'n_symbols',
+            'date_range',
+            'cs_config'
+        ]
+    except Exception as e:
+        logger.debug(f"Could not load cohort_config_keys from config: {e}, using defaults")
+        return [
+            'n_effective_cs',
+            'n_symbols',
+            'date_range',
+            'cs_config'
+        ]
+

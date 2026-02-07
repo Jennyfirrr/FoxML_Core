@@ -1,0 +1,247 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later OR Commercial
+# Copyright (c) 2025-2026 Fox ML Infrastructure LLC
+
+"""
+Data Preprocessor
+
+Handles data preprocessing for different training strategies.
+"""
+
+
+import numpy as np
+import pandas as pd
+from typing import Dict, List, Tuple, Any, Optional, Union
+import logging
+
+logger = logging.getLogger(__name__)
+
+class DataPreprocessor:
+    """Data preprocessing utilities for model training"""
+    
+    def __init__(self, config: Dict[str, Any] = None):
+        self.config = config or {}
+        self.feature_names = []
+        self.targets = []
+        
+    def prepare_training_data(self, X: np.ndarray, y_dict: Dict[str, np.ndarray], 
+                             feature_names: List[str], strategy: str = 'single_task') -> Dict[str, Any]:
+        """Prepare data for training based on strategy"""
+        
+        self.feature_names = feature_names
+        self.targets = list(y_dict.keys())
+        
+        # Validate inputs
+        self._validate_inputs(X, y_dict, feature_names)
+        
+        # Clean data
+        X_clean, y_clean = self._clean_data(X, y_dict)
+        
+        # Prepare based on strategy
+        if strategy == 'single_task':
+            return self._prepare_single_task_data(X_clean, y_clean)
+        elif strategy == 'multi_task':
+            return self._prepare_multi_task_data(X_clean, y_clean)
+        elif strategy == 'cascade':
+            return self._prepare_cascade_data(X_clean, y_clean)
+        else:
+            raise ValueError(f"Unknown strategy: {strategy}")
+    
+    def _validate_inputs(self, X: np.ndarray, y_dict: Dict[str, np.ndarray], 
+                        feature_names: List[str]):
+        """Validate input data"""
+        
+        if X.shape[0] == 0:
+            raise ValueError("X is empty")
+        
+        if len(feature_names) != X.shape[1]:
+            raise ValueError(f"Feature names length ({len(feature_names)}) doesn't match X columns ({X.shape[1]})")
+        
+        if not y_dict:
+            raise ValueError("y_dict is empty")
+        
+        # Check all targets have same length
+        target_lengths = [len(y) for y in y_dict.values()]
+        if len(set(target_lengths)) > 1:
+            raise ValueError("All targets must have same length")
+        
+        if target_lengths[0] != X.shape[0]:
+            raise ValueError("X and y dimensions don't match")
+        
+        logger.info(f"Data validation passed: {X.shape[0]} samples, {X.shape[1]} features, {len(y_dict)} targets")
+    
+    def _clean_data(self, X: np.ndarray, y_dict: Dict[str, np.ndarray]) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+        """Clean data by removing NaN values and outliers"""
+        
+        # Find valid samples (no NaN in X or any y)
+        valid_mask = ~np.isnan(X).any(axis=1)
+        
+        for target, y in y_dict.items():
+            target_valid = ~np.isnan(y)
+            valid_mask = valid_mask & target_valid
+        
+        # Apply mask
+        X_clean = X[valid_mask]
+        y_clean = {name: y[valid_mask] for name, y in y_dict.items()}
+        
+        n_removed = len(X) - len(X_clean)
+        if n_removed > 0:
+            logger.warning(f"Removed {n_removed} samples with NaN values")
+        
+        # Remove outliers if configured
+        if self.config.get('remove_outliers', False):
+            X_clean, y_clean = self._remove_outliers(X_clean, y_clean)
+        
+        logger.info(f"Cleaned data: {len(X_clean)} samples remaining")
+        return X_clean, y_clean
+    
+    def _remove_outliers(self, X: np.ndarray, y_dict: Dict[str, np.ndarray]) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+        """Remove outliers using IQR method"""
+        
+        # Calculate IQR for each feature
+        Q1 = np.percentile(X, 25, axis=0)
+        Q3 = np.percentile(X, 75, axis=0)
+        IQR = Q3 - Q1
+        
+        # Define outlier bounds
+        lower_bound = Q1 - 1.5 * IQR
+        upper_bound = Q3 + 1.5 * IQR
+        
+        # Find valid samples
+        valid_mask = np.all((X >= lower_bound) & (X <= upper_bound), axis=1)
+        
+        X_clean = X[valid_mask]
+        y_clean = {name: y[valid_mask] for name, y in y_dict.items()}
+        
+        n_removed = len(X) - len(X_clean)
+        if n_removed > 0:
+            logger.info(f"Removed {n_removed} outliers")
+        
+        return X_clean, y_clean
+    
+    def _prepare_single_task_data(self, X: np.ndarray, y_dict: Dict[str, np.ndarray]) -> Dict[str, Any]:
+        """Prepare data for single-task training"""
+        
+        return {
+            'X': X,
+            'y_dict': y_dict,
+            'feature_names': self.feature_names,
+            'targets': self.targets,
+            'strategy': 'single_task'
+        }
+    
+    def _prepare_multi_task_data(self, X: np.ndarray, y_dict: Dict[str, np.ndarray]) -> Dict[str, Any]:
+        """Prepare data for multi-task training"""
+        
+        # Ensure all targets have same length
+        target_lengths = [len(y) for y in y_dict.values()]
+        if len(set(target_lengths)) > 1:
+            raise ValueError("All targets must have same length for multi-task learning")
+        
+        return {
+            'X': X,
+            'y_dict': y_dict,
+            'feature_names': self.feature_names,
+            'targets': self.targets,
+            'strategy': 'multi_task',
+            'n_targets': len(y_dict)
+        }
+    
+    def _prepare_cascade_data(self, X: np.ndarray, y_dict: Dict[str, np.ndarray]) -> Dict[str, Any]:
+        """Prepare data for cascade training"""
+        
+        # Separate targets by type
+        barrier_targets = []
+        fwd_ret_targets = []
+        
+        for target, y in y_dict.items():
+            if target.startswith('fwd_ret_'):
+                fwd_ret_targets.append(target)
+            elif any(target.startswith(prefix) for prefix in 
+                    ['will_peak', 'will_valley', 'mdd', 'mfe', 'y_will_']):
+                barrier_targets.append(target)
+            else:
+                # Default to regression for unknown targets
+                fwd_ret_targets.append(target)
+        
+        return {
+            'X': X,
+            'y_dict': y_dict,
+            'feature_names': self.feature_names,
+            'targets': self.targets,
+            'strategy': 'cascade',
+            'barrier_targets': barrier_targets,
+            'fwd_ret_targets': fwd_ret_targets
+        }
+    
+    def get_data_summary(self, X: np.ndarray, y_dict: Dict[str, np.ndarray]) -> Dict[str, Any]:
+        """Get summary statistics of the data"""
+        
+        summary = {
+            'n_samples': len(X),
+            'n_features': X.shape[1],
+            'n_targets': len(y_dict),
+            'feature_stats': {
+                'mean': np.mean(X, axis=0),
+                'std': np.std(X, axis=0),
+                'min': np.min(X, axis=0),
+                'max': np.max(X, axis=0)
+            },
+            'target_stats': {}
+        }
+        
+        # Target statistics
+        for target, y in y_dict.items():
+            summary['target_stats'][target] = {
+                'mean': float(np.mean(y)),
+                'std': float(np.std(y)),
+                'min': float(np.min(y)),
+                'max': float(np.max(y)),
+                'n_unique': len(np.unique(y)),
+                'n_nan': int(np.sum(np.isnan(y)))
+            }
+        
+        return summary
+    
+    def create_train_test_split(self, X: np.ndarray, y_dict: Dict[str, np.ndarray], 
+                               test_size: Optional[float] = None,  # Load from config if None
+                               seed: Optional[int] = None  # Load from determinism system if None
+                               ) -> Dict[str, Any]:
+        """Create train/test split"""
+        # Load from config if not provided
+        if test_size is None:
+            try:
+                from CONFIG.config_loader import get_cfg
+                test_size = float(get_cfg("preprocessing.validation.test_size", default=0.2, config_name="preprocessing_config"))
+            except Exception:
+                test_size = 0.2  # FALLBACK_DEFAULT_OK
+        
+        if seed is None:
+            try:
+                from TRAINING.common.determinism import BASE_SEED
+                seed = BASE_SEED if BASE_SEED is not None else 42  # FALLBACK_DEFAULT_OK
+            except Exception:
+                seed = 42  # FALLBACK_DEFAULT_OK
+        
+        from sklearn.model_selection import train_test_split
+        
+        # Split X
+        X_train, X_test, indices_train, indices_test = train_test_split(
+            X, np.arange(len(X)), test_size=test_size, random_state=seed
+        )
+        
+        # Split y_dict
+        y_train = {}
+        y_test = {}
+        
+        for target, y in y_dict.items():
+            y_train[target] = y[indices_train]
+            y_test[target] = y[indices_test]
+        
+        return {
+            'X_train': X_train,
+            'X_test': X_test,
+            'y_train': y_train,
+            'y_test': y_test,
+            'indices_train': indices_train,
+            'indices_test': indices_test
+        }

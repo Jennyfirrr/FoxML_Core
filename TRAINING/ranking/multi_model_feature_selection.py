@@ -1,0 +1,3231 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later OR Commercial
+# Copyright (c) 2025-2026 Fox ML Infrastructure LLC
+
+"""
+Multi-Model Feature Selection Pipeline
+
+Combines feature importance from multiple model families to find robust features
+that have predictive power across diverse architectures.
+
+Strategy:
+1. Train multiple model families (tree-based, neural, specialized)
+2. Extract importance using best method per family:
+   - Tree models: Native feature_importances_ (gain/split)
+   - Neural networks: SHAP TreeExplainer approximation or permutation
+   - Linear models: Absolute coefficients
+3. Aggregate across models AND symbols
+4. Rank by consensus: features important across multiple model types
+
+This avoids model-specific biases and finds truly predictive features.
+"""
+
+# ============================================================================
+# CRITICAL: Path setup MUST happen FIRST before any TRAINING imports
+# ============================================================================
+import sys
+from pathlib import Path
+
+# Add project root FIRST (before any TRAINING.* imports)
+# TRAINING/ranking/multi_model_feature_selection.py -> parents[2] = repo root
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+# ============================================================================
+# CRITICAL: Import repro_bootstrap FIRST before ANY numeric libraries
+# This sets thread env vars BEFORE numpy/torch/sklearn are imported.
+# DO NOT move this import or add imports above it (except path setup)!
+# ============================================================================
+import TRAINING.common.repro_bootstrap  # noqa: F401 - side effects only
+
+# Now safe to import ML libraries
+import argparse
+import inspect
+import logging
+import math
+from typing import List, Dict, Any, Tuple, Optional, Union
+import pandas as pd
+import numpy as np
+import lightgbm as lgb
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
+import json
+from collections import defaultdict
+from scipy.stats import spearmanr
+
+# DETERMINISM: Use atomic writes for crash consistency
+from TRAINING.common.utils.file_utils import write_atomic_json
+# DETERMINISM_CRITICAL: Dict iteration order must be deterministic
+from TRAINING.common.utils.determinism_ordering import sorted_items
+from dataclasses import dataclass, asdict
+import warnings
+
+# CRITICAL: Set up determinism BEFORE importing any ML libraries
+# This ensures reproducible results across runs
+try:
+    from CONFIG.config_loader import get_cfg
+    base_seed = get_cfg("pipeline.determinism.base_seed", default=42)
+except ImportError:
+    base_seed = 42  # FALLBACK_DEFAULT_OK
+
+# Import determinism system (after bootstrap has set thread env vars)
+from TRAINING.common.determinism import init_determinism_from_config, seed_for, stable_seed_from, is_strict_mode
+
+# Set global determinism immediately (reads from config, respects REPRO_MODE env var)
+BASE_SEED = init_determinism_from_config()
+
+from CONFIG.config_loader import load_model_config
+from CONFIG.config_builder import load_yaml  # CH-005: Use SST config loader
+import yaml
+import time
+from contextlib import contextmanager
+
+# Import checkpoint utility (after path is set)
+from TRAINING.orchestration.utils.checkpoint import CheckpointManager
+# Setup logging with journald support (after path is set)
+from TRAINING.orchestration.utils.logging_setup import setup_logging
+logger = setup_logging(
+    script_name="multi_model_feature_selection",
+    level=logging.INFO,
+    use_journald=True
+)
+
+# Timed context manager for performance diagnostics
+@contextmanager
+def timed(name: str, **kwargs):
+    """Context manager to time expensive operations with metadata."""
+    t0 = time.perf_counter()
+    metadata_str = " ".join(f"{k}={v}" for k, v in kwargs.items())
+    logger.info(f"⏱️ START {name} {metadata_str}")
+    try:
+        yield
+    finally:
+        dt = time.perf_counter() - t0
+        logger.info(f"⏱️ END   {name}: {dt:.2f}s ({dt/60:.2f} minutes) {metadata_str}")
+
+# Suppress warnings from SHAP/sklearn
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', message='X does not have valid feature names')
+
+# Import logging config utilities for backend verbosity
+try:
+    from CONFIG.logging_config_utils import get_backend_logging_config
+    _LOGGING_CONFIG_AVAILABLE = True
+except ImportError:
+    _LOGGING_CONFIG_AVAILABLE = False
+
+
+# Import shared config cleaner utility
+from TRAINING.common.utils.config_cleaner import clean_config_for_estimator as _clean_config_for_estimator
+
+# Import threading utilities for smart thread management
+try:
+    from TRAINING.common.threads import plan_for_family, thread_guard, default_threads
+    _THREADING_UTILITIES_AVAILABLE = True
+except ImportError:
+    _THREADING_UTILITIES_AVAILABLE = False
+    logger.warning("Threading utilities not available; will use manual thread management")
+
+
+# Import from modular components
+from TRAINING.ranking.multi_model_feature_selection.types import (
+    ModelFamilyConfig,
+    ImportanceResult
+)
+
+# Import modular trainers dispatcher
+from TRAINING.ranking.multi_model_feature_selection.trainers import dispatch_trainer
+
+# SST: Import View and Stage enums for consistent handling
+from TRAINING.orchestration.utils.scope_resolution import View, Stage
+# DETERMINISM: Import deterministic filesystem helpers
+from TRAINING.common.utils.determinism_ordering import glob_sorted
+
+
+def normalize_importance(
+    raw_importance: Optional[Union[np.ndarray, pd.Series]],
+    n_features: int,
+    family: str,
+    feature_names: Optional[List[str]] = None,
+    config: Optional[Dict[str, Any]] = None
+) -> Tuple[np.ndarray, Optional[str]]:
+    """
+    Normalize and sanitize importance vector with fallback handling for no-signal cases.
+    
+    This function ensures importance vectors are always valid (non-None, correct shape, no NaN/inf)
+    and provides a uniform fallback when there's truly no signal, preventing InvalidImportance errors.
+    
+    Args:
+        raw_importance: Raw importance values (can be None, array, or Series)
+        n_features: Expected number of features
+        family: Model family name (for logging)
+        feature_names: Optional feature names (for Series conversion)
+        config: Optional config dict with fallback settings (from aggregation.fallback)
+    
+    Returns:
+        Tuple of (normalized_importance, fallback_reason)
+        - normalized_importance: np.ndarray of shape (n_features,) with non-zero sum
+        - fallback_reason: None if no fallback used, or string reason if fallback applied
+    """
+    # Load fallback config from SST
+    try:
+        from CONFIG.config_loader import get_cfg
+        fallback_cfg = get_cfg("preprocessing.multi_model_feature_selection.aggregation.fallback", default={}, config_name="preprocessing_config")
+        uniform_importance = fallback_cfg.get('uniform_importance', 1e-6)
+        normalize_after_fallback = fallback_cfg.get('normalize_after_fallback', True)
+    except Exception as e:
+        # Fallback defaults if config unavailable
+        logger.debug(f"Failed to load fallback config: {e}, using defaults")
+        uniform_importance = config.get('uniform_importance', 1e-6) if config else 1e-6
+        normalize_after_fallback = config.get('normalize_after_fallback', True) if config else True
+    
+    # Handle None / empty
+    if raw_importance is None:
+        importance = np.zeros(n_features, dtype=float)
+    else:
+        # Convert to numpy array
+        if isinstance(raw_importance, pd.Series):
+            importance = raw_importance.values
+        else:
+            importance = np.asarray(raw_importance, dtype=float)
+        
+        # Flatten if needed
+        importance = importance.flatten()
+    
+    # Clean NaN / inf
+    importance = np.nan_to_num(importance, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    # Pad / truncate to match feature count
+    if importance.size < n_features:
+        importance = np.pad(importance, (0, n_features - importance.size), mode='constant', constant_values=0.0)
+    elif importance.size > n_features:
+        importance = importance[:n_features]
+    
+    # Defensive: ensure n_features > 0 to avoid division issues
+    if n_features <= 0:
+        logger.error(f"{family}: n_features={n_features} is invalid, using default n_features=1")
+        n_features = 1
+        importance = np.array([1.0], dtype=float)
+        return importance, f"{family}:fallback_invalid_n_features"
+    
+    # Fallback if truly no signal (all zeros)
+    if not np.any(importance > 0):
+        # No signal: treat as "no strong preference" instead of failure
+        importance = np.full(n_features, uniform_importance, dtype=float)
+        fallback_reason = f"{family}:fallback_uniform_no_signal"
+        
+        # Always ensure sum > 0 (even if normalize_after_fallback is False)
+        s = float(importance.sum())
+        if s <= 0:
+            # Defensive: if uniform_importance was 0 or negative, use 1/n
+            importance = np.full(n_features, 1.0 / n_features, dtype=float)
+            logger.warning(f"{family}: uniform_importance={uniform_importance} resulted in sum={s}, using 1/n normalization")
+        elif normalize_after_fallback:
+            # Normalize to sum to 1.0
+            importance = importance / s
+    else:
+        fallback_reason = None
+        # For non-zero importance, check sum and normalize if needed
+        s = float(importance.sum())
+        if s <= 0:
+            # Edge case: importance has some positive values but sum is still <= 0 (shouldn't happen, but defensive)
+            importance = np.full(n_features, 1.0 / n_features, dtype=float)
+            fallback_reason = f"{family}:fallback_negative_sum"
+            logger.warning(f"{family}: Importance had positive values but sum={s} <= 0, using uniform fallback")
+        elif normalize_after_fallback:
+            # Normalize existing signal
+            importance = importance / s
+    
+    # Final check: ensure sum > 0 (defensive, should always be true now)
+    s = float(importance.sum())
+    if s <= 0:
+        # Last resort: force positive sum
+        importance = np.full(n_features, 1.0 / n_features, dtype=float)
+        if fallback_reason is None:
+            fallback_reason = f"{family}:fallback_final_check"
+        logger.warning(f"{family}: Importance sum was {s} in final check, forcing uniform distribution")
+    
+    # Guarantee: sum must be > 0 (defensive check before assertion)
+    final_sum = float(importance.sum())
+    if final_sum <= 0 or not np.isfinite(final_sum):
+        # Last resort: force positive sum
+        importance = np.full(n_features, 1.0 / n_features, dtype=float)
+        if fallback_reason is None:
+            fallback_reason = f"{family}:fallback_assertion_fix"
+        logger.error(f"{family}: Importance sum was {final_sum} after all normalization, forcing uniform distribution")
+        final_sum = 1.0  # After uniform distribution, sum should be 1.0
+    
+    # Final assertion (should always pass now)
+    assert final_sum > 0 and np.isfinite(final_sum), \
+        f"Importance sum should be positive and finite after normalization (family={family}, sum={final_sum}, n_features={n_features})"
+    
+    return importance, fallback_reason
+
+
+def compute_per_model_reproducibility(
+    symbol: str,
+    target_column: str,
+    model_family: str,
+    current_score: float,
+    current_importance: pd.Series,
+    previous_data: Optional[Dict[str, Any]] = None,
+    top_k: int = 50
+) -> Dict[str, Any]:
+    """
+    Compute per-model reproducibility statistics.
+    
+    Args:
+        symbol: Symbol name
+        target_column: Target column name
+        model_family: Model family name
+        current_score: Current validation score
+        current_importance: Current importance Series
+        previous_data: Previous run data (dict with 'score' and 'importance' keys)
+        top_k: Number of top features for Jaccard calculation
+    
+    Returns:
+        Dict with reproducibility stats: delta_score, jaccard_top_k, importance_corr, status
+    """
+    if previous_data is None:
+        return {
+            "delta_score": None,
+            "jaccard_top_k": None,
+            "importance_corr": None,
+            "status": "no_previous_run"
+        }
+    
+    prev_score = previous_data.get('score')
+    prev_importance = previous_data.get('importance')
+    
+    # Compute delta_score
+    delta_score = None
+    if prev_score is not None and not math.isnan(current_score) and not math.isnan(prev_score):
+        delta_score = abs(current_score - prev_score)
+    
+    # Compute Jaccard@K
+    jaccard_top_k = None
+    if prev_importance is not None and isinstance(prev_importance, pd.Series):
+        try:
+            # Get top K features from both runs
+            current_top_k = set(current_importance.nlargest(top_k).index)
+            prev_top_k = set(prev_importance.nlargest(top_k).index)
+            
+            if current_top_k or prev_top_k:
+                intersection = len(current_top_k & prev_top_k)
+                union = len(current_top_k | prev_top_k)
+                jaccard_top_k = intersection / union if union > 0 else 0.0
+        except Exception as e:
+            logger.debug(f"    {symbol}:{model_family}: Jaccard calculation failed: {e}")
+    
+    # Compute importance correlation (Spearman)
+    importance_corr = None
+    if prev_importance is not None and isinstance(prev_importance, pd.Series):
+        try:
+            # Align features (use union of features from both runs)
+            all_features = set(current_importance.index) | set(prev_importance.index)
+            if len(all_features) > 1:
+                current_aligned = current_importance.reindex(all_features, fill_value=0.0)
+                prev_aligned = prev_importance.reindex(all_features, fill_value=0.0)
+                
+                # Compute Spearman correlation
+                corr, p_value = spearmanr(current_aligned.values, prev_aligned.values)
+                if not math.isnan(corr):
+                    importance_corr = float(corr)
+        except Exception as e:
+            logger.debug(f"    {symbol}:{model_family}: Correlation calculation failed: {e}")
+    
+    # Determine status based on thresholds
+    # Model family priorities: high-variance families get stricter thresholds
+    high_variance_families = {'neural_network', 'lasso', 'stability_selection', 'boruta', 'rfe', 'xgboost'}
+    
+    if model_family in high_variance_families:
+        delta_score_threshold = 0.01
+        min_jaccard = 0.7
+        min_corr = 0.7
+    else:
+        # More stable families (random_forest, lightgbm, catboost)
+        delta_score_threshold = 0.01
+        min_jaccard = 0.7
+        min_corr = 0.7
+    
+    # Filter/scoring methods (mutual_information, univariate_selection) use same thresholds
+    # but we'll be more lenient in logging
+    
+    status = "stable"
+    if delta_score is not None and delta_score > delta_score_threshold:
+        status = "unstable"
+    elif jaccard_top_k is not None and jaccard_top_k < min_jaccard:
+        status = "unstable"
+    elif importance_corr is not None and importance_corr < min_corr:
+        status = "unstable"
+    elif (delta_score is not None and delta_score > delta_score_threshold * 0.7) or \
+         (jaccard_top_k is not None and jaccard_top_k < min_jaccard * 1.1) or \
+         (importance_corr is not None and importance_corr < min_corr * 1.1):
+        status = "borderline"
+    
+    return {
+        "delta_score": delta_score,
+        "jaccard_top_k": jaccard_top_k,
+        "importance_corr": importance_corr,
+        "status": status
+    }
+
+
+def load_previous_model_results(
+    output_dir: Optional[Path],
+    symbol: str,
+    target_column: str,
+    model_family: str
+) -> Optional[Dict[str, Any]]:
+    """
+    Load previous run results for a specific model family.
+    
+    Args:
+        output_dir: Output directory (may contain previous run metadata)
+        symbol: Symbol name
+        target_column: Target column name
+        model_family: Model family name
+    
+    Returns:
+        Dict with 'score' and 'importance' keys, or None if not found
+    """
+    if output_dir is None:
+        return None
+    
+    try:
+        # Look for metadata JSON in output_dir (feature_selections/{target}/model_metadata.json)
+        # output_dir might be feature_selections/{target}/ or a parent
+        if output_dir.name == target_column or (output_dir.parent / target_column).exists():
+            if output_dir.name != target_column:
+                metadata_dir = output_dir.parent / target_column
+            else:
+                metadata_dir = output_dir
+        else:
+            metadata_dir = output_dir
+        
+        metadata_file = metadata_dir / "model_metadata.json"
+        
+        # Try current location first
+        if not metadata_file.exists():
+            # Try parent directories (for previous runs)
+            for parent in [metadata_dir.parent, metadata_dir.parent.parent]:
+                if parent.exists():
+                    prev_metadata = parent / "model_metadata.json"
+                    if prev_metadata.exists():
+                        metadata_file = prev_metadata
+                        break
+        
+        if metadata_file.exists():
+            with open(metadata_file, 'r') as f:
+                metadata = json.load(f)
+            
+            # Look for this symbol/target/model combination
+            key = f"{symbol}:{target_column}:{model_family}"
+            if key in metadata:
+                prev_data = metadata[key]
+                # Convert importance back to Series if needed
+                if 'importance' in prev_data and isinstance(prev_data['importance'], dict):
+                    prev_data['importance'] = pd.Series(prev_data['importance'])
+                return prev_data
+    except Exception as e:
+        logger.debug(f"Could not load previous model results for {symbol}:{model_family}: {e}")
+    
+    return None
+
+
+def save_model_metadata(
+    output_dir: Optional[Path],
+    symbol: str,
+    target_column: str,
+    model_family: str,
+    score: float,
+    importance: pd.Series,
+    reproducibility: Dict[str, Any]
+):
+    """
+    Save model metadata including reproducibility stats.
+    
+    Args:
+        output_dir: Output directory
+        symbol: Symbol name
+        target_column: Target column name
+        model_family: Model family name
+        score: Validation score
+        importance: Importance Series
+        reproducibility: Reproducibility stats dict
+    """
+    if output_dir is None:
+        return
+    
+    try:
+        # Determine metadata directory (feature_selections/{target}/)
+        if output_dir.name == target_column or (output_dir.parent / target_column).exists():
+            if output_dir.name != target_column:
+                metadata_dir = output_dir.parent / target_column
+            else:
+                metadata_dir = output_dir
+        else:
+            metadata_dir = output_dir
+        
+        metadata_file = metadata_dir / "model_metadata.json"
+        
+        # Load existing metadata
+        if metadata_file.exists():
+            with open(metadata_file, 'r') as f:
+                metadata = json.load(f)
+        else:
+            metadata = {}
+        
+        # Store this model's data
+        key = f"{symbol}:{target_column}:{model_family}"
+        metadata[key] = {
+            "score": float(score) if not math.isnan(score) else None,
+            "importance": importance.to_dict(),  # Convert Series to dict for JSON
+            "reproducibility": reproducibility
+        }
+        
+        # Save metadata - DETERMINISM: Use atomic write for crash consistency
+        metadata_dir.mkdir(parents=True, exist_ok=True)
+        write_atomic_json(metadata_file, metadata)
+    except Exception as e:
+        logger.debug(f"Could not save model metadata for {symbol}:{model_family}: {e}")
+
+
+def boruta_to_importance(
+    support: np.ndarray,
+    support_weak: Optional[np.ndarray] = None,
+    ranking: Optional[np.ndarray] = None,
+    n_features: Optional[int] = None,
+) -> Optional[np.ndarray]:
+    """
+    Build a robust importance vector from Boruta outputs.
+    
+    This function ensures that when Boruta identifies confirmed or tentative features,
+    the resulting importance array will have non-zero entries and a positive sum,
+    preventing false "InvalidImportance" errors.
+    
+    Returns values compatible with gatekeeper logic:
+    - confirmed: 1.0
+    - tentative: 0.3
+    - rejected: 0.0 (not -1.0, to ensure positive sum)
+    
+    Args:
+        support: Boolean mask of confirmed features (True=confirmed, False=rejected/tentative)
+        support_weak: Optional boolean mask of tentative features
+        ranking: Optional integer ranking array (1=confirmed, 2=tentative, >2=rejected)
+        n_features: Total number of features (inferred from support if not provided)
+    
+    Returns:
+        importance: np.ndarray of shape (n_features,) with non-zero entries
+                    for confirmed/tentative features, or None if truly no signal.
+                    Values: confirmed=1.0, tentative=0.3, rejected=0.0
+    
+    Notes:
+        - Only returns None when Boruta truly selects nothing (no confirmed, no tentative)
+        - Guarantees sum(importance) > 0 when any features are confirmed/tentative
+        - Uses gatekeeper-compatible scoring (1.0/0.3/0.0) instead of normalized values
+        - Rejected features get 0.0 (not -1.0) to ensure positive sum for validation
+    """
+    support = np.asarray(support, dtype=bool)
+    if n_features is None:
+        n_features = support.shape[0]
+
+    if support_weak is None:
+        support_weak = np.zeros_like(support, dtype=bool)
+    else:
+        support_weak = np.asarray(support_weak, dtype=bool)
+
+    # Defensive: ensure correct length
+    if support.shape[0] != n_features:
+        raise ValueError(f"support length {support.shape[0]} != n_features {n_features}")
+    if support_weak.shape[0] != n_features:
+        raise ValueError(f"support_weak length {support_weak.shape[0]} != n_features {n_features}")
+
+    has_confirmed = support.any()
+    has_tentative = support_weak.any()
+
+    # Case 1: nothing selected at all → let caller handle as "no signal"
+    if not has_confirmed and not has_tentative:
+        return None
+
+    # Initialize with zeros (rejected features)
+    importance = np.zeros(n_features, dtype=float)
+    
+    # Assign importance: confirmed=1.0, tentative=0.3
+    # Note: We use 0.0 for rejected (not -1.0) to ensure positive sum for validation
+    # The gatekeeper logic will apply penalties separately in aggregation
+    importance[support] = 1.0  # Confirmed features
+    importance[support_weak] = 0.3  # Tentative features
+    
+    # If both confirmed and tentative exist, confirmed takes precedence
+    # (support_weak should not overlap with support, but be defensive)
+    overlap = support & support_weak
+    if overlap.any():
+        # If there's overlap, confirmed takes precedence (1.0 > 0.3)
+        importance[overlap] = 1.0
+
+    # Final safety check: ensure we have positive values
+    if importance.sum() <= 0:
+        # Something is very off; treat as "no signal"
+        return None
+
+    # Guarantee: if we have confirmed/tentative, sum must be > 0
+    assert importance.sum() > 0, "Importance sum should be positive when features are selected"
+    
+    return importance
+
+
+def load_multi_model_config(config_path: Path = None) -> Dict[str, Any]:
+    """Load multi-model feature selection configuration
+    
+    Uses centralized config loader if available, otherwise falls back to manual path resolution.
+    Checks new location first (CONFIG/ranking/features/multi_model.yaml),
+    then old location (CONFIG/feature_selection/multi_model.yaml),
+    then falls back to legacy location (CONFIG/multi_model_feature_selection.yaml).
+    """
+    if config_path is None:
+        # Try using centralized config loader first
+        try:
+            from CONFIG.config_loader import get_config_path
+            config_path = get_config_path("feature_selection_multi_model")
+            if config_path.exists():
+                logger.debug(f"Using centralized config loader: {config_path}")
+            else:
+                # Fallback to manual resolution
+                config_path = None
+        except (ImportError, AttributeError):
+            # Config loader not available, use manual resolution
+            config_path = None
+        
+        if config_path is None:
+            # Manual path resolution (fallback)
+            # Try newest location first (ranking/features/)
+            newest_path = _REPO_ROOT / "CONFIG" / "ranking" / "features" / "multi_model.yaml"
+            # Then old location (feature_selection/)
+            old_path = _REPO_ROOT / "CONFIG" / "feature_selection" / "multi_model.yaml"
+            # Finally legacy location (root) - but this file was deleted, so skip
+            # legacy_path = _REPO_ROOT / "CONFIG" / "multi_model_feature_selection.yaml"
+            
+            if newest_path.exists():
+                config_path = newest_path
+                logger.debug(f"Using new config location: {config_path}")
+            elif old_path.exists():
+                config_path = old_path
+                logger.debug(f"Using old config location: {config_path} (consider migrating to ranking/features/)")
+            else:
+                logger.warning(f"Config not found in new ({newest_path}) or old ({old_path}) locations, using defaults")
+                return get_default_config()
+    
+    if not config_path.exists():
+        logger.warning(f"Config not found: {config_path}, using defaults")
+        return get_default_config()
+    
+    # CH-005: Use SST config loader instead of direct yaml.safe_load
+    config = load_yaml(config_path)
+    
+    # Inject global defaults from defaults.yaml (SST)
+    # This centralizes common settings like seed, n_jobs, etc.
+    try:
+        from CONFIG.config_loader import inject_defaults
+        
+        # Inject defaults into each model family config
+        if 'model_families' in config and config['model_families']:
+            for family_name, family_config in config['model_families'].items():
+                if 'config' in family_config and family_config['config'] is not None:
+                    family_config['config'] = inject_defaults(
+                        family_config['config'], 
+                        model_family=family_name
+                    )
+                elif 'config' not in family_config or family_config.get('config') is None:
+                    # Initialize empty config if missing/None
+                    family_config['config'] = inject_defaults({}, model_family=family_name)
+        
+        # Inject defaults into top-level sections
+        if 'sampling' in config and config.get('sampling') is not None:
+            config['sampling'] = inject_defaults(config['sampling'])
+        if 'permutation' in config and config.get('permutation') is not None:
+            config['permutation'] = inject_defaults(config['permutation'])
+            
+    except Exception as e:
+        logger.warning(f"Failed to inject defaults: {e}, continuing without defaults")
+    
+    logger.info(f"Loaded multi-model config from {config_path}")
+    return config
+
+
+def get_default_config() -> Dict[str, Any]:
+    """Default configuration if file doesn't exist"""
+    # Load default max_samples from config
+    try:
+        from CONFIG.config_loader import get_cfg, load_model_config
+        default_max_samples = int(get_cfg("pipeline.data_limits.default_max_samples_feature_selection", default=50000, config_name="pipeline_config"))
+        validation_split = float(get_cfg("preprocessing.validation.test_size", default=0.2, config_name="preprocessing_config"))
+        
+        # Load aggregation settings from config
+        agg_cfg = get_cfg("preprocessing.multi_model_feature_selection.aggregation", default={}, config_name="preprocessing_config")
+        model_weights_cfg = get_cfg("preprocessing.multi_model_feature_selection.model_weights", default={}, config_name="preprocessing_config")
+        rf_cfg = get_cfg("preprocessing.multi_model_feature_selection.random_forest", default={}, config_name="preprocessing_config")
+        nn_cfg = get_cfg("preprocessing.multi_model_feature_selection.neural_network", default={}, config_name="preprocessing_config")
+        
+        # Load model configs (load_model_config returns hyperparameters directly, like Phase 3)
+        try:
+            lgb_hyperparams = load_model_config('lightgbm')
+        except Exception as e:
+            logger.debug(f"Failed to load LightGBM config: {e}, using empty config")
+            lgb_hyperparams = {}
+
+        try:
+            xgb_hyperparams = load_model_config('xgboost')
+        except Exception as e:
+            logger.debug(f"Failed to load XGBoost config: {e}, using empty config")
+            xgb_hyperparams = {}
+
+        try:
+            mlp_hyperparams = load_model_config('mlp')
+        except Exception as e:
+            logger.debug(f"Failed to load MLP config: {e}, using empty config")
+            mlp_hyperparams = {}
+    except Exception as e:
+        # CH-006: Strict mode fails on config errors, non-strict gracefully degrades
+        if is_strict_mode():
+            from TRAINING.common.exceptions import ConfigError
+            raise ConfigError(f"CH-006: Failed to load default config values in strict mode: {e}") from e
+        logger.warning(f"Failed to load default config values: {e}, using hardcoded defaults")
+        default_max_samples = 50000
+        validation_split = 0.2
+        agg_cfg = {}
+        model_weights_cfg = {}
+        rf_cfg = {}
+        nn_cfg = {}
+        lgb_hyperparams = {}
+        xgb_hyperparams = {}
+        mlp_hyperparams = {}
+    
+    # Build model families config with defaults and config overrides
+    return {
+        'model_families': {
+            'lightgbm': {
+                'enabled': True,
+                'importance_method': 'native',
+                'weight': model_weights_cfg.get('lightgbm', 1.0),
+                'config': {
+                    'objective': 'regression_l1',
+                    'metric': 'mae',
+                    'n_estimators': lgb_hyperparams.get('n_estimators', 1000),  # Match Phase 3 default
+                    'learning_rate': lgb_hyperparams.get('learning_rate', 0.03),  # Match Phase 3 default
+                    'num_leaves': lgb_hyperparams.get('num_leaves', 96),  # Match Phase 3 default
+                    'max_depth': lgb_hyperparams.get('max_depth', 8),  # Match Phase 3 default
+                    'verbose': -1
+                }
+            },
+            'xgboost': {
+                'enabled': True,
+                'importance_method': 'native',
+                'weight': model_weights_cfg.get('xgboost', 1.0),
+                'config': {
+                    'objective': 'reg:squarederror',
+                    'n_estimators': xgb_hyperparams.get('n_estimators', 1000),  # Match Phase 3 default
+                    'learning_rate': xgb_hyperparams.get('eta', xgb_hyperparams.get('learning_rate', 0.03)),  # Match Phase 3 default (eta is XGBoost's learning_rate)
+                    'max_depth': xgb_hyperparams.get('max_depth', 7),  # Match Phase 3 default
+                    'verbosity': 0
+                }
+            },
+            'random_forest': {
+                'enabled': True,
+                'importance_method': 'native',
+                'weight': model_weights_cfg.get('random_forest', 0.8),
+                'config': {
+                    # Load from preprocessing config (no model_config file yet)
+                    'n_estimators': rf_cfg.get('n_estimators', 200),
+                    'max_depth': rf_cfg.get('max_depth', 15),
+                    'max_features': rf_cfg.get('max_features', 'sqrt'),
+                    'n_jobs': rf_cfg.get('n_jobs', 4)
+                }
+            },
+            'neural_network': {
+                'enabled': True,
+                'importance_method': 'permutation',
+                'weight': model_weights_cfg.get('neural_network', 1.2),
+                'config': {
+                    'hidden_layer_sizes': tuple(mlp_hyperparams.get('hidden_layers', [256, 128, 64])),  # Match Phase 3 default
+                    'max_iter': mlp_hyperparams.get('epochs', mlp_hyperparams.get('max_iter', 50)),  # Match Phase 3 default
+                    'early_stopping': True,
+                    'validation_fraction': nn_cfg.get('validation_fraction', 0.1)  # Load from config
+                }
+            }
+        },
+        'aggregation': {
+            'per_symbol_method': agg_cfg.get('per_symbol_method', 'mean'),
+            'cross_model_method': agg_cfg.get('cross_model_method', 'weighted_mean'),
+            'require_min_models': agg_cfg.get('require_min_models', 2),
+            'consensus_threshold': agg_cfg.get('consensus_threshold', 0.5),
+            'boruta_confirm_bonus': agg_cfg.get('boruta_confirm_bonus', 0.2),
+            'boruta_reject_penalty': agg_cfg.get('boruta_reject_penalty', -0.3),
+            'boruta_confirmed_threshold': agg_cfg.get('boruta_confirmed_threshold', 0.9),
+            'boruta_tentative_threshold': agg_cfg.get('boruta_tentative_threshold', 0.0),
+            'boruta_magnitude_warning_threshold': agg_cfg.get('boruta_magnitude_warning_threshold', 0.5)
+        },
+        'sampling': {
+            'max_samples_per_symbol': default_max_samples,
+            'validation_split': validation_split
+        }
+    }
+
+
+# Import from modular components (keeping original implementations for now due to complexity)
+# from TRAINING.ranking.multi_model_feature_selection.importance_extractors import (
+#     safe_load_dataframe,
+#     extract_native_importance,
+#     extract_shap_importance,
+#     extract_permutation_importance
+# )
+
+def safe_load_dataframe(file_path: Path) -> pd.DataFrame:
+    """Safely load a parquet file"""
+    try:
+        return pd.read_parquet(file_path)
+    except Exception as e:
+        logger.error(f"Failed to load {file_path}: {e}")
+        raise
+
+
+def extract_native_importance(model, feature_names: List[str]) -> pd.Series:
+    """Extract native feature importance from various model types"""
+    if hasattr(model, 'feature_importance'):
+        # LightGBM
+        importance = model.feature_importance(importance_type='gain')
+    elif hasattr(model, 'get_feature_importance'):
+        # CatBoost
+        importance = model.get_feature_importance()
+    elif hasattr(model, 'feature_importances_'):
+        # sklearn models (RF, XGBoost sklearn API, HistGradientBoosting, etc.)
+        importance = model.feature_importances_
+    elif hasattr(model, 'coef_'):
+        # Linear models (Lasso, Ridge, ElasticNet)
+        importance = np.abs(model.coef_)
+    elif hasattr(model, 'get_score'):
+        # XGBoost native API
+        score_dict = model.get_score(importance_type='gain')
+        importance = np.array([score_dict.get(f, 0.0) for f in feature_names])
+    elif hasattr(model, 'importance'):
+        # Dummy model for mutual information
+        importance = model.importance
+    else:
+        raise ValueError(f"Model does not have native feature importance. Available attributes: {dir(model)}")
+    
+    # Ensure importance matches feature_names length
+    if len(importance) != len(feature_names):
+        logger.warning(f"Importance length ({len(importance)}) doesn't match features ({len(feature_names)})")
+        # Pad or truncate if needed
+        if len(importance) < len(feature_names):
+            importance = np.pad(importance, (0, len(feature_names) - len(importance)), 'constant')
+        else:
+            importance = importance[:len(feature_names)]
+    
+    return pd.Series(importance, index=feature_names)
+
+
+def extract_shap_importance(model, X: np.ndarray, feature_names: List[str],
+                           max_samples: int = None,
+                           model_family: Optional[str] = None,
+                           target_column: Optional[str] = None,
+                           symbol: Optional[str] = None) -> pd.Series:
+    """Extract SHAP-based feature importance"""
+    # Load default max_samples for SHAP from config if not provided
+    if max_samples is None:
+        try:
+            from CONFIG.config_loader import get_cfg
+            max_samples = int(get_cfg("pipeline.data_limits.max_cs_samples", default=1000, config_name="pipeline_config"))
+        except Exception as e:
+            logger.debug(f"Failed to load max_cs_samples from config: {e}, using default=1000")
+            max_samples = 1000
+    
+    try:
+        import shap
+    except ImportError:
+        logger.warning("SHAP not available, falling back to permutation importance")
+        return extract_permutation_importance(model, X, None, feature_names,
+                                             model_family=model_family,
+                                             target_column=target_column,
+                                             symbol=symbol)
+    
+    # Sample for computational efficiency - use deterministic sampling
+    if len(X) > max_samples:
+        # Generate deterministic seed for SHAP sampling
+        shap_sample_seed = stable_seed_from(['shap', 'sampling'])
+        np.random.seed(shap_sample_seed)
+        indices = np.random.choice(len(X), max_samples, replace=False)
+        X_sample = X[indices]
+    else:
+        X_sample = X
+    
+    try:
+        # TreeExplainer for tree models
+        if hasattr(model, 'tree_'):
+            explainer = shap.TreeExplainer(model)
+        else:
+            # KernelExplainer for other models (slower)
+            # Load sample size from config
+            try:
+                from CONFIG.config_loader import get_cfg
+                kernel_sample_size = int(get_cfg("preprocessing.multi_model_feature_selection.shap.kernel_explainer_sample_size", default=100, config_name="preprocessing_config"))
+            except Exception as e:
+                logger.debug(f"Failed to load kernel_explainer_sample_size from config: {e}, using default=100")
+                kernel_sample_size = 100
+            explainer = shap.KernelExplainer(model.predict, X_sample[:kernel_sample_size])
+        
+        shap_values = explainer.shap_values(X_sample)
+        
+        # Handle multi-output or single output
+        if isinstance(shap_values, list):
+            shap_values = shap_values[0]
+        
+        # Mean absolute SHAP value per feature
+        mean_abs_shap = np.mean(np.abs(shap_values), axis=0)
+        
+        return pd.Series(mean_abs_shap, index=feature_names)
+    
+    except Exception as e:
+        logger.warning(f"SHAP extraction failed: {e}, falling back to permutation")
+        return extract_permutation_importance(model, X, None, feature_names, 
+                                               model_family=model_family if 'model_family' in locals() else None,
+                                               target_column=target_column if 'target_column' in locals() else None,
+                                               symbol=symbol if 'symbol' in locals() else None)
+
+# Module-level function for CatBoost importance computation (must be picklable for multiprocessing)
+def _compute_catboost_importance_worker(model_data, X_data, feature_names_data, result_queue):
+    """
+    Worker process to compute CatBoost importance.
+    
+    This must be a module-level function (not nested) to be picklable for multiprocessing.
+    CRITICAL: CatBoost get_feature_importance() requires Pool objects when data parameter is provided.
+    """
+    try:
+        import numpy as np
+        from catboost import Pool
+        
+        # CRITICAL: CatBoost requires Pool objects for get_feature_importance(data=...)
+        # Convert numpy array to Pool if needed
+        if isinstance(X_data, np.ndarray):
+            # Get categorical features if available
+            cat_features = []
+            if hasattr(model_data, 'cat_features'):
+                cat_features = model_data.cat_features
+            elif hasattr(model_data, 'base_model') and hasattr(model_data.base_model, 'get_cat_feature_indices'):
+                try:
+                    cat_features = model_data.base_model.get_cat_feature_indices()
+                except Exception:
+                    cat_features = []
+            
+            importance_data = Pool(data=X_data, cat_features=cat_features if cat_features else None)
+        else:
+            importance_data = X_data
+        
+        if hasattr(model_data, 'base_model'):
+            importance_raw = model_data.base_model.get_feature_importance(data=importance_data, type='PredictionValuesChange')
+        else:
+            importance_raw = model_data.get_feature_importance(data=importance_data, type='PredictionValuesChange')
+        result_queue.put(('success', pd.Series(importance_raw, index=feature_names_data)))
+    except Exception as e:
+        result_queue.put(('error', str(e)))
+
+
+def extract_permutation_importance(model, X: np.ndarray, y: np.ndarray,
+                                   feature_names: List[str],
+                                   n_repeats: int = 5,
+                                   model_family: Optional[str] = None,
+                                   target_column: Optional[str] = None,
+                                   symbol: Optional[str] = None) -> pd.Series:
+    """Extract permutation importance"""
+    try:
+        from sklearn.inspection import permutation_importance
+        
+        # Need y for permutation importance
+        if y is None:
+            logger.warning("No y provided for permutation importance, returning zeros")
+            return pd.Series(0.0, index=feature_names)
+        
+        # Generate deterministic seed for permutation importance
+        seed_parts = ['perm']
+        if model_family:
+            seed_parts.append(model_family)
+        if symbol:
+            seed_parts.append(symbol)
+        if target_column:
+            seed_parts.append(target_column)
+        perm_seed = stable_seed_from(seed_parts)
+        
+        result = permutation_importance(
+            model, X, y,
+            n_repeats=n_repeats,
+            random_state=perm_seed,
+            n_jobs=1
+        )
+        
+        return pd.Series(result.importances_mean, index=feature_names)
+    
+    except Exception as e:
+        logger.error(f"Permutation importance failed: {e}")
+        return pd.Series(0.0, index=feature_names)
+
+
+def train_model_and_get_importance(
+    model_family: str,
+    family_config: Dict[str, Any],
+    X: np.ndarray,
+    y: np.ndarray,
+    feature_names: List[str],
+    data_interval_minutes: int = 5,  # Data bar interval (default: 5 minutes)
+    target_column: Optional[str] = None,  # Target column name for horizon extraction
+    symbol: Optional[str] = None,  # Symbol name for deterministic seed generation
+    X_train: Optional[np.ndarray] = None,  # Optional: Pre-split training data (for CV-based normalization)
+    X_test: Optional[np.ndarray] = None,  # Optional: Pre-split test data (for CV-based normalization)
+    y_train: Optional[np.ndarray] = None,  # Optional: Pre-split training target
+    y_test: Optional[np.ndarray] = None  # Optional: Pre-split test target
+) -> Tuple[Any, pd.Series, str]:
+    """
+    Train a single model family and extract importance
+    
+    FIX #2: For proper CV-based normalization, pass X_train/X_test separately.
+    When provided, normalization (imputation/scaling) will fit only on X_train.
+    If not provided, falls back to full-dataset normalization (leakage risk).
+    
+    PERFORMANCE AUDIT: This function is tracked for call counts and timing.
+    """
+    
+    # Generate deterministic seed for this model/symbol/target combination
+    seed_parts = [model_family]
+    if symbol:
+        seed_parts.append(symbol)
+    if target_column:
+        seed_parts.append(target_column)
+    model_seed = stable_seed_from(seed_parts)
+    
+    # PERFORMANCE AUDIT: Track train_model_and_get_importance calls
+    import time
+    train_start_time = time.time()
+    try:
+        from TRAINING.common.utils.performance_audit import get_auditor
+        auditor = get_auditor()
+        if auditor.enabled:
+            fingerprint_kwargs = {
+                'model_family': model_family,
+                'data_shape': X.shape,
+                'n_features': len(feature_names),
+                'target': target_column,
+                'symbol': symbol
+            }
+            fingerprint = auditor._compute_fingerprint('train_model_and_get_importance', **fingerprint_kwargs)
+    except Exception:
+        auditor = None
+        fingerprint = None
+    
+    # Validate target before training
+    try:
+        from TRAINING.ranking.utils.target_validation import validate_target
+        is_valid, error_msg = validate_target(y, min_samples=10, min_class_samples=2)
+        if not is_valid:
+            logger.debug(f"    {model_family}: {error_msg}")
+            return None, pd.Series(0.0, index=feature_names), family_config['importance_method'], 0.0
+    except ImportError:
+        # Fallback: validate_target not available, use simple check
+        logger.debug(f"    {model_family}: validate_target not available, using simple validation")
+        unique_vals = np.unique(y[~np.isnan(y)])
+        if len(unique_vals) < 2:
+            logger.debug(f"    {model_family}: Target has only {len(unique_vals)} unique value(s)")
+            return None, pd.Series(0.0, index=feature_names), family_config['importance_method'], 0.0
+    
+    importance_method = family_config['importance_method']
+    model_config = family_config['config']
+    
+    # CRITICAL: Strict mode assertions for determinism
+    if is_strict_mode():
+        import os
+        # Assert threading is single-thread
+        omp_threads = os.environ.get('OMP_NUM_THREADS')
+        if omp_threads != '1':
+            logger.warning(f"Strict mode: OMP_NUM_THREADS={omp_threads}, expected '1'. Determinism may be compromised.")
+        
+        # Assert model params use single-thread AND deterministic flags AND randomness knobs
+        if model_family in ['lightgbm', 'lgbm']:
+            if model_config.get('num_threads', 1) != 1:
+                logger.warning(f"Strict mode: LightGBM num_threads={model_config.get('num_threads')}, expected 1")
+            if not model_config.get('deterministic', False):
+                logger.warning(f"Strict mode: LightGBM deterministic={model_config.get('deterministic')}, expected True")
+            # Check randomness knobs
+            if 'seed' not in model_config and 'random_state' not in model_config:
+                logger.warning(f"Strict mode: LightGBM missing seed/random_state")
+        elif model_family in ['xgboost', 'xgb']:
+            if model_config.get('nthread', 1) != 1:
+                logger.warning(f"Strict mode: XGBoost nthread={model_config.get('nthread')}, expected 1")
+            if 'seed' not in model_config and 'random_state' not in model_config:
+                logger.warning(f"Strict mode: XGBoost missing seed/random_state")
+        elif model_family in ['randomforest', 'random_forest']:
+            if model_config.get('n_jobs', 1) != 1:
+                logger.warning(f"Strict mode: RandomForest n_jobs={model_config.get('n_jobs')}, expected 1")
+            if 'random_state' not in model_config:
+                logger.warning(f"Strict mode: RandomForest missing random_state")
+        elif model_family in ['catboost', 'cat']:
+            if model_config.get('thread_count', 1) != 1:
+                logger.warning(f"Strict mode: CatBoost thread_count={model_config.get('thread_count')}, expected 1")
+            if 'random_seed' not in model_config and 'random_state' not in model_config:
+                logger.warning(f"Strict mode: CatBoost missing random_seed/random_state")
+    
+    # Load cv_n_jobs for parallelization (same logic as model_evaluation.py)
+    cv_n_jobs = 1  # Default to single-threaded
+    try:
+        from CONFIG.config_loader import get_cfg
+        cv_n_jobs = int(get_cfg("training.cv_n_jobs", default=1, config_name="intelligent_training_config"))
+    except Exception:
+        # Fallback: try to get from multi_model_config if available
+        try:
+            cv_config = model_config.get('cross_validation', {})
+            if cv_config is None:
+                cv_config = {}
+            cv_n_jobs = cv_config.get('n_jobs', 1)
+        except Exception:
+            cv_n_jobs = 1
+
+    # ==========================================================================
+    # TECH DEBT REDUCTION: Try modular trainers first (dispatch_trainer)
+    # Falls back to legacy if/elif blocks for complex trainers not yet extracted
+    # ==========================================================================
+    model = None
+    train_score = 0.0
+    _use_legacy_trainer = True  # Flag to track if we need legacy code
+
+    trainer_result, use_fallback = dispatch_trainer(
+        model_family=model_family,
+        model_config=model_config,
+        X=X,
+        y=y,
+        feature_names=feature_names,
+        model_seed=model_seed,
+        # Pass additional context for trainers that need it
+        target_column=target_column,
+        symbol=symbol,
+        data_interval_minutes=data_interval_minutes,
+    )
+
+    if not use_fallback and trainer_result is not None:
+        # Modular trainer succeeded - use its result
+        model = trainer_result.model
+        train_score = trainer_result.train_score
+        _use_legacy_trainer = False
+        logger.debug(f"    {model_family}: Using modular trainer (score={train_score:.4f})")
+
+    # All trainers are now modular (dispatched via dispatch_trainer above).
+    # If dispatch_trainer failed, return error.
+    if _use_legacy_trainer:
+        logger.error(f"Unknown model family: {model_family}")
+        return None, pd.Series(0.0, index=feature_names), importance_method, 0.0
+
+    # Extract importance based on method
+    import time
+    importance_start_time = time.time() if model_family == 'catboost' else None
+    try:
+        if importance_method == 'native':
+            if model_family == 'catboost':
+                logger.info(f"    CatBoost: Starting feature importance computation")
+            importance = extract_native_importance(model, feature_names)
+            if model_family == 'catboost' and importance_start_time:
+                importance_elapsed = time.time() - importance_start_time
+                logger.info(f"    CatBoost: Feature importance computation completed in {importance_elapsed/60:.2f} minutes")
+                
+                # Log top 10 features by importance
+                if isinstance(importance, pd.Series) and len(importance) > 0:
+                    top_10 = importance.nlargest(10)
+                    logger.info(f"    CatBoost: Top 10 features by importance:")
+                    for idx, (feat, imp) in enumerate(top_10.items(), 1):
+                        logger.info(f"      {idx:2d}. {feat}: {imp:.6f} ({imp/importance.sum()*100:.2f}%)")
+                    
+                    # Check for importance concentration (potential leakage indicator)
+                    top_5_sum = top_10.head(5).sum()
+                    total_importance = importance.sum()
+                    if total_importance > 0:
+                        top_5_pct = (top_5_sum / total_importance) * 100
+                        if top_5_pct > 50:
+                            logger.warning(f"    CatBoost: Top 5 features account for {top_5_pct:.1f}% of importance - potential overfitting or leakage")
+        elif importance_method == 'shap':
+            importance = extract_shap_importance(model, X, feature_names,
+                                                model_family=model_family,
+                                                target_column=target_column,
+                                                symbol=symbol)
+        elif importance_method == 'permutation':
+            importance = extract_permutation_importance(model, X, y, feature_names,
+                                                        model_family=model_family,
+                                                        target_column=target_column,
+                                                        symbol=symbol)
+        else:
+            logger.error(f"Unknown importance method: {importance_method}")
+            importance = pd.Series(0.0, index=feature_names)
+        
+        # Validate importance was extracted successfully
+        if importance is None:
+            logger.warning(f"    {model_family}: Importance extraction returned None, using zeros")
+            importance = pd.Series(0.0, index=feature_names)
+        elif not isinstance(importance, pd.Series):
+            logger.warning(f"    {model_family}: Importance extraction returned {type(importance)}, converting to Series")
+            importance = pd.Series(importance, index=feature_names) if hasattr(importance, '__len__') else pd.Series(0.0, index=feature_names)
+        elif len(importance) != len(feature_names):
+            logger.warning(f"    {model_family}: Importance length ({len(importance)}) != features ({len(feature_names)}), padding/truncating")
+            if len(importance) < len(feature_names):
+                importance = pd.concat([importance, pd.Series(0.0, index=feature_names[len(importance):])])
+            else:
+                importance = importance.iloc[:len(feature_names)]
+        
+    except Exception as e:
+        logger.error(f"    {model_family}: Importance extraction failed: {e}")
+        importance = pd.Series(0.0, index=feature_names)
+    
+    return model, importance, importance_method, train_score
+
+
+def process_single_symbol(
+    symbol: str,
+    data_path: Path,
+    target_column: str,
+    model_families_config: Dict[str, Dict[str, Any]],
+    max_samples: int = None,
+    explicit_interval: Optional[Union[int, str]] = None,  # Optional explicit interval from config
+    experiment_config: Optional[Any] = None,  # Optional ExperimentConfig (for data.bar_interval)
+    output_dir: Optional[Path] = None,  # Optional output directory for stability snapshots
+    selected_features: Optional[List[str]] = None,  # FIX: Use pruned feature list from shared harness
+    run_identity: Optional[Any] = None,  # RunIdentity for snapshot storage
+) -> Tuple[List[ImportanceResult], List[Dict[str, Any]]]:
+    """
+    Process a single symbol with multiple model families.
+    
+    Args:
+        symbol: Symbol name
+        data_path: Path to symbol data file
+        target_column: Target column name
+        model_families_config: Model families configuration
+        max_samples: Maximum samples per symbol
+        explicit_interval: Explicit data interval
+        experiment_config: Experiment configuration
+        output_dir: Output directory for snapshots
+        selected_features: Optional pruned feature list from shared harness (ensures consistency)
+    """
+    
+    # CH-006: Load default max_samples from config if not provided
+    if max_samples is None:
+        try:
+            from CONFIG.config_loader import get_cfg
+            max_samples = int(get_cfg("pipeline.data_limits.default_max_samples_feature_selection", default=50000, config_name="pipeline_config"))
+        except ImportError:
+            # CH-006: Strict mode fails on missing config loader
+            if is_strict_mode():
+                from TRAINING.common.exceptions import ConfigError
+                raise ConfigError("CH-006: CONFIG.config_loader not available in strict mode")
+            logger.debug("CONFIG.config_loader not available, using default max_samples=50000")
+            max_samples = 50000
+        except Exception as e:
+            # CH-006: Strict mode fails on config errors
+            if is_strict_mode():
+                from TRAINING.common.exceptions import ConfigError
+                raise ConfigError(f"CH-006: Failed to load max_samples config in strict mode: {e}") from e
+            logger.debug(f"Failed to load default_max_samples_feature_selection from config: {e}, using default=50000")
+            max_samples = 50000
+    
+    results = []
+    family_statuses = []  # Initialize family_statuses list
+    
+    try:
+        # Load data
+        df = safe_load_dataframe(data_path)
+        
+        # Validate target
+        if target_column not in df.columns:
+            logger.warning(f"Skipping {symbol}: Target '{target_column}' not found")
+            return results, family_statuses
+        
+        # Drop NaN in target
+        df = df.dropna(subset=[target_column])
+        if df.empty:
+            logger.warning(f"Skipping {symbol}: No valid data after dropping NaN")
+            return results, family_statuses
+        
+        # Sample if too large - use deterministic seed based on symbol
+        if len(df) > max_samples:
+            # Generate stable seed from symbol name for deterministic sampling
+            sample_seed = stable_seed_from([symbol, "data_sampling"])
+            df = df.sample(n=max_samples, random_state=sample_seed)
+        
+        # LEAKAGE PREVENTION: Filter out leaking features (with registry validation)
+        from TRAINING.ranking.utils.leakage_filtering import filter_features_for_target
+        from TRAINING.ranking.utils.data_interval import detect_interval_from_dataframe
+        
+        # Detect data interval for horizon conversion
+        detected_interval = detect_interval_from_dataframe(
+            df, 
+            timestamp_column='ts', 
+            default=5,
+            explicit_interval=explicit_interval,
+            experiment_config=experiment_config
+        )
+        
+        # Resolve registry overlay directory (for feature selection to consume target ranking patches)
+        registry_overlay_dir = None
+        if output_dir:
+            try:
+                from TRAINING.orchestration.utils.target_first_paths import run_root
+                from TRAINING.ranking.utils.registry_overlay_resolver import resolve_registry_overlay_dir_for_feature_selection
+                
+                run_output_root = run_root(output_dir)
+                overlay_resolution = resolve_registry_overlay_dir_for_feature_selection(
+                    run_output_root=run_output_root,
+                    experiment_config=experiment_config,
+                    target_column=target_column,
+                    current_bar_minutes=detected_interval
+                )
+                registry_overlay_dir = overlay_resolution.overlay_dir
+                
+                if overlay_resolution.overlay_kind == "patch":
+                    logger.debug(
+                        f"📋 {symbol}: Using registry patch for {target_column}: {overlay_resolution.patch_file.name} "
+                        f"(signature: {overlay_resolution.overlay_signature[:16] if overlay_resolution.overlay_signature else 'none'}...)"
+                    )
+                elif overlay_resolution.overlay_kind == "config":
+                    logger.debug(f"{symbol}: Using config registry overlay for {target_column}: {overlay_resolution.overlay_dir}")
+            except Exception as e:
+                logger.debug(f"Could not resolve registry overlay for {target_column} ({symbol}): {e}")
+        
+        # Track registry filtering stats for metadata
+        registry_stats = {
+            'features_before_registry': 0,
+            'features_after_registry': 0,
+            'features_rejected_by_registry': 0
+        }
+        
+        # FIX: Use pruned feature list from shared harness if available (ensures consistency)
+        # This prevents features like "adjusted" from "coming back" after pruning
+        # CRITICAL: Re-validate with STRICT registry filtering even if selected_features provided
+        # Shared harness uses permissive ranking mode, but we need strict mode for feature selection
+        if selected_features is not None and len(selected_features) > 0:
+            # Track stats before filtering
+            registry_stats['features_before_registry'] = len(selected_features)
+            
+            # Re-validate selected_features with STRICT registry filtering
+            # This ensures features that passed permissive ranking mode also pass strict training mode
+            from TRAINING.ranking.utils.leakage_filtering import filter_features_for_target
+            validated_features = filter_features_for_target(
+                selected_features,
+                target_column,
+                verbose=False,
+                use_registry=True,
+                data_interval_minutes=detected_interval,
+                for_ranking=False,  # CRITICAL: Use strict mode (same as training)
+                registry_overlay_dir=registry_overlay_dir  # Pass resolved overlay directory
+            )
+            
+            # Track stats after filtering
+            registry_stats['features_after_registry'] = len(validated_features)
+            registry_stats['features_rejected_by_registry'] = len(selected_features) - len(validated_features)
+            
+            # Only keep features that exist in the dataframe AND pass strict registry validation
+            available_features = [f for f in validated_features if f in df.columns]
+            
+            if len(available_features) < len(selected_features):
+                rejected = set(selected_features) - set(available_features)
+                logger.debug(f"  {symbol}: Registry strict mode rejected {len(rejected)} features from shared harness: {list(rejected)[:5]}")
+            
+            # Apply runtime quarantine (dominance quarantine confirmed features)
+            if output_dir:
+                try:
+                    from TRAINING.ranking.utils.dominance_quarantine import load_confirmed_quarantine
+                    runtime_quarantine = load_confirmed_quarantine(
+                        output_dir=output_dir,
+                        target=target_column,
+                        view=View.SYMBOL_SPECIFIC,  # process_single_symbol is always SYMBOL_SPECIFIC
+                        symbol=symbol
+                    )
+                    if runtime_quarantine:
+                        available_features = [f for f in available_features if f not in runtime_quarantine]
+                        logger.info(f"  🔒 {symbol}: Applied runtime quarantine: Removed {len(runtime_quarantine)} confirmed leaky features ({len(available_features)} remaining)")
+                except Exception as e:
+                    logger.debug(f"Could not load runtime quarantine for {symbol}: {e}")
+            
+            # Keep only validated features + target + required ID columns (ts, symbol, etc.)
+            required_cols = ['ts', 'symbol'] if 'ts' in df.columns else []
+            keep_cols = available_features + [target_column] + [c for c in required_cols if c in df.columns]
+            df = df[keep_cols]
+            logger.debug(f"  {symbol}: Using {len(available_features)} features (validated with strict registry filtering)")
+        else:
+            # Fallback: rebuild feature list (original behavior)
+            # CRITICAL: Sort columns for deterministic ordering
+            all_columns = sorted(df.columns.tolist())
+            # Track stats before filtering
+            registry_stats['features_before_registry'] = len([c for c in all_columns if c != target_column])
+            
+            # CRITICAL FIX: Use STRICT registry filtering (not permissive ranking mode)
+            # This ensures features selected here will also pass training-time registry validation
+            # If we use permissive mode here, we'll select features that get rejected at training time
+            safe_columns = filter_features_for_target(
+                all_columns, 
+                target_column, 
+                verbose=False,
+                use_registry=True,  # Enable registry validation
+                data_interval_minutes=detected_interval,
+                for_ranking=False,  # CRITICAL: Use strict mode (same as training), not permissive ranking mode
+                registry_overlay_dir=registry_overlay_dir  # Pass resolved overlay directory
+            )
+            
+            # Track stats after filtering
+            registry_stats['features_after_registry'] = len([c for c in safe_columns if c != target_column])
+            registry_stats['features_rejected_by_registry'] = registry_stats['features_before_registry'] - registry_stats['features_after_registry']
+            
+            # Keep only safe features + target
+            safe_columns_with_target = [c for c in safe_columns if c != target_column] + [target_column]
+            df = df[safe_columns_with_target]
+            
+            logger.debug(f"  {symbol}: Registry filtering (strict mode): {registry_stats['features_before_registry']} → {registry_stats['features_after_registry']} features ({registry_stats['features_rejected_by_registry']} rejected)")
+        
+        # Prepare features (target already in safe list, so exclude it explicitly)
+        X = df.drop(columns=[target_column], errors='ignore')
+        
+        # FIX: Enforce numeric dtypes BEFORE any model training (prevents CatBoost object column errors)
+        # This is critical - CatBoost treating numeric columns as object/text causes fake performance
+        import pandas as pd
+        import numpy as np
+        
+        # Convert to DataFrame if needed
+        if isinstance(X, np.ndarray):
+            X_df = pd.DataFrame(X, columns=X.columns if hasattr(X, 'columns') else [f'f{i}' for i in range(X.shape[1])])
+        else:
+            X_df = X.copy() if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        
+        # Hard-cast all numeric columns to float32 (prevents object dtype from NaN/mixed types)
+        object_cols = []
+        for col in X_df.columns:
+            if X_df[col].dtype.name in ['object', 'string', 'category']:
+                # Try to convert to numeric, drop if fails
+                try:
+                    X_df[col] = pd.to_numeric(X_df[col], errors='coerce').astype('float32')
+                    logger.debug(f"  {symbol}: Converted object column {col} to float32")
+                except Exception:
+                    object_cols.append(col)
+            elif pd.api.types.is_numeric_dtype(X_df[col]):
+                # Explicitly cast to float32 (prevents object dtype)
+                X_df[col] = X_df[col].astype('float32')
+        
+        # Drop columns that couldn't be converted
+        if object_cols:
+            logger.warning(f"  {symbol}: Dropping {len(object_cols)} non-numeric columns: {object_cols[:5]}")
+            X_df = X_df.drop(columns=object_cols)
+        
+        # Verify all columns are numeric
+        still_bad = [c for c in X_df.columns if not np.issubdtype(X_df[c].dtype, np.number)]
+        if still_bad:
+            raise TypeError(f"  {symbol}: Non-numeric columns remain after conversion: {still_bad[:10]}")
+        
+        # FIX: Replace inf/-inf with nan before fail-fast (prevents phantom issues)
+        # Some models (e.g., Ridge) may fail on inf values
+        X_df = X_df.replace([np.inf, -np.inf], np.nan)
+        # Drop columns that are all nan/inf
+        X_df = X_df.dropna(axis=1, how='all')
+        
+        # FIX: Initialize feature_names from X_df.columns before any filtering
+        # This prevents UnboundLocalError when feature_names is used before assignment
+        # In fallback path, feature_names may not exist from shared harness, so derive from dataframe
+        # CRITICAL: Sort feature_names for deterministic ordering
+        # DataFrame column order may not be deterministic across runs
+        feature_names = sorted(X_df.columns.tolist())
+        # Reorder DataFrame columns to match sorted feature_names
+        X_df = X_df[feature_names]
+        
+        # Update X
+        X_arr = X_df.values.astype('float32')  # Already float32 from conversion above
+        
+        y = df[target_column]
+        y_arr = y.to_numpy() if hasattr(y, 'to_numpy') else np.array(y)
+        
+        if not feature_names:
+            logger.warning(f"Skipping {symbol}: No features after filtering")
+            return results, family_statuses
+        
+        # CRITICAL: Use already-detected interval (detected above at line 773)
+        # No need to detect again - use the same detected_interval from above
+        if detected_interval != 5:
+            logger.info(f"  Detected data interval: {detected_interval}m (was assuming 5m)")
+        
+        # Infer task type from target values (for task-type filtering)
+        unique_vals = np.unique(y_arr[~np.isnan(y_arr)])
+        is_binary = len(unique_vals) == 2 and set(unique_vals).issubset({0, 1, 0.0, 1.0})
+        is_multiclass = len(unique_vals) <= 10 and len(unique_vals) > 2 and all(
+            isinstance(v, (int, np.integer)) or (isinstance(v, float) and v.is_integer())
+            for v in unique_vals
+        )
+        if is_binary:
+            inferred_task_type = "binary"
+        elif is_multiclass:
+            inferred_task_type = "multiclass"
+        else:
+            inferred_task_type = "regression"
+        
+        # Train each enabled model family with structured status tracking
+        # Filter by task type compatibility BEFORE training (prevents garbage importance scores)
+        from TRAINING.training_strategies.utils import is_family_compatible
+        enabled_families = []
+        for family_name, family_cfg in model_families_config.items():
+            if not family_cfg.get('enabled', False):
+                continue
+            compatible, skip_reason = is_family_compatible(family_name, inferred_task_type)
+            if compatible:
+                enabled_families.append(family_name)
+            else:
+                logger.info(f"  {symbol}: ⏭️ Skipping {family_name} for feature selection: {skip_reason}")
+                family_statuses.append({
+                    'family': family_name,
+                    'status': 'skipped',
+                    'skip_reason': skip_reason,
+                    'symbol': symbol
+                })
+        
+        # FIX: Create fallback identity using SST factory if run_identity wasn't passed
+        # This ensures ALL model families can save snapshots (not just xgboost)
+        # Mirrors TARGET_RANKING pattern from main.py:238-249
+        effective_run_identity = run_identity
+        if effective_run_identity is None:
+            try:
+                from TRAINING.common.utils.fingerprinting import create_stage_identity
+                effective_run_identity = create_stage_identity(
+                    stage=Stage.FEATURE_SELECTION,
+                    symbols=[symbol] if symbol else [],
+                    experiment_config=experiment_config,
+                )
+                logger.debug(f"  {symbol}: Created fallback FEATURE_SELECTION identity with train_seed={effective_run_identity.train_seed}")
+            except Exception as e:
+                logger.debug(f"  {symbol}: Failed to create fallback identity: {e}")
+        
+        # Log reproducibility info for this symbol
+        try:
+            from TRAINING.common.determinism import BASE_SEED
+            base_seed = BASE_SEED if BASE_SEED is not None else 42
+            logger.debug(f"  {symbol}: Reproducibility - base_seed={base_seed}, n_features={len(feature_names)}, n_samples={len(X_arr)}, detected_interval={detected_interval}m")
+        except Exception:
+            logger.debug(f"  {symbol}: Reproducibility - base_seed=N/A (determinism system unavailable)")
+        
+        # Track per-model reproducibility
+        per_model_reproducibility = []
+        
+        # Iterate only over compatible, enabled families (filtered above)
+        for family_name in enabled_families:
+            family_config = model_families_config[family_name]
+            
+            try:
+                logger.info(f"  {symbol}: Training {family_name}...")
+                model, importance, method, train_score = train_model_and_get_importance(
+                    family_name, family_config, X_arr, y_arr, feature_names,
+                    data_interval_minutes=detected_interval,
+                    target_column=target_column,
+                    symbol=symbol  # Pass symbol for deterministic seed generation
+                )
+                
+                # Compute prediction fingerprint for determinism tracking (SST)
+                model_prediction_fp = None
+                if model is not None:
+                    try:
+                        from TRAINING.common.utils.prediction_hashing import compute_prediction_fingerprint_for_model
+                        from TRAINING.common.utils.fingerprinting import get_identity_mode
+                        strict_mode = get_identity_mode() == "strict"
+                        
+                        # Get predictions from trained model
+                        y_pred = model.predict(X_arr)
+                        
+                        # Determine task type from target values
+                        unique_vals = np.unique(y_arr[~np.isnan(y_arr)])
+                        is_binary = len(unique_vals) == 2 and set(unique_vals).issubset({0, 1, 0.0, 1.0})
+                        task_type = "BINARY_CLASSIFICATION" if is_binary else "REGRESSION"
+                        
+                        # Get probabilities for classification if available
+                        y_proba = None
+                        if is_binary and hasattr(model, 'predict_proba'):
+                            try:
+                                y_proba = model.predict_proba(X_arr)
+                            except Exception:
+                                pass
+                        
+                        model_prediction_fp = compute_prediction_fingerprint_for_model(
+                            preds=y_pred,
+                            proba=y_proba,
+                            model=model,
+                            task_type=task_type,
+                            X=X_arr,
+                            strict_mode=strict_mode,
+                        )
+                        if model_prediction_fp:
+                            logger.debug(f"    {family_name}: prediction_fingerprint={model_prediction_fp.get('prediction_hash', '')[:12]}...")
+                    except Exception as fp_e:
+                        logger.debug(f"    {family_name}: prediction fingerprint failed: {fp_e}")
+                
+                # FIX: Always create ImportanceResult, even if importance is zero (failed models)
+                # This ensures all enabled families appear in results, making failures visible
+                if importance is None:
+                    # Model failed completely - create zero importance for all features
+                    importance = pd.Series(0.0, index=feature_names)
+                    logger.warning(f"    {symbol}: {family_name} importance is None (model failed), using zero importance")
+                elif hasattr(importance, '__len__') and len(importance) == 0:
+                    # Empty Series - create zero importance for all features
+                    importance = pd.Series(0.0, index=feature_names)
+                    logger.warning(f"    {symbol}: {family_name} importance is empty (model likely failed), using zero importance")
+                
+                result = ImportanceResult(
+                    model_family=family_name,
+                    symbol=symbol,
+                    importance_scores=importance,
+                    method=method,
+                    train_score=train_score
+                )
+                results.append(result)
+                
+                # Handle NaN scores gracefully (e.g., Boruta doesn't have a train score)
+                score_str = f"{train_score:.4f}" if not math.isnan(train_score) else "N/A"
+                # Only log top feature if importance is non-zero (avoid errors on zero Series)
+                if importance.sum() > 0:
+                    logger.info(f"    ✅ {family_name}: score={score_str}, "
+                              f"top feature={importance.idxmax()} ({importance.max():.2f})")
+                else:
+                    logger.warning(f"    ⚠️  {family_name}: score={score_str}, importance is all zeros (model likely failed)")
+                    
+                    # Compute per-model reproducibility
+                    previous_data = load_previous_model_results(output_dir, symbol, target_column, family_name)
+                    repro_stats = compute_per_model_reproducibility(
+                        symbol=symbol,
+                        target_column=target_column,
+                        model_family=family_name,
+                        current_score=train_score,
+                        current_importance=importance,
+                        previous_data=previous_data,
+                        top_k=50
+                    )
+                    
+                    # Store reproducibility in metadata
+                    save_model_metadata(
+                        output_dir=output_dir,
+                        symbol=symbol,
+                        target_column=target_column,
+                        model_family=family_name,
+                        score=train_score,
+                        importance=importance,
+                        reproducibility=repro_stats
+                    )
+                    
+                    # Compact logging based on status
+                    if repro_stats['status'] == 'no_previous_run':
+                        # First run - no comparison
+                        pass
+                    elif repro_stats['status'] == 'stable':
+                        # OK/stable - one compact line
+                        delta_str = f"Δscore={repro_stats['delta_score']:.3f}" if repro_stats['delta_score'] is not None else "Δscore=N/A"
+                        jaccard_str = f"Jaccard@50={repro_stats['jaccard_top_k']:.2f}" if repro_stats['jaccard_top_k'] is not None else "Jaccard@50=N/A"
+                        corr_str = f"corr={repro_stats['importance_corr']:.2f}" if repro_stats['importance_corr'] is not None else "corr=N/A"
+                        logger.info(f"  {symbol}: {family_name} reproducibility: {delta_str}, {jaccard_str}, {corr_str} [OK]")
+                    elif repro_stats['status'] == 'borderline':
+                        # Borderline - info level
+                        delta_str = f"Δscore={repro_stats['delta_score']:.3f}" if repro_stats['delta_score'] is not None else "Δscore=N/A"
+                        jaccard_str = f"Jaccard@50={repro_stats['jaccard_top_k']:.2f}" if repro_stats['jaccard_top_k'] is not None else "Jaccard@50=N/A"
+                        corr_str = f"corr={repro_stats['importance_corr']:.2f}" if repro_stats['importance_corr'] is not None else "corr=N/A"
+                        logger.info(f"  {symbol}: {family_name} reproducibility: {delta_str}, {jaccard_str}, {corr_str} [BORDERLINE]")
+                    else:  # unstable
+                        # Unstable - WARNING level
+                        delta_str = f"Δscore={repro_stats['delta_score']:.3f}" if repro_stats['delta_score'] is not None else "Δscore=N/A"
+                        jaccard_str = f"Jaccard@50={repro_stats['jaccard_top_k']:.2f}" if repro_stats['jaccard_top_k'] is not None else "Jaccard@50=N/A"
+                        corr_str = f"corr={repro_stats['importance_corr']:.2f}" if repro_stats['importance_corr'] is not None else "corr=N/A"
+                        logger.warning(f"  {symbol}: {family_name} reproducibility: {delta_str}, {jaccard_str}, {corr_str} [UNSTABLE]")
+                    
+                    # Store for symbol-level summary
+                    per_model_reproducibility.append({
+                        "family": family_name,
+                        "status": repro_stats['status'],
+                        "delta_score": repro_stats['delta_score'],
+                        "jaccard_top_k": repro_stats['jaccard_top_k'],
+                        "importance_corr": repro_stats['importance_corr']
+                    })
+                    
+                    # Save stability snapshot for this model family (non-invasive hook)
+                    # CRITICAL: Use model_family as method name, not importance_method
+                    # This ensures stability is computed per-model-family (comparing same family across runs)
+                    # Only save if output_dir is available (optional feature)
+                    if output_dir is not None:
+                        try:
+                            from TRAINING.stability.feature_importance import save_snapshot_from_series_hook
+                            import hashlib
+                            
+                            # FIX: Use feature_universe_fingerprint instead of symbol for universe_sig
+                            # Symbol is useful for INDIVIDUAL, but universe fingerprint is the real guard
+                            # against comparing different candidate sets (pruner/sanitizer differences)
+                            # Compute fingerprint from sorted feature names (stable across runs)
+                            sorted_features = sorted(feature_names)
+                            feature_universe_str = "|".join(sorted_features)
+                            feature_universe_fingerprint = hashlib.sha256(feature_universe_str.encode()).hexdigest()[:16]
+                            
+                            # For INDIVIDUAL mode, include symbol in universe_sig for clarity
+                            # But use fingerprint as the primary identifier
+                            if symbol:
+                                universe_sig = f"{symbol}:{feature_universe_fingerprint}"
+                            else:
+                                universe_sig = f"ALL:{feature_universe_fingerprint}"
+                            
+                            # FIX: Use model_family (e.g., "lightgbm", "ridge", "elastic_net") as method name
+                            # NOT importance_method (e.g., "native", "shap") - stability should be per-family
+                            # Compute identity for this model family
+                            # FIX: Use effective_run_identity (includes fallback) instead of run_identity
+                            family_identity = None
+                            partial_identity_dict = None  # Fallback: extract signatures from partial identity
+                            
+                            if effective_run_identity is not None:
+                                # Always extract partial identity signatures as fallback
+                                partial_identity_dict = {
+                                    "dataset_signature": getattr(effective_run_identity, 'dataset_signature', None),
+                                    "split_signature": getattr(effective_run_identity, 'split_signature', None),
+                                    "target_signature": getattr(effective_run_identity, 'target_signature', None),
+                                    "routing_signature": getattr(effective_run_identity, 'routing_signature', None),
+                                    "train_seed": getattr(effective_run_identity, 'train_seed', None),
+                                }
+                                
+                                try:
+                                    from TRAINING.common.utils.fingerprinting import (
+                                        RunIdentity, compute_hparams_fingerprint,
+                                        compute_feature_fingerprint_from_specs
+                                    )
+                                    # Hparams for this family
+                                    hparams_signature = compute_hparams_fingerprint(
+                                        model_family=family_name,
+                                        params={},  # Default params used
+                                    )
+                                    # Feature signature from importance series (registry-resolved)
+                                    from TRAINING.common.utils.fingerprinting import resolve_feature_specs_from_registry
+                                    feature_specs = resolve_feature_specs_from_registry(list(importance.index))
+                                    feature_signature = compute_feature_fingerprint_from_specs(feature_specs)
+                                    
+                                    # Add computed signatures to fallback dict
+                                    partial_identity_dict["hparams_signature"] = hparams_signature
+                                    partial_identity_dict["feature_signature"] = feature_signature
+                                    
+                                    # FP-003: Extract signatures with None fallback (not empty string)
+                                    effective_dataset_sig = getattr(effective_run_identity, 'dataset_signature', None)
+                                    effective_split_sig = getattr(effective_run_identity, 'split_signature', None)
+                                    effective_target_sig = getattr(effective_run_identity, 'target_signature', None)
+                                    effective_routing_sig = getattr(effective_run_identity, 'routing_signature', None)
+
+                                    # FP-003: Fail-closed in strict mode for missing split_signature
+                                    # NOTE: is_strict_mode already imported at module level (line 72)
+                                    if effective_split_sig is None:
+                                        if is_strict_mode():
+                                            raise ValueError(
+                                                "split_signature required but not computed in strict mode. "
+                                                "Ensure CV folds are finalized before creating RunIdentity."
+                                            )
+                                        logger.warning("FP-003: split_signature not available, identity may not be fully reproducible")
+
+                                    # FP-004: Compute feature_signature_input from candidate features
+                                    family_candidate_features = list(importance.index) if importance is not None else []
+                                    feature_sig_input = None
+                                    if family_candidate_features:
+                                        import hashlib
+                                        import json as json_mod
+                                        sorted_candidates = sorted(family_candidate_features)
+                                        feature_sig_input = hashlib.sha256(json_mod.dumps(sorted_candidates).encode()).hexdigest()
+
+                                    # Create updated partial and finalize
+                                    updated_partial = RunIdentity(
+                                        dataset_signature=effective_dataset_sig,  # FP-003: None not empty string
+                                        split_signature=effective_split_sig,  # FP-003: None not empty string
+                                        target_signature=effective_target_sig,  # FP-003: None not empty string
+                                        feature_signature=None,
+                                        feature_signature_input=feature_sig_input,  # FP-004: Set candidate features hash
+                                        hparams_signature=hparams_signature,  # FP-003: None not empty string
+                                        routing_signature=effective_routing_sig,  # FP-003: None not empty string
+                                        routing_payload=getattr(effective_run_identity, 'routing_payload', None),
+                                        train_seed=getattr(effective_run_identity, 'train_seed', None),
+                                        is_final=False,
+                                    )
+                                    family_identity = updated_partial.finalize(feature_signature)
+                                except Exception as e:
+                                    # FIX: Log at WARNING level so failures are visible
+                                    logger.warning(
+                                        f"Failed to compute family identity for {family_name}: {e}. "
+                                        f"Using partial identity signatures as fallback."
+                                    )
+                            
+                            # FIX: If identity not finalized but we have partial signatures, pass them
+                            effective_identity = family_identity if family_identity else partial_identity_dict
+                            
+                            # Compute feature_fingerprint_input for per-family snapshots
+                            family_candidate_features = list(importance.index) if importance is not None else []
+                            family_feature_input_hash = None
+                            if family_candidate_features:
+                                import hashlib
+                                import json as json_mod
+                                sorted_features = sorted(family_candidate_features)
+                                family_feature_input_hash = hashlib.sha256(json_mod.dumps(sorted_features).encode()).hexdigest()
+                            
+                            family_inputs = {
+                                "candidate_features": family_candidate_features,
+                                "feature_fingerprint_input": family_feature_input_hash,
+                            }
+                            
+                            save_snapshot_from_series_hook(
+                                target=target_column if target_column else 'unknown',
+                                method=family_name,  # Use model_family, not importance_method
+                                importance_series=importance,
+                                universe_sig=universe_sig,  # FIX: Use feature_universe_fingerprint (not just symbol)
+                                output_dir=output_dir,
+                                auto_analyze=None,  # Load from config
+                                run_identity=effective_identity,  # Pass finalized identity or partial dict fallback
+                                allow_legacy=(family_identity is None and partial_identity_dict is None),
+                                prediction_fingerprint=model_prediction_fp,  # SST: prediction hash for determinism
+                                view=View.SYMBOL_SPECIFIC,  # process_single_symbol is always SYMBOL_SPECIFIC
+                                symbol=symbol,  # Pass symbol for proper scoping
+                                inputs=family_inputs,  # Pass inputs with feature_fingerprint_input
+                                stage=Stage.FEATURE_SELECTION,  # Explicit stage for proper path scoping
+                            )
+                        except Exception as e:
+                            logger.debug(f"Stability snapshot save failed for {family_name} (non-critical): {e}")
+                    
+                    # Check if model used a fallback (soft no-signal case)
+                    fallback_reason = getattr(model, '_fallback_reason', None)
+                    if fallback_reason:
+                        # Soft no-signal fallback: not a failure, just "no strong preference"
+                        family_statuses.append({
+                            "status": "no_signal_fallback",
+                            "family": family_name,
+                            "symbol": symbol,
+                            "score": float(train_score) if not math.isnan(train_score) else None,
+                            "top_feature": importance.idxmax(),
+                            "top_feature_score": float(importance.max()),
+                            "error": fallback_reason,
+                            "error_type": "NoSignalFallback"
+                        })
+                        logger.debug(f"    ℹ️  {family_name}: {fallback_reason} (not counted as failure)")
+                    else:
+                        # Normal success
+                        family_statuses.append({
+                            "status": "success",
+                            "family": family_name,
+                            "symbol": symbol,
+                            "score": float(train_score) if not math.isnan(train_score) else None,
+                            "top_feature": importance.idxmax(),
+                            "top_feature_score": float(importance.max()),
+                            "error": None,
+                            "error_type": None
+                        })
+                
+                # Note: The else block for importance.sum() > 0 case ends here
+                # If importance.sum() <= 0, the code above (lines 4125-4324) handles it
+                
+            except Exception as e:
+                # Capture exception details for debugging
+                error_type = type(e).__name__
+                error_msg = str(e)
+                
+                # Check if this is an expected failure (over-regularization, no signal, etc.)
+                # These are common and expected, so log as WARNING without traceback
+                is_expected_failure = (
+                    "all coefficients are zero" in error_msg.lower() or
+                    "over-regularized" in error_msg.lower() or
+                    "no signal" in error_msg.lower() or
+                    "model invalid" in error_msg.lower()
+                )
+                
+                if is_expected_failure:
+                    logger.warning(f"    ⚠️  {symbol}: {family_name} failed (expected): {error_msg}")
+                else:
+                    # Unexpected errors get full ERROR logging with traceback
+                    logger.error(f"    ❌ {symbol}: {family_name} FAILED: {error_type}: {error_msg}", exc_info=True)
+                
+                family_statuses.append({
+                    "status": "failed",
+                    "family": family_name,
+                    "symbol": symbol,
+                    "score": None,
+                    "top_feature": None,
+                    "top_feature_score": None,
+                    "error": error_msg,
+                    "error_type": error_type
+                })
+                continue
+        
+        # Log structured summary per symbol
+        success_families = [s["family"] for s in family_statuses if s["status"] == "success"]
+        failed_families = [s["family"] for s in family_statuses if s["status"] == "failed"]
+        
+        logger.info(f"✅ {symbol}: Completed {len(success_families)}/{len(enabled_families)} model families")
+        if success_families:
+            logger.info(f"   ✅ Success: {', '.join(success_families)}")
+        if failed_families:
+            logger.warning(f"   ❌ Failed: {', '.join(failed_families)}")
+            # Log error types for failed families
+            for status in family_statuses:
+                if status["status"] == "failed":
+                    logger.warning(f"      - {status['family']}: {status['error_type']}: {status['error']}")
+        
+        # Log reproducibility summary per symbol
+        if per_model_reproducibility:
+            stable_count = sum(1 for r in per_model_reproducibility if r['status'] == 'stable')
+            borderline_count = sum(1 for r in per_model_reproducibility if r['status'] == 'borderline')
+            unstable_count = sum(1 for r in per_model_reproducibility if r['status'] == 'unstable')
+            no_prev_count = sum(1 for r in per_model_reproducibility if r['status'] == 'no_previous_run')
+            
+            if unstable_count > 0 or borderline_count > 0:
+                unstable_families = [r['family'] for r in per_model_reproducibility if r['status'] == 'unstable']
+                borderline_families = [r['family'] for r in per_model_reproducibility if r['status'] == 'borderline']
+                
+                summary_parts = []
+                if stable_count > 0:
+                    summary_parts.append(f"{stable_count} stable")
+                if borderline_count > 0:
+                    summary_parts.append(f"{borderline_count} borderline")
+                if unstable_count > 0:
+                    summary_parts.append(f"{unstable_count} unstable")
+                if no_prev_count > 0:
+                    summary_parts.append(f"{no_prev_count} no_previous_run")
+                
+                summary_str = ", ".join(summary_parts)
+                
+                if unstable_count > 0:
+                    logger.warning(f"  {symbol}: reproducibility summary: {summary_str} -> ⚠️ check model_families: {', '.join(unstable_families)}")
+                else:
+                    logger.info(f"  {symbol}: reproducibility summary: {summary_str}")
+        
+    except Exception as e:
+        logger.error(f"❌ {symbol}: Processing failed: {e}", exc_info=True)
+        # Return empty results but preserve any statuses collected before failure
+        return results, family_statuses
+    
+    return results, family_statuses
+
+
+def aggregate_multi_model_importance(
+    all_results: List[ImportanceResult],
+    model_families_config: Dict[str, Dict[str, Any]],
+    aggregation_config: Dict[str, Any],
+    top_n: Optional[int] = None,
+    all_family_statuses: Optional[List[Dict[str, Any]]] = None  # Optional: for logging excluded families
+) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    Aggregate feature importance across models AND symbols
+    
+    Strategy:
+    1. Group by model family
+    2. Aggregate within each family across symbols
+    3. Weight by family weight
+    4. Combine across families
+    5. Rank by consensus
+    """
+    
+    if not all_results:
+        logger.warning("⚠️  No results to aggregate - all model families may have failed or returned empty importance")
+        return pd.DataFrame(), []
+    
+    # Group results by model family
+    family_results = defaultdict(list)
+    for result in all_results:
+        family_results[result.model_family].append(result)
+    
+    # Log which families were excluded due to failures (if status info available)
+    if all_family_statuses:
+        from TRAINING.common.utils.determinism_ordering import sorted_items
+        enabled_families = set(f for f, cfg in sorted_items(model_families_config) if cfg.get('enabled', False))
+        families_with_results = set(family_results.keys())
+        families_without_results = enabled_families - families_with_results
+        
+        if families_without_results:
+            logger.warning(f"⚠️  {len(families_without_results)} model families excluded from aggregation (no results): {', '.join(sorted(families_without_results))}")
+            # FIX: Log skip reasons for failed models in consensus summary (makes debugging easier)
+            failed_models_with_reasons = []
+            for family in families_without_results:
+                family_failures = [s for s in all_family_statuses if s.get('family') == family and s.get('status') == 'failed']
+                if family_failures:
+                    # Extract error messages and create concise skip reasons
+                    error_messages = [s.get('error', '') for s in family_failures if s.get('error')]
+                    error_types = set(s.get('error_type') for s in family_failures if s.get('error_type'))
+                    symbols_failed = [s.get('symbol') for s in family_failures]
+                    
+                    # Create concise skip reason (e.g., 'ridge:zero_coefs', 'elastic_net:singular')
+                    skip_reason = None
+                    if error_messages:
+                        # Extract key phrase from error message
+                        first_error = error_messages[0].lower()
+                        if 'zero' in first_error and 'coefficient' in first_error:
+                            skip_reason = f"{family}:zero_coefs"
+                        elif 'singular' in first_error:
+                            skip_reason = f"{family}:singular"
+                        elif 'invalid' in first_error:
+                            skip_reason = f"{family}:invalid"
+                        else:
+                            # Use error_type if available, otherwise generic
+                            skip_reason = f"{family}:{list(error_types)[0].lower() if error_types else 'unknown'}"
+                    else:
+                        skip_reason = f"{family}:{list(error_types)[0].lower() if error_types else 'unknown'}"
+                    
+                    if skip_reason:
+                        failed_models_with_reasons.append(skip_reason)
+                    
+                    logger.warning(f"   - {family}: Failed for {len(symbols_failed)} symbol(s) ({', '.join(set(symbols_failed))}) with error types: {', '.join(error_types) if error_types else 'Unknown'}")
+            
+            # Log concise skip reasons for consensus summary
+            if failed_models_with_reasons:
+                logger.info(f"📋 Failed models (excluded from consensus): {', '.join(failed_models_with_reasons)}")
+        
+        logger.info(f"✅ Aggregating {len(families_with_results)} model families with results: {', '.join(sorted(families_with_results))}")
+    
+    # Aggregate within each family
+    family_scores = {}
+    boruta_scores = None  # Store separately for gatekeeper role
+    
+    # DETERMINISM: Use sorted_items for deterministic iteration order
+    for family_name, results in sorted_items(family_results):
+        # Combine importances across symbols for this family
+        # CRITICAL: Check if we have any importance scores before concatenation
+        # FIX: Include empty Series (zero importance) so failed models still appear in aggregation
+        importance_series_list = [r.importance_scores for r in results if hasattr(r, 'importance_scores') and r.importance_scores is not None]
+        
+        if not importance_series_list:
+            logger.warning(f"⚠️  {family_name}: No importance scores available (all results have None or missing importance_scores)")
+            # FIX: Try to create zero importance Series from first result's index
+            # This ensures failed models still appear in aggregation (with zero importance)
+            if results:
+                # Try to get feature names from first result's importance_scores index
+                first_result = results[0]
+                if hasattr(first_result, 'importance_scores') and first_result.importance_scores is not None:
+                    feature_names_from_result = first_result.importance_scores.index if hasattr(first_result.importance_scores, 'index') else []
+                    if len(feature_names_from_result) > 0:
+                        importance_series_list = [pd.Series(0.0, index=feature_names_from_result)]
+                        logger.debug(f"  {family_name}: Created zero importance Series for aggregation ({len(feature_names_from_result)} features)")
+                    else:
+                        logger.warning(f"  {family_name}: Cannot create zero Series (no feature names), skipping aggregation")
+                        continue
+                else:
+                    logger.warning(f"  {family_name}: Cannot create zero Series (no importance_scores), skipping aggregation")
+                    continue
+            else:
+                logger.warning(f"  {family_name}: No results available, skipping aggregation")
+                continue
+        
+        importances_df = pd.concat(
+            importance_series_list,
+            axis=1,
+            sort=False
+        ).fillna(0)
+        
+        # CRITICAL: Check if importances_df is empty after concatenation
+        # FIX: Don't skip - even empty DataFrames should be aggregated (with zero importance)
+        # This ensures failed models appear in results
+        if importances_df.empty:
+            logger.warning(f"⚠️  {family_name}: Empty importance DataFrame after concatenation, using zero importance")
+            # Create zero importance Series from feature names if available
+            if importance_series_list and len(importance_series_list) > 0:
+                feature_names_from_series = importance_series_list[0].index if hasattr(importance_series_list[0], 'index') else []
+                if len(feature_names_from_series) > 0:
+                    importances_df = pd.DataFrame({0: pd.Series(0.0, index=feature_names_from_series)})
+                else:
+                    continue  # Can't proceed without feature names
+            else:
+                continue  # Can't proceed without any Series
+        
+        # Aggregate across symbols (mean by default)
+        method = aggregation_config.get('per_symbol_method', 'mean')
+        if method == 'mean':
+            family_score = importances_df.mean(axis=1)
+        elif method == 'median':
+            family_score = importances_df.median(axis=1)
+        else:
+            family_score = importances_df.mean(axis=1)
+        
+        # CRITICAL: Check if family_score is empty after aggregation
+        # FIX: Don't skip - even zero importance should be included in aggregation
+        # This ensures failed models appear in results (with zero consensus score)
+        if len(family_score) == 0 or family_score.empty:
+            logger.warning(f"⚠️  {family_name}: Empty family_score after aggregation, using zero importance")
+            # Create zero importance Series from importances_df index
+            if not importances_df.empty:
+                family_score = pd.Series(0.0, index=importances_df.index)
+            else:
+                continue  # Can't proceed without DataFrame
+        
+        # Apply family weight
+        weight = model_families_config[family_name].get('weight', 1.0)
+        
+        # CRITICAL: Boruta is NOT included in base consensus - it's a gatekeeper, not a scorer
+        # FIX: Count unique symbols, not number of results (CROSS_SECTIONAL has 1 result with symbol="ALL")
+        unique_symbols = set(r.symbol for r in results if hasattr(r, 'symbol') and r.symbol)
+        n_symbols = len(unique_symbols)
+        symbol_str = f"{n_symbols} symbol{'s' if n_symbols != 1 else ''}"
+        if n_symbols == 1 and results and hasattr(results[0], 'symbol') and results[0].symbol == "ALL":
+            symbol_str = "all symbols (CROSS_SECTIONAL)"
+        
+        # CRITICAL: Safe idxmax() call - family_score is guaranteed non-empty at this point
+        # but add defensive check anyway for robustness
+        top_feature = family_score.idxmax() if len(family_score) > 0 else "N/A"
+        
+        if family_name == 'boruta':
+            boruta_scores = family_score  # Store for gatekeeper role only
+            logger.info(f"🔒 {family_name}: Aggregated {symbol_str} (gatekeeper, excluded from base consensus)")
+        else:
+            family_scores[family_name] = family_score * weight
+            logger.info(f"📊 {family_name}: Aggregated {symbol_str}, "
+                       f"weight={weight}, top={top_feature}")
+    
+    # Combine across families (EXCLUDING Boruta - it's a gatekeeper, not a scorer)
+    if not family_scores:
+        logger.warning("No model family results available (all families may have failed or been disabled)")
+        return pd.DataFrame(), []
+    
+    combined_df = pd.DataFrame(family_scores)
+    
+    # CRITICAL: Check if combined_df is empty before creating consensus scores
+    if combined_df.empty:
+        logger.warning("Empty combined DataFrame after aggregating family scores - no features available for consensus")
+        return pd.DataFrame(), []
+    
+    # Calculate BASE consensus score (from non-Boruta families only)
+    # Keep this separate from final score so we can see Boruta's effect
+    cross_model_method = aggregation_config.get('cross_model_method', 'weighted_mean')
+    if cross_model_method == 'weighted_mean':
+        consensus_score_base = combined_df.mean(axis=1)
+    elif cross_model_method == 'median':
+        consensus_score_base = combined_df.median(axis=1)
+    elif cross_model_method == 'geometric_mean':
+        # Geometric mean (good for multiplicative effects)
+        consensus_score_base = np.exp(np.log(combined_df + 1e-10).mean(axis=1))
+    else:
+        consensus_score_base = combined_df.mean(axis=1)
+    
+    # BORUTA GATEKEEPER: Apply Boruta as statistical gate (bonus/penalty system)
+    # Boruta is not just another importance scorer - it's a robustness check
+    # It modifies consensus scores but doesn't contribute to base consensus
+    
+    # Check if Boruta is enabled in config (even if no results)
+    boruta_enabled = model_families_config.get('boruta', {}).get('enabled', False)
+    
+    if boruta_scores is not None:
+        boruta_bonus = aggregation_config.get('boruta_confirm_bonus', 0.2)  # Bonus for confirmed features
+        boruta_penalty = aggregation_config.get('boruta_reject_penalty', -0.3)  # Penalty for rejected features
+        
+        # Boruta scores: 1.0=confirmed, 0.3=tentative, 0.0=rejected
+        # (Note: rejected is 0.0, not -1.0, to ensure positive sum for validation)
+        # Apply modifiers to consensus score
+        confirmed_threshold = aggregation_config.get('boruta_confirmed_threshold', 0.9)  # Configurable threshold
+        tentative_threshold = aggregation_config.get('boruta_tentative_threshold', 0.1)  # Updated: 0.1 to distinguish from 0.0 (rejected)
+        
+        confirmed_mask = boruta_scores >= confirmed_threshold  # Confirmed (score >= 0.9, typically = 1.0)
+        rejected_mask = boruta_scores <= 0.0  # Rejected (score = 0.0, updated from < 0.0)
+        tentative_mask = (boruta_scores > tentative_threshold) & (boruta_scores < confirmed_threshold)  # Tentative (between 0.1 and 0.9, typically = 0.3)
+        
+        # Calculate Boruta gate effect (bonus/penalty per feature)
+        boruta_gate_effect = pd.Series(0.0, index=consensus_score_base.index)
+        boruta_gate_effect[confirmed_mask] = boruta_bonus
+        boruta_gate_effect[rejected_mask] = boruta_penalty
+        # Tentative features get no modifier (neutral = 0.0)
+        
+        # Apply to base consensus to get final score
+        consensus_score_final = consensus_score_base + boruta_gate_effect
+        
+        # Magnitude sanity check: warn if Boruta bonuses/penalties are too large relative to base consensus
+        # Use explicit mathematical definition: ratio = max(|bonus|, |penalty|) / base_range
+        base_min = consensus_score_base.min()
+        base_max = consensus_score_base.max()
+        base_range = max(base_max - base_min, 1e-9)  # Avoid division by zero
+        
+        # Calculate magnitude ratio (larger of bonus or penalty relative to base range)
+        magnitude = max(abs(boruta_bonus), abs(boruta_penalty))
+        magnitude_ratio = magnitude / base_range
+        
+        # Configurable threshold (default 0.5 = 50% of base range)
+        magnitude_warning_threshold = aggregation_config.get('boruta_magnitude_warning_threshold', 0.5)
+        
+        if magnitude_ratio > magnitude_warning_threshold:
+            logger.warning(
+                "⚠️  Boruta gate magnitude ratio=%.3f exceeds threshold=%.3f "
+                "(base_range=%.4f, base_min=%.4f, base_max=%.4f, confirm_bonus=%.3f, reject_penalty=%.3f). "
+                "Consider reducing boruta_confirm_bonus/boruta_reject_penalty in config if Boruta dominates decisions.",
+                magnitude_ratio,
+                magnitude_warning_threshold,
+                base_range,
+                base_min,
+                base_max,
+                boruta_bonus,
+                boruta_penalty
+            )
+        
+        logger.info(f"🔒 Boruta gatekeeper: {confirmed_mask.sum()} confirmed (+{boruta_bonus}), "
+                   f"{rejected_mask.sum()} rejected ({boruta_penalty}), "
+                   f"{tentative_mask.sum()} tentative (neutral)")
+        logger.debug(f"   Base consensus range: [{consensus_score_base.min():.3f}, {consensus_score_base.max():.3f}], "
+                    f"std={consensus_score_base.std():.3f}, magnitude_ratio={magnitude_ratio:.3f}")
+        
+        # Calculate "Boruta changed ranking" metric: compare top-K sets before vs after gatekeeper
+        # Use top_n if available, otherwise use a reasonable default (50) for comparison
+        top_k_for_comparison = top_n if top_n is not None else min(50, len(consensus_score_base))
+        if top_k_for_comparison > 0 and len(consensus_score_base) >= top_k_for_comparison:
+            # Get top-K features from base consensus (without Boruta)
+            top_base_features = set(
+                consensus_score_base.sort_values(ascending=False).head(top_k_for_comparison).index
+            )
+            # Get top-K features from final consensus (with Boruta)
+            top_final_features = set(
+                consensus_score_final.sort_values(ascending=False).head(top_k_for_comparison).index
+            )
+            # Symmetric difference: features that changed in top-K set
+            changed_features = len(top_base_features ^ top_final_features)
+            logger.info(f"   Boruta ranking impact: {changed_features} features changed in top-{top_k_for_comparison} set "
+                       f"(base vs final). Ratio: {changed_features/top_k_for_comparison:.1%}")
+        
+        # Store for summary_df
+        boruta_gate_effect_series = boruta_gate_effect
+        boruta_gate_scores_series = boruta_scores
+        boruta_confirmed_mask = confirmed_mask
+        boruta_rejected_mask = rejected_mask
+        boruta_tentative_mask = tentative_mask
+        
+    elif boruta_enabled:
+        # Boruta enabled but failed completely (no results from any symbol)
+        # GRACEFUL DEGRADATION: Log warning and continue without Boruta gatekeeper
+        # Collect error information for diagnostics
+        boruta_failures = []
+        if all_family_statuses:
+            boruta_failures = [s for s in all_family_statuses 
+                             if s.get('family') == 'boruta' and s.get('status') == 'failed']
+        
+        error_summary = "Unknown error"
+        if boruta_failures:
+            error_messages = [s.get('error', '') for s in boruta_failures if s.get('error')]
+            error_types = set(s.get('error_type') for s in boruta_failures if s.get('error_type'))
+            symbols_failed = [s.get('symbol') for s in boruta_failures]
+            
+            if error_messages:
+                # Use first error message as summary
+                error_summary = error_messages[0]
+            elif error_types:
+                error_summary = f"Error types: {', '.join(error_types)}"
+            
+            error_details = (
+                f"Boruta gatekeeper FAILED for {len(symbols_failed)} symbol(s): {', '.join(set(symbols_failed))}. "
+                f"Error: {error_summary}"
+            )
+        else:
+            # Check if this is CROSS_SECTIONAL view (symbol="ALL")
+            is_cross_sectional = all_family_statuses and any(
+                s.get('symbol') == 'ALL' for s in all_family_statuses
+            )
+            if is_cross_sectional:
+                error_details = (
+                    "Boruta gatekeeper enabled in config but no results produced and no failure status recorded. "
+                    "This likely indicates Boruta failed silently in the shared harness (CROSS_SECTIONAL view). "
+                    "Check harness logs for Boruta errors."
+                )
+            else:
+                error_details = (
+                    "Boruta gatekeeper enabled in config but no results produced and no failure status recorded. "
+                    "This may indicate Boruta was silently skipped or failed without proper error tracking."
+                )
+        
+        # GRACEFUL DEGRADATION: Log warning and continue without Boruta
+        logger.warning(
+            f"⚠️  Boruta gatekeeper is enabled but failed. {error_details} "
+            f"Continuing without Boruta gatekeeper (features will not receive Boruta bonuses/penalties)."
+        )
+        # Continue without Boruta (graceful degradation)
+        boruta_gate_effect_series = pd.Series(0.0, index=consensus_score_base.index)
+        boruta_gate_scores_series = pd.Series(0.0, index=consensus_score_base.index)
+        boruta_confirmed_mask = pd.Series(False, index=consensus_score_base.index)
+        boruta_rejected_mask = pd.Series(False, index=consensus_score_base.index)
+        boruta_tentative_mask = pd.Series(False, index=consensus_score_base.index)
+        consensus_score_final = consensus_score_base.copy()
+    else:
+        # Boruta not enabled in config - explicit log for clarity
+        logger.debug("🔒 Boruta gatekeeper: disabled via config (no effect on consensus).")
+        boruta_gate_effect_series = pd.Series(0.0, index=consensus_score_base.index)
+        boruta_gate_scores_series = pd.Series(0.0, index=consensus_score_base.index)
+        boruta_confirmed_mask = pd.Series(False, index=consensus_score_base.index)
+        boruta_rejected_mask = pd.Series(False, index=consensus_score_base.index)
+        boruta_tentative_mask = pd.Series(False, index=consensus_score_base.index)
+        consensus_score_final = consensus_score_base.copy()
+    
+    # Calculate consensus metrics
+    n_models = combined_df.shape[1]
+    frequency = (combined_df > 0).sum(axis=1)
+    frequency_pct = (frequency / n_models) * 100
+    
+    # Standard deviation across models (lower = more consensus)
+    consensus_std = combined_df.std(axis=1)
+    
+    # Create summary DataFrame with base and final consensus scores
+    summary_df = pd.DataFrame({
+        'feature': consensus_score_base.index,
+        'consensus_score_base': consensus_score_base.values,  # Base consensus (without Boruta)
+        'consensus_score': consensus_score_final.values,  # Final consensus (with Boruta gatekeeper effect)
+        'boruta_gate_effect': boruta_gate_effect_series.values,  # Pure Boruta effect (final - base)
+        'n_models_agree': frequency,
+        'consensus_pct': frequency_pct,
+        'std_across_models': consensus_std,
+    })
+    
+    # Add per-family scores (excluding Boruta from per-family columns - it's in gatekeeper section)
+    for family_name in sorted(family_scores.keys()):
+        summary_df[f'{family_name}_score'] = combined_df[family_name].values
+    
+    # Always add Boruta gatekeeper columns (even if disabled/failed - shows zeros/False)
+    summary_df['boruta_gate_score'] = boruta_gate_scores_series.values  # Raw Boruta scores (1.0/0.3/0.0)
+    summary_df['boruta_confirmed'] = boruta_confirmed_mask.values
+    summary_df['boruta_rejected'] = boruta_rejected_mask.values
+    summary_df['boruta_tentative'] = boruta_tentative_mask.values
+    
+    # Sort by final consensus score (with Boruta effect)
+    # CRITICAL: Use stable sort with tie-breaker for deterministic ordering
+    # Round consensus_score to 12 decimals for ordering stability (float jitter protection)
+    summary_df['_consensus_score_rounded'] = summary_df['consensus_score'].round(12)
+    summary_df = summary_df.sort_values(
+        ['_consensus_score_rounded', 'feature'], 
+        ascending=[False, True],
+        kind='mergesort'  # CRITICAL: Stable sort for ties
+    ).reset_index(drop=True)
+    # Drop temporary rounded column (keep original consensus_score)
+    summary_df = summary_df.drop(columns=['_consensus_score_rounded'])
+    
+    # Filter by minimum consensus if specified
+    min_models = aggregation_config.get('require_min_models', 1)
+    summary_df = summary_df[summary_df['n_models_agree'] >= min_models]
+    
+    # Select top N
+    if top_n:
+        summary_df = summary_df.head(top_n)
+    
+    selected_features = summary_df['feature'].tolist()
+    
+    return summary_df, selected_features
+
+
+def compute_target_confidence(
+    summary_df: pd.DataFrame,
+    all_results: List[ImportanceResult],
+    model_families_config: Dict[str, Dict[str, Any]],
+    target: str,
+    confidence_config: Optional[Dict[str, Any]] = None,
+    top_k: Optional[int] = None
+) -> Dict[str, Any]:
+    """
+    Compute target-level confidence metrics from multi-model feature selection results.
+    
+    Metrics computed:
+    1. Boruta coverage (confirmed/tentative counts)
+    2. Model coverage (successful vs available)
+    3. Score strength (mean/max scores)
+    4. Agreement ratio (features in top-K across multiple models)
+    
+    Args:
+        summary_df: DataFrame with feature importance and Boruta status
+        all_results: List of ImportanceResult from all model runs
+        model_families_config: Config dict with enabled model families
+        target: Target column name
+        confidence_config: Optional config dict with confidence thresholds (from multi_model.yaml)
+        top_k: Number of top features to consider for agreement (default: from config or 20)
+    
+    Returns:
+        Dict with confidence metrics and bucket (HIGH/MEDIUM/LOW)
+    """
+    # Extract thresholds from config with defaults
+    if confidence_config is None:
+        confidence_config = {}
+    
+    high_cfg = confidence_config.get('high', {})
+    medium_cfg = confidence_config.get('medium', {})
+    low_reasons_cfg = confidence_config.get('low_reasons', {})
+    agreement_cfg = confidence_config.get('agreement', {})
+    
+    # Default thresholds (matching current hardcoded values)
+    high_boruta_min = high_cfg.get('boruta_confirmed_min', 5)
+    high_agreement_min = high_cfg.get('agreement_ratio_min', 0.4)
+    high_score_min = high_cfg.get('auc_min', 0.05)
+    high_coverage_min = high_cfg.get('model_coverage_min', 0.7)
+    
+    medium_boruta_min = medium_cfg.get('boruta_confirmed_min', 1)
+    medium_agreement_min = medium_cfg.get('agreement_ratio_min', 0.25)
+    medium_score_min = medium_cfg.get('auc_min', 0.02)
+    
+    # Low reason thresholds
+    boruta_zero_cfg = low_reasons_cfg.get('boruta_zero_confirmed', {})
+    boruta_zero_confirmed_max = boruta_zero_cfg.get('boruta_confirmed_max', 0)
+    boruta_zero_tentative_max = boruta_zero_cfg.get('boruta_tentative_max', 1)
+    boruta_zero_score_max = boruta_zero_cfg.get('auc_max', 0.03)
+    
+    low_agreement_max = low_reasons_cfg.get('low_model_agreement', {}).get('agreement_ratio_max', 0.2)
+    low_score_max = low_reasons_cfg.get('low_model_scores', {}).get('auc_max', 0.01)
+    low_coverage_max = low_reasons_cfg.get('low_model_coverage', {}).get('model_coverage_max', 0.5)
+    
+    # Agreement top_k from config
+    if top_k is None:
+        top_k = agreement_cfg.get('top_k', 20)
+    
+    metrics = {
+        'target': target,
+        'boruta_confirmed_count': 0,
+        'boruta_tentative_count': 0,
+        'boruta_rejected_count': 0,
+        'boruta_used': False,
+        'n_models_available': 0,
+        'n_models_successful': 0,
+        'model_coverage_ratio': 0.0,
+        'auc': 0.0,
+        'max_score': 0.0,
+        'mean_strong_score': 0.0,  # Tree ensembles + CatBoost + NN
+        'agreement_ratio': 0.0,
+        'score_tier': 'LOW',  # Orthogonal to confidence: signal strength
+        'confidence': 'LOW',
+        'low_confidence_reason': None
+    }
+    
+    # 1. Boruta coverage
+    if 'boruta_confirmed' in summary_df.columns:
+        metrics['boruta_confirmed_count'] = int(summary_df['boruta_confirmed'].sum())
+        metrics['boruta_tentative_count'] = int(summary_df['boruta_tentative'].sum())
+        metrics['boruta_rejected_count'] = int(summary_df['boruta_rejected'].sum())
+        metrics['boruta_used'] = (
+            metrics['boruta_confirmed_count'] > 0 or
+            metrics['boruta_tentative_count'] > 0 or
+            metrics['boruta_rejected_count'] > 0
+        )
+    
+    # 2. Model coverage
+    enabled_families = [
+        name for name, cfg in model_families_config.items()
+        if cfg.get('enabled', False)
+    ]
+    metrics['n_models_available'] = len(enabled_families)
+    
+    # Count successful models (those with valid results)
+    # Note: "no_signal_fallback" cases are counted as successful (they produced valid importance, just uniform)
+    # Only hard failures (exceptions, InvalidImportance) are excluded
+    successful_models = set(r.model_family for r in all_results if r.train_score is not None and not (isinstance(r.train_score, float) and (math.isnan(r.train_score) or math.isinf(r.train_score))))
+    metrics['n_models_successful'] = len(successful_models)
+    
+    if metrics['n_models_available'] > 0:
+        metrics['model_coverage_ratio'] = metrics['n_models_successful'] / metrics['n_models_available']
+    
+    # 3. Score strength
+    valid_scores = [
+        r.train_score for r in all_results
+        if r.train_score is not None and not (isinstance(r.train_score, float) and (math.isnan(r.train_score) or math.isinf(r.train_score)))
+    ]
+    
+    if valid_scores:
+        metrics['auc'] = float(np.mean(valid_scores))
+        metrics['max_score'] = float(np.max(valid_scores))
+        
+        # Strong models: tree ensembles, CatBoost, neural networks
+        strong_model_families = {'lightgbm', 'xgboost', 'random_forest', 'catboost', 'neural_network'}
+        strong_scores = [
+            r.train_score for r in all_results
+            if r.model_family in strong_model_families
+            and r.train_score is not None
+            and not (isinstance(r.train_score, float) and (math.isnan(r.train_score) or math.isinf(r.train_score)))
+        ]
+        if strong_scores:
+            metrics['mean_strong_score'] = float(np.mean(strong_scores))
+    
+    # 3b. Score tier (orthogonal to confidence: pure signal strength)
+    # Extract thresholds from config
+    score_tier_cfg = confidence_config.get('score_tier', {})
+    high_tier_cfg = score_tier_cfg.get('high', {})
+    medium_tier_cfg = score_tier_cfg.get('medium', {})
+    
+    high_mean_strong_min = high_tier_cfg.get('mean_strong_score_min', 0.08)
+    high_max_min = high_tier_cfg.get('max_score_min', 0.70)
+    medium_mean_strong_min = medium_tier_cfg.get('mean_strong_score_min', 0.03)
+    medium_max_min = medium_tier_cfg.get('max_score_min', 0.55)
+    
+    # HIGH if strong models show high scores OR max is very high
+    if metrics['mean_strong_score'] >= high_mean_strong_min or metrics['max_score'] >= high_max_min:
+        metrics['score_tier'] = 'HIGH'
+    # MEDIUM if moderate scores
+    elif metrics['mean_strong_score'] >= medium_mean_strong_min or metrics['max_score'] >= medium_max_min:
+        metrics['score_tier'] = 'MEDIUM'
+    # LOW otherwise
+    else:
+        metrics['score_tier'] = 'LOW'
+    
+    # 4. Agreement on top features
+    if len(summary_df) > 0 and 'feature' in summary_df.columns:
+        # Get top-K features by consensus score
+        top_k_features = summary_df.nlargest(min(top_k, len(summary_df)), 'consensus_score')['feature'].tolist()
+        
+        # Count how many models have each feature in their top-K
+        feature_model_count = defaultdict(int)
+        
+        for result in all_results:
+            if result.importance_scores is None or len(result.importance_scores) == 0:
+                continue
+            
+            # Get top-K features for this model
+            model_top_k = result.importance_scores.nlargest(min(top_k, len(result.importance_scores))).index.tolist()
+            
+            # Count overlap with overall top-K
+            for feature in top_k_features:
+                if feature in model_top_k:
+                    feature_model_count[feature] += 1
+        
+        # Agreement ratio: fraction of top-K features that appear in >= 2 models
+        features_in_multiple_models = sum(1 for count in feature_model_count.values() if count >= 2)
+        metrics['agreement_ratio'] = features_in_multiple_models / len(top_k_features) if top_k_features else 0.0
+    
+    # 5. Confidence bucket assignment (using config thresholds)
+    # HIGH confidence (all conditions must be met)
+    if (metrics['boruta_confirmed_count'] >= high_boruta_min and
+        metrics['agreement_ratio'] >= high_agreement_min and
+        metrics['auc'] >= high_score_min and
+        metrics['model_coverage_ratio'] >= high_coverage_min):
+        metrics['confidence'] = 'HIGH'
+    
+    # MEDIUM confidence (any one condition is sufficient)
+    elif (metrics['boruta_confirmed_count'] >= medium_boruta_min or
+          metrics['agreement_ratio'] >= medium_agreement_min or
+          metrics['auc'] >= medium_score_min):
+        metrics['confidence'] = 'MEDIUM'
+    
+    # LOW confidence (fallback)
+    else:
+        metrics['confidence'] = 'LOW'
+        
+        # Determine reason using config thresholds
+        if (metrics['boruta_used'] and
+            metrics['boruta_confirmed_count'] <= boruta_zero_confirmed_max and
+            metrics['boruta_tentative_count'] <= boruta_zero_tentative_max and
+            metrics['auc'] < boruta_zero_score_max):
+            metrics['low_confidence_reason'] = 'boruta_zero_confirmed'
+        elif metrics['agreement_ratio'] < low_agreement_max:
+            metrics['low_confidence_reason'] = 'low_model_agreement'
+        elif metrics['auc'] < low_score_max:
+            metrics['low_confidence_reason'] = 'low_model_scores'
+        elif metrics['model_coverage_ratio'] < low_coverage_max:
+            metrics['low_confidence_reason'] = 'low_model_coverage'
+        else:
+            metrics['low_confidence_reason'] = 'multiple_weak_signals'
+    
+    return metrics
+
+
+def save_multi_model_results(
+    summary_df: pd.DataFrame,
+    selected_features: List[str],
+    all_results: List[ImportanceResult],
+    output_dir: Path,
+    metadata: Dict[str, Any],
+    universe_sig: Optional[str] = None,  # Phase A: optional for backward compat
+):
+    """Save multi-model feature selection results.
+    
+    Target-first structure (with OutputLayout when universe_sig provided):
+    targets/<target>/reproducibility/{view}/universe={universe_sig}/feature_importances/
+      {model}_importances.csv
+      feature_importance_multi_model.csv
+      feature_importance_with_boruta_debug.csv
+      model_agreement_matrix.csv
+    targets/<target>/reproducibility/{view}/universe={universe_sig}/selected_features.txt
+    
+    Falls back to legacy structure without universe scoping when universe_sig not provided.
+    
+    ROUTING NOTE: These are SCOPE-LEVEL SUMMARY artifacts, not cohort artifacts.
+    They use OutputLayout.repro_dir() / feature_importance_dir() directly.
+    Do NOT use _save_to_cohort for these outputs - the cohort firewall is for
+    per-cohort metrics/run data under cohort=cs_* or cohort=sy_* directories.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Find base run directory and target name
+    base_output_dir = output_dir
+    target = None
+    
+    # Try to extract target from metadata
+    if metadata and 'target' in metadata:
+        target = metadata['target']
+    elif metadata and 'target_column' in metadata:
+        target = metadata['target_column']
+    
+    # If not in metadata, try to extract from output_dir path
+    if not target:
+        # output_dir is typically: REPRODUCIBILITY/FEATURE_SELECTION/CROSS_SECTIONAL/{target}/
+        parts = output_dir.parts
+        if 'FEATURE_SELECTION' in parts:
+            idx = parts.index('FEATURE_SELECTION')
+            if idx + 2 < len(parts):
+                target = parts[idx + 2]
+    
+    # Also try to extract universe_sig from metadata if not passed explicitly
+    # Validate extracted sig before using - invalid values are ignored
+    if not universe_sig and metadata:
+        extracted_sig = metadata.get('universe_sig')
+        if extracted_sig:
+            try:
+                from TRAINING.orchestration.utils.cohort_metadata import validate_universe_sig
+                validate_universe_sig(extracted_sig)
+                universe_sig = extracted_sig
+            except ValueError as e:
+                logger.warning(
+                    "Invalid universe_sig from metadata; ignoring and falling back to legacy paths. "
+                    f"error={e} metadata_keys={list(metadata.keys())}"
+                )
+                universe_sig = None  # Don't use invalid value
+    
+    # Phase A: Use OutputLayout if universe_sig provided (new canonical path)
+    # Otherwise fall back to legacy path resolution with warning
+    use_output_layout = bool(universe_sig)
+    if not use_output_layout:
+        logger.warning(
+            f"universe_sig not provided for {target} multi-model results, "
+            f"falling back to legacy path resolution. Pass universe_sig for canonical paths."
+        )
+    
+    # Walk up to find base run directory using SST helper
+    from TRAINING.orchestration.utils.target_first_paths import run_root as get_run_root
+    base_output_dir = get_run_root(base_output_dir)
+    
+    # Set up target-first structure if we found target and base directory (view/symbol-scoped)
+    target_importances_dir = None
+    target_selected_features_path = None
+    repro_dir = None  # Track for later use
+    
+    if target and base_output_dir.exists():
+        try:
+            from TRAINING.orchestration.utils.target_first_paths import normalize_target_name
+            target_clean = normalize_target_name(target)
+            
+            # Extract view and symbol from metadata (view is REQUIRED)
+            view = metadata.get('view') if metadata else None
+            symbol = metadata.get('symbol') if metadata else None
+            
+            # Validate view is provided
+            if view is None:
+                raise ValueError(
+                    f"view must be provided in metadata for save_multi_model_results. "
+                    f"Metadata keys: {list(metadata.keys()) if metadata else 'None'}"
+                )
+            # Normalize view to enum for validation
+            view_enum = View.from_string(view) if isinstance(view, str) else view
+            
+            # Auto-detect SYMBOL_SPECIFIC view if symbol is provided (same pattern as other FEATURE_SELECTION fixes)
+            # CRITICAL: Only auto-detect if this is actually a single-symbol run
+            if view_enum == View.CROSS_SECTIONAL and symbol is not None:
+                # Check if metadata has symbols list to validate single-symbol
+                metadata_symbols = metadata.get('symbols') if metadata else None
+                is_single_symbol = False
+                if metadata_symbols:
+                    is_single_symbol = len(metadata_symbols) == 1
+                elif symbol:
+                    # If no symbols list in metadata, assume single-symbol if symbol is provided
+                    # (caller should have validated, but be defensive)
+                    is_single_symbol = True
+                    logger.debug(f"No symbols list in metadata, assuming single-symbol run based on symbol={symbol}")
+                
+                if is_single_symbol:
+                    logger.info(f"Auto-detecting SYMBOL_SPECIFIC view for multi-model results (symbol={symbol} provided with CROSS_SECTIONAL, single-symbol run)")
+                    view = View.SYMBOL_SPECIFIC
+                    view_enum = View.SYMBOL_SPECIFIC
+                else:
+                    # Multi-symbol CROSS_SECTIONAL run - clear symbol to prevent incorrect SYMBOL_SPECIFIC detection
+                    num_symbols = len(metadata_symbols) if metadata_symbols else 'unknown'
+                    logger.warning(
+                        f"CROSS_SECTIONAL run with {num_symbols} symbols - keeping CROSS_SECTIONAL view, "
+                        f"ignoring symbol={symbol} parameter to prevent incorrect SYMBOL_SPECIFIC detection"
+                    )
+                    symbol = None
+            
+            if view_enum not in (View.CROSS_SECTIONAL, View.SYMBOL_SPECIFIC):
+                raise ValueError(f"Invalid view in metadata: {view}. Must be View.CROSS_SECTIONAL or View.SYMBOL_SPECIFIC")
+            if view_enum == View.SYMBOL_SPECIFIC and symbol is None:
+                raise ValueError("symbol required in metadata when view=View.SYMBOL_SPECIFIC")
+            
+            if use_output_layout and universe_sig:
+                # Canonical path via OutputLayout (non-cohort write)
+                from TRAINING.orchestration.utils.output_layout import OutputLayout
+                layout = OutputLayout(
+                    output_root=base_output_dir,
+                    target=target_clean,
+                    view=view_enum,
+                    universe_sig=universe_sig,
+                    symbol=symbol if view_enum == View.SYMBOL_SPECIFIC else None,
+                    stage=Stage.FEATURE_SELECTION,  # Explicit stage for proper path scoping
+                    attempt_id=0,  # Default to attempt_0 for FEATURE_SELECTION (no reruns)
+                )
+                repro_dir = layout.repro_dir()
+                target_importances_dir = layout.feature_importance_dir()
+                target_selected_features_path = repro_dir / "selected_features.txt"
+            else:
+                # Legacy path resolution with stage
+                from TRAINING.orchestration.utils.target_first_paths import (
+                    run_root, target_repro_dir, target_repro_file_path, ensure_target_structure
+                )
+                run_root_dir = run_root(base_output_dir)
+                ensure_target_structure(run_root_dir, target_clean)
+                repro_dir = target_repro_dir(run_root_dir, target_clean, view=view_enum, symbol=symbol, stage=Stage.FEATURE_SELECTION)
+                target_importances_dir = repro_dir / "feature_importances"
+                target_selected_features_path = target_repro_file_path(run_root_dir, target_clean, "selected_features.txt", view=view_enum, symbol=symbol, stage=Stage.FEATURE_SELECTION)
+            
+            target_importances_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            logger.debug(f"Failed to set up target-first structure: {e}")
+    
+    # Write to target-first structure only
+    # 1. Selected features list
+    if target_selected_features_path:
+        try:
+            target_selected_features_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(target_selected_features_path, "w") as f:
+                for feature in selected_features:
+                    f.write(f"{feature}\n")
+            logger.info(f"✅ Saved {len(selected_features)} features to {target_selected_features_path}")
+        except Exception as e:
+            logger.warning(f"Failed to write selected features to target-first location: {e}")
+            import traceback
+            logger.debug(f"Traceback: {traceback.format_exc()}")
+    else:
+        logger.warning(f"Target selected features path not available")
+    
+    # 2. Detailed summary CSV (includes all columns including Boruta gatekeeper)
+    if target_importances_dir:
+        try:
+            target_importances_dir.mkdir(parents=True, exist_ok=True)
+            target_csv_path = target_importances_dir / "feature_importance_multi_model.csv"
+            summary_df.to_csv(target_csv_path, index=False)
+            logger.info(f"✅ Saved detailed multi-model summary to {target_csv_path}")
+        except Exception as e:
+            logger.warning(f"Failed to write feature importance summary to target-first location: {e}")
+            import traceback
+            logger.debug(f"Traceback: {traceback.format_exc()}")
+    else:
+        logger.warning(f"Target importances directory not available")
+    
+    # 2b. Explicit debug view: Boruta gatekeeper effect analysis → feature_importances/
+    # This is a stable, named file for quick inspection of Boruta's impact
+    debug_columns = [
+        'feature',
+        'consensus_score_base',  # Base consensus (model families only)
+        'consensus_score',  # Final consensus (with Boruta effect)
+        'boruta_gate_effect',  # Pure Boruta effect (final - base)
+        'boruta_gate_score',  # Raw Boruta scores (1.0/0.3/0.0)
+        'boruta_confirmed',
+        'boruta_rejected',
+        'boruta_tentative',
+        'n_models_agree',
+        'consensus_pct'
+    ]
+    # Only include columns that exist in summary_df
+    available_debug_columns = [col for col in debug_columns if col in summary_df.columns]
+    if available_debug_columns:
+        debug_df = summary_df[available_debug_columns].copy()
+        debug_df = debug_df.sort_values('consensus_score', ascending=False)  # Sort by final score
+        
+        # Write to target-first structure only
+        if target_importances_dir:
+            try:
+                target_debug_path = target_importances_dir / "feature_importance_with_boruta_debug.csv"
+                debug_df.to_csv(target_debug_path, index=False)
+                logger.info(f"✅ Saved Boruta gatekeeper debug view to {target_debug_path}")
+            except Exception as e:
+                logger.warning(f"Failed to write Boruta debug view to target-first location: {e}")
+                import traceback
+                logger.debug(f"Traceback: {traceback.format_exc()}")
+    
+    # 3. Per-model-family breakdowns → feature_importances/ (matching target ranking naming)
+    for family_name in summary_df.columns:
+        if family_name.endswith('_score') and family_name not in ['consensus_score']:
+            family_df = summary_df[['feature', family_name]].copy()
+            family_df = family_df.sort_values(family_name, ascending=False)
+            # Match target ranking naming: {model}_importances.csv
+            model_name = family_name.replace('_score', '')
+            
+            # Write to target-first structure only
+            if target_importances_dir:
+                try:
+                    target_family_csv = target_importances_dir / f"{model_name}_importances.csv"
+                    family_df.to_csv(target_family_csv, index=False)
+                    logger.debug(f"✅ Saved {model_name} importances to target-first location: {target_family_csv}")
+                except Exception as e:
+                    logger.warning(f"Failed to write {model_name} importances to target-first location: {e}")
+    
+    # 4. Model agreement matrix → feature_importances/
+    model_families = list(set(r.model_family for r in all_results))
+    agreement_matrix = pd.DataFrame(
+        index=selected_features[:20],  # Top 20 for readability
+        columns=model_families
+    )
+    
+    for result in all_results:
+        for feature in selected_features[:20]:
+            if feature in result.importance_scores.index:
+                current = agreement_matrix.loc[feature, result.model_family]
+                score = result.importance_scores[feature]
+                if pd.isna(current):
+                    agreement_matrix.loc[feature, result.model_family] = score
+                else:
+                    agreement_matrix.loc[feature, result.model_family] = max(current, score)
+    
+    # Write to target-first structure only
+    if target_importances_dir:
+        try:
+            target_agreement_path = target_importances_dir / "model_agreement_matrix.csv"
+            agreement_matrix.to_csv(target_agreement_path)
+            logger.debug(f"Also saved model agreement matrix to target-first location: {target_agreement_path}")
+        except Exception as e:
+            logger.debug(f"Failed to write model agreement matrix to target-first location: {e}")
+    
+    # 5. Metadata JSON → target level (matching TARGET_RANKING, metadata goes in cohort/ folder from reproducibility tracker)
+    # For now, save a summary at target level for quick access (detailed metadata is in cohort/)
+    metadata['n_selected_features'] = len(selected_features)
+    metadata['n_total_results'] = len(all_results)
+    metadata['model_families_used'] = list(set(r.model_family for r in all_results))
+
+    # Save summary metadata at target level (detailed metadata is in cohort/ from reproducibility tracker)
+    # This matches TARGET_RANKING structure where summary files are at target level
+    # Write only to target-first structure (no legacy root-level writes) - view/symbol-scoped
+    if target and base_output_dir.exists():
+        try:
+            from TRAINING.orchestration.utils.target_first_paths import normalize_target_name
+            target_clean = normalize_target_name(target)
+            # Extract view and symbol from metadata (view is REQUIRED)
+            view = metadata.get('view') if metadata else None
+            symbol = metadata.get('symbol') if metadata else None
+            
+            # Validate view is provided
+            if view is None:
+                raise ValueError(
+                    f"view must be provided in metadata for feature_selection_summary. "
+                    f"Metadata keys: {list(metadata.keys()) if metadata else 'None'}"
+                )
+            # Normalize view to enum
+            view_enum = View.from_string(view) if isinstance(view, str) else view
+            if view_enum not in (View.CROSS_SECTIONAL, View.SYMBOL_SPECIFIC):
+                raise ValueError(f"Invalid view in metadata: {view}. Must be View.CROSS_SECTIONAL or View.SYMBOL_SPECIFIC")
+            if view_enum == View.SYMBOL_SPECIFIC and symbol is None:
+                raise ValueError("symbol required in metadata when view=View.SYMBOL_SPECIFIC")
+            
+            if use_output_layout and universe_sig:
+                # Canonical path via OutputLayout (non-cohort write)
+                from TRAINING.orchestration.utils.output_layout import OutputLayout
+                layout = OutputLayout(
+                    output_root=base_output_dir,
+                    target=target_clean,
+                    view=view_enum,
+                    universe_sig=universe_sig,
+                    symbol=symbol if view_enum == View.SYMBOL_SPECIFIC else None,
+                    stage=Stage.FEATURE_SELECTION,  # Explicit stage for proper path scoping
+                    attempt_id=0,  # Default to attempt_0 for FEATURE_SELECTION (no reruns)
+                )
+                target_summary_path = layout.repro_dir() / "feature_selection_summary.json"
+            else:
+                # Legacy path resolution with stage
+                from TRAINING.orchestration.utils.target_first_paths import run_root, target_repro_file_path
+                run_root_dir = run_root(base_output_dir)
+                target_summary_path = target_repro_file_path(run_root_dir, target_clean, "feature_selection_summary.json", view=view_enum, symbol=symbol, stage=Stage.FEATURE_SELECTION)
+            
+            target_summary_path.parent.mkdir(parents=True, exist_ok=True)
+            # DETERMINISM: Use atomic write for crash consistency
+            write_atomic_json(target_summary_path, metadata)
+            logger.info(f"✅ Saved feature selection summary to {target_summary_path}")
+        except Exception as e:
+            logger.warning(f"Failed to write feature selection summary to target-first location: {e}")
+            import traceback
+            logger.debug(f"Traceback: {traceback.format_exc()}")
+    
+    # 6. Family status tracking JSON (for debugging broken models)
+    if 'family_statuses' in metadata and metadata['family_statuses']:
+        family_statuses = metadata['family_statuses']
+        # Create summary by family
+        status_summary = {}
+        for status in family_statuses:
+            family = status.get('family')
+            if family not in status_summary:
+                status_summary[family] = {
+                    'total_runs': 0,
+                'success': 0,
+                'failed': 0,
+                'no_signal_fallback': 0,  # Soft fallbacks (not counted as failures)
+                'symbols_success': [],
+                'symbols_failed': [],
+                'error_types': set(),
+                'errors': []
+                }
+            summary = status_summary[family]
+            summary['total_runs'] += 1
+            status_value = status.get('status')
+            if status_value == 'success':
+                summary['success'] += 1
+                summary['symbols_success'].append(status.get('symbol'))
+            elif status_value == 'no_signal_fallback':
+                # Soft fallback: counted as success for coverage, but tracked separately
+                summary['success'] += 1  # Count as success for model_coverage_ratio
+                summary['no_signal_fallback'] = summary.get('no_signal_fallback', 0) + 1
+                summary['symbols_success'].append(status.get('symbol'))
+                if status.get('error_type'):
+                    summary['error_types'].add(status.get('error_type'))
+            else:
+                # Hard failure (exceptions, InvalidImportance, etc.)
+                summary['failed'] += 1
+                summary['symbols_failed'].append(status.get('symbol'))
+                if status.get('error_type'):
+                    summary['error_types'].add(status.get('error_type'))
+                if status.get('error'):
+                    summary['errors'].append({
+                        'symbol': status.get('symbol'),
+                        'error_type': status.get('error_type'),
+                        'error': status.get('error')
+                    })
+        
+        # Convert sets to lists for JSON serialization
+        for family_summary in status_summary.values():
+            family_summary['error_types'] = list(family_summary['error_types'])
+        
+        # Save detailed status file → target-first structure only (matching TARGET_RANKING structure) - view/symbol-scoped
+        if target and base_output_dir.exists():
+            try:
+                from TRAINING.orchestration.utils.target_first_paths import run_root, target_repro_file_path
+                from TRAINING.orchestration.utils.target_first_paths import normalize_target_name
+                target_clean = normalize_target_name(target)
+                run_root_dir = run_root(base_output_dir)
+                # Extract view and symbol from metadata (view is REQUIRED)
+                view = metadata.get('view') if metadata else None
+                symbol = metadata.get('symbol') if metadata else None
+                
+                # Validate view is provided
+                if view is None:
+                    raise ValueError(
+                        f"view must be provided in metadata for model_family_status. "
+                        f"Metadata keys: {list(metadata.keys()) if metadata else 'None'}"
+                    )
+                # Normalize view to enum
+                view_enum = View.from_string(view) if isinstance(view, str) else view
+                if view_enum not in (View.CROSS_SECTIONAL, View.SYMBOL_SPECIFIC):
+                    raise ValueError(f"Invalid view in metadata: {view}. Must be View.CROSS_SECTIONAL or View.SYMBOL_SPECIFIC")
+                if view_enum == View.SYMBOL_SPECIFIC and symbol is None:
+                    raise ValueError("symbol required in metadata when view=View.SYMBOL_SPECIFIC")
+                
+                # Use view/symbol-scoped path helper with explicit stage
+                status_path = target_repro_file_path(run_root_dir, target_clean, "model_family_status.json", view=view_enum, symbol=symbol, stage=Stage.FEATURE_SELECTION)
+                status_path.parent.mkdir(parents=True, exist_ok=True)
+                # DETERMINISM: Use atomic write for crash consistency
+                write_atomic_json(status_path, {
+                    'summary': status_summary,
+                    'detailed': family_statuses
+                })
+                logger.info(f"✅ Saved model family status tracking to {status_path}")
+            except Exception as e:
+                logger.warning(f"Failed to write model family status to target-first location: {e}")
+                import traceback
+                logger.debug(f"Traceback: {traceback.format_exc()}")
+        
+        # Log summary (only hard failures, not soft fallbacks)
+        failed_families = [f for f, s in status_summary.items() if s['failed'] > 0]
+        if failed_families:
+            logger.warning(f"⚠️  {len(failed_families)} model families had hard failures: {', '.join(failed_families)}")
+        
+        # Log soft fallbacks separately (informational, not warnings)
+        fallback_families = [f for f, s in status_summary.items() if s.get('no_signal_fallback', 0) > 0]
+        if fallback_families:
+            logger.info(f"ℹ️  {len(fallback_families)} model families used no-signal fallbacks (not failures): {', '.join(fallback_families)}")
+    
+    # 6. Target confidence metrics (if model_families_config available in metadata)
+    try:
+        model_families_config = metadata.get('model_families_config')
+        config = metadata.get('config', {})
+        
+        if model_families_config is None:
+            # Try to extract from metadata config if nested
+            model_families_config = config.get('model_families', {})
+        
+        # Extract confidence config from nested config
+        confidence_config = config.get('confidence', {})
+        
+        if model_families_config:
+            target = metadata.get('target_column', 'unknown_target')
+            confidence_metrics = compute_target_confidence(
+                summary_df=summary_df,
+                all_results=all_results,
+                model_families_config=model_families_config,
+                target=target,
+                confidence_config=confidence_config,
+                top_k=None  # Will use config or default
+            )
+            
+            # Save target confidence at target-first structure only (matching TARGET_RANKING structure) - view/symbol-scoped
+            if target and base_output_dir.exists():
+                try:
+                    from TRAINING.orchestration.utils.target_first_paths import run_root, target_repro_file_path
+                    from TRAINING.orchestration.utils.target_first_paths import normalize_target_name
+                    target_clean = normalize_target_name(target)
+                    run_root_dir = run_root(base_output_dir)
+                    # Extract view and symbol from metadata (view is REQUIRED)
+                    view = metadata.get('view') if metadata else None
+                    symbol = metadata.get('symbol') if metadata else None
+                    
+                    # Validate view is provided
+                    if view is None:
+                        raise ValueError(
+                            f"view must be provided in metadata for target_confidence. "
+                            f"Metadata keys: {list(metadata.keys()) if metadata else 'None'}"
+                        )
+                    # Normalize view to enum
+                    view_enum = View.from_string(view) if isinstance(view, str) else view
+                    if view_enum not in (View.CROSS_SECTIONAL, View.SYMBOL_SPECIFIC):
+                        raise ValueError(f"Invalid view in metadata: {view}. Must be View.CROSS_SECTIONAL or View.SYMBOL_SPECIFIC")
+                    if view_enum == View.SYMBOL_SPECIFIC and symbol is None:
+                        raise ValueError("symbol required in metadata when view=View.SYMBOL_SPECIFIC")
+                    
+                    # Use view/symbol-scoped path helper with explicit stage
+                    confidence_path = target_repro_file_path(run_root_dir, target_clean, "target_confidence.json", view=view_enum, symbol=symbol, stage=Stage.FEATURE_SELECTION)
+                    confidence_path.parent.mkdir(parents=True, exist_ok=True)
+                    # DETERMINISM: Use atomic write for crash consistency
+                    write_atomic_json(confidence_path, confidence_metrics)
+                except Exception as e:
+                    logger.debug(f"Failed to save target_confidence to target-first location: {e}")
+                    
+                    # Log confidence summary
+                    confidence = confidence_metrics['confidence']
+                    reason = confidence_metrics.get('low_confidence_reason', '')
+                    if confidence == 'LOW':
+                        logger.warning(f"⚠️  Target {target}: confidence={confidence} ({reason})")
+                    elif confidence == 'MEDIUM':
+                        logger.info(f"ℹ️  Target {target}: confidence={confidence}")
+                    else:
+                        logger.info(f"✅ Target {target}: confidence={confidence}")
+                    
+                    logger.info(f"✅ Saved target confidence metrics to {confidence_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to write target confidence to target-first location: {e}")
+                    import traceback
+                    logger.debug(f"Traceback: {traceback.format_exc()}")
+    except Exception as e:
+        logger.warning(f"Failed to compute target confidence metrics: {e}")
+        logger.debug("Confidence computation requires model_families_config in metadata", exc_info=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Multi-Model Feature Selection: Find robust features across model families"
+    )
+    parser.add_argument("--symbols", type=str, 
+                       help="Comma-separated symbols (default: all in data_dir)")
+    parser.add_argument("--data-dir", type=Path,
+                       default=_REPO_ROOT / "data/data_labeled/interval=5m",
+                       help="Directory with labeled data")
+    parser.add_argument("--output-dir", type=Path,
+                       default=_REPO_ROOT / "RESULTS/features/multi_model",
+                       help="Output directory")
+    parser.add_argument("--target-column", type=str,
+                       default="y_will_peak_60m_0.8",
+                       help="Target column for training")
+    parser.add_argument("--top-n", type=int, default=60,
+                       help="Number of features to select")
+    parser.add_argument("--config", type=Path,
+                       help="Path to multi-model config YAML")
+    parser.add_argument("--num-workers", type=int, default=4,
+                       help="Parallel workers (sequential per symbol)")
+    parser.add_argument("--enable-families", type=str,
+                       help="Comma-separated families to enable (e.g., lightgbm,xgboost,neural_network)")
+    parser.add_argument("--resume", action="store_true",
+                       help="Resume from checkpoint if available")
+    parser.add_argument("--clear-checkpoint", action="store_true",
+                       help="Clear existing checkpoint and start fresh")
+    
+    args = parser.parse_args()
+    
+    # Load config
+    config = load_multi_model_config(args.config)
+    
+    # Override enabled families if specified
+    if args.enable_families:
+        enabled = [f.strip() for f in args.enable_families.split(',')]
+        for family in config['model_families']:
+            config['model_families'][family]['enabled'] = family in enabled
+    
+    # Count enabled families
+    enabled_families = [f for f, cfg in config['model_families'].items() if cfg.get('enabled')]
+    
+    logger.info("="*80)
+    logger.info("🚀 Multi-Model Feature Selection Pipeline")
+    logger.info("="*80)
+    logger.info(f"Target: {args.target_column}")
+    logger.info(f"Top N: {args.top_n}")
+    logger.info(f"Enabled model families ({len(enabled_families)}): {', '.join(enabled_families)}")
+    logger.info(f"Output: {args.output_dir}")
+    logger.info("-"*80)
+    
+    # Find symbols
+    if not args.data_dir.exists():
+        logger.error(f"❌ Data directory not found: {args.data_dir}")
+        return 1
+    
+    # DETERMINISM: Use glob_sorted for deterministic iteration order
+    symbol_dirs = [d for d in glob_sorted(args.data_dir, "symbol=*", filter_fn=lambda p: p.is_dir())]
+    labeled_files = []
+    for symbol_dir in symbol_dirs:
+        symbol_name = symbol_dir.name.replace("symbol=", "")
+        parquet_file = symbol_dir / f"{symbol_name}.parquet"
+        if parquet_file.exists():
+            labeled_files.append((symbol_name, parquet_file))
+    
+    if args.symbols:
+        requested = [s.upper().strip() for s in args.symbols.split(',')]
+        labeled_files = [(sym, path) for sym, path in labeled_files if sym.upper() in requested]
+    
+    if not labeled_files:
+        logger.error("❌ No labeled files found")
+        return 1
+    
+    logger.info(f"📊 Processing {len(labeled_files)} symbols")
+    
+    # Initialize checkpoint manager
+    checkpoint_file = args.output_dir / "checkpoint.json"
+    checkpoint = CheckpointManager(
+        checkpoint_file=checkpoint_file,
+        item_key_fn=lambda item: item if isinstance(item, str) else item[0]  # symbol name
+    )
+    
+    # Clear checkpoint if requested
+    if args.clear_checkpoint:
+        checkpoint.clear()
+        logger.info("Cleared checkpoint - starting fresh")
+    
+    # Load completed symbols
+    completed = checkpoint.load_completed()
+    logger.info(f"Found {len(completed)} completed symbols in checkpoint")
+    
+    # Process symbols (sequential to avoid GPU/memory conflicts)
+    all_results = []
+    all_family_statuses = []  # Collect status info for debugging
+    for i, (symbol, path) in enumerate(labeled_files, 1):
+        # Check if already completed
+        if symbol in completed:
+            if args.resume:
+                logger.info(f"\n[{i}/{len(labeled_files)}] Skipping {symbol} (already completed)")
+                symbol_results = completed[symbol]
+                if isinstance(symbol_results, list):
+                    # Reconstruct ImportanceResult objects from dicts
+                    for r_dict in symbol_results:
+                        # Convert importance_scores dict back to pd.Series
+                        if isinstance(r_dict.get('importance_scores'), dict):
+                            r_dict['importance_scores'] = pd.Series(r_dict['importance_scores'])
+                        # Convert None back to NaN for train_score (from checkpoint deserialization)
+                        if r_dict.get('train_score') is None:
+                            r_dict['train_score'] = math.nan
+                        all_results.append(ImportanceResult(**r_dict))
+            continue
+        elif not args.resume:
+            continue
+        
+        logger.info(f"\n[{i}/{len(labeled_files)}] Processing {symbol}...")
+        try:
+            results, family_statuses = process_single_symbol(
+                symbol, path, args.target_column,
+                config['model_families'],
+                config['sampling']['max_samples_per_symbol']
+            )
+            all_results.extend(results)
+            all_family_statuses.extend(family_statuses)
+            
+            # Save checkpoint after each symbol
+            # Convert results to dict for serialization (handle pd.Series and NaN)
+            results_dict = []
+            for r in results:
+                r_dict = asdict(r)
+                # Convert pd.Series to dict
+                if isinstance(r_dict.get('importance_scores'), pd.Series):
+                    r_dict['importance_scores'] = r_dict['importance_scores'].to_dict()
+                # Convert NaN to None for JSON serialization (checkpoint can't serialize NaN)
+                if 'train_score' in r_dict and math.isnan(r_dict['train_score']):
+                    r_dict['train_score'] = None
+                results_dict.append(r_dict)
+            checkpoint.save_item(symbol, results_dict)
+        except Exception as e:
+            logger.error(f"  Failed to process {symbol}: {e}")
+            checkpoint.mark_failed(symbol, str(e))
+            continue
+    
+    if not all_results:
+        logger.error("❌ No results collected")
+        return 1
+    
+    logger.info(f"\n{'='*80}")
+    logger.info(f"📈 Aggregating {len(all_results)} model results...")
+    logger.info(f"{'='*80}")
+    
+    # Aggregate across models and symbols
+    summary_df, selected_features = aggregate_multi_model_importance(
+        all_results,
+        config['model_families'],
+        config['aggregation'],
+        args.top_n,
+        all_family_statuses=all_family_statuses  # Pass status info for logging excluded families
+    )
+    
+    if summary_df.empty:
+        logger.error("❌ No features selected")
+        return 1
+    
+    # Save results
+    metadata = {
+        'timestamp': pd.Timestamp.now().isoformat(),
+        'target_column': args.target_column,
+        'family_statuses': all_family_statuses,  # Include for debugging
+        'top_n': args.top_n,
+        'n_symbols': len(labeled_files),
+        'enabled_families': enabled_families,
+        'config': config,
+        'model_families_config': config.get('model_families', {}),  # Explicit for confidence computation
+        'family_statuses': all_family_statuses  # Include for debugging
+    }
+    
+    save_multi_model_results(
+        summary_df, selected_features, all_results,
+        args.output_dir, metadata
+    )
+    
+    # Print summary
+    logger.info(f"\n{'='*80}")
+    logger.info("✅ Multi-Model Feature Selection Complete!")
+    logger.info(f"{'='*80}")
+    logger.info(f"\n📊 Top 10 Features by Consensus:")
+    for i, row in summary_df.head(10).iterrows():
+        logger.info(f"  {i+1:2d}. {row['feature']:30s} | "
+                   f"score={row['consensus_score']:8.2f} | "
+                   f"agree={row['n_models_agree']}/{len(enabled_families)} | "
+                   f"std={row['std_across_models']:6.2f}")
+    
+    logger.info(f"\n📁 Output files:")
+    logger.info(f"  • {args.output_dir}/artifacts/selected_features.txt")
+    logger.info(f"  • {args.output_dir}/feature_importances/feature_importance_multi_model.csv")
+    logger.info(f"  • {args.output_dir}/feature_importances/feature_importance_with_boruta_debug.csv")
+    logger.info(f"  • {args.output_dir}/feature_importances/model_agreement_matrix.csv")
+    logger.info(f"  • {args.output_dir}/feature_importances/<model>_importances.csv (per-model)")
+    logger.info(f"  • {args.output_dir}/metadata/target_confidence.json")
+    logger.info(f"  • {args.output_dir}/metadata/multi_model_metadata.json")
+    logger.info(f"  • {args.output_dir}/metadata/model_family_status.json (family status tracking)")
+    
+    # Generate metrics rollups after all feature selections complete
+    try:
+        from TRAINING.orchestration.utils.reproducibility_tracker import ReproducibilityTracker
+        from datetime import datetime
+        
+        # Find the REPRODUCIBILITY directory
+        repro_dir = args.output_dir / "REPRODUCIBILITY"
+        if not repro_dir.exists() and args.output_dir.parent.exists():
+            repro_dir = args.output_dir.parent / "REPRODUCIBILITY"
+        
+        if repro_dir.exists():
+            # Use output_dir parent as base (where RESULTS/runs/ typically is)
+            base_dir = args.output_dir.parent if (args.output_dir / "REPRODUCIBILITY").exists() else args.output_dir
+            tracker = ReproducibilityTracker(output_dir=base_dir)
+            # Generate run_id from output_dir name or timestamp
+            run_id = args.output_dir.name if args.output_dir.name else datetime.now().strftime("%Y%m%d_%H%M%S")
+            tracker.generate_metrics_rollups(stage=Stage.FEATURE_SELECTION, run_id=run_id)
+            logger.debug("✅ Generated metrics rollups for FEATURE_SELECTION")
+    except Exception as e:
+        logger.debug(f"Failed to generate metrics rollups: {e}")
+    
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+

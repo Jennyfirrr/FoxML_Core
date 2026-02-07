@@ -1,0 +1,1730 @@
+# Phase 19: Feature Aliases for Interval-Agnostic Naming
+# Maps interval-agnostic names to canonical (interval-specific) names.
+# Allows code to use stable names that work across all data intervals.
+#
+# Formats supported:
+#   Simple: alias: canonical
+#   Detailed: alias: {canonical: name, description: ...}
+#
+# Example usage:
+#   registry.get_feature_metadata("ret_short")  # Returns ret_5m metadata
+#   registry.resolve_alias("vol_short")  # Returns "vol_5m"
+#
+feature_aliases:
+  # Return features (interval-agnostic names)
+  ret_short: ret_5m          # 5-minute return at reference interval
+  ret_medium: ret_15m        # 15-minute return
+  ret_long: ret_60m          # 60-minute return
+
+  # Volatility features
+  vol_short: vol_5m
+  vol_medium: vol_15m
+  vol_long: vol_60m
+
+  # Technical indicators (interval-agnostic)
+  rsi_standard: rsi_14       # Standard 14-period RSI
+  macd_standard: macd_12_26  # Standard MACD (12/26)
+  atr_standard: atr_14       # Standard 14-period ATR
+  adx_standard: adx_14       # Standard 14-period ADX
+
+feature_families:
+  lagged_returns:
+    # Phase 7 (interval-agnostic): V2 schema uses minutes, V1 uses bars
+    # V2 schema (preferred): allowed_horizon_minutes
+    default_allowed_horizon_minutes:
+    - 5
+    - 10
+    - 15
+    - 25
+    - 60
+    - 120
+    - 300
+    # V1 schema (deprecated, kept for backward compatibility)
+    default_allowed_horizons:
+    - 1
+    - 2
+    - 3
+    - 5
+    - 12
+    - 24
+    - 60
+    default_lag_bars: null
+    description: Lagged returns (ret_N where N is lag)
+    pattern: ^ret_\d+$
+  rejected_barriers:
+    default_allowed_horizons: []
+    default_lag_bars: 0
+    default_lookback_minutes: 0
+    description: 'REJECTED: Barrier features (leaky)'
+    pattern: ^barrier_
+    rejected: true
+  rejected_future_returns:
+    default_allowed_horizons: []
+    default_lag_bars: -1
+    default_lookback_minutes: -5
+    description: 'REJECTED: Future returns (leaky)'
+    pattern: ^(ret_future_|fwd_ret_)
+    rejected: true
+  rejected_metadata:
+    default_allowed_horizons: []
+    default_lag_bars: 0
+    default_lookback_minutes: 0
+    description: 'REJECTED: Metadata columns'
+    pattern: ^(ts|timestamp|symbol|time)$
+    rejected: true
+  rejected_mfe_mdd:
+    default_allowed_horizons: []
+    default_lag_bars: 0
+    default_lookback_minutes: 0
+    description: 'REJECTED: MFE/MDD features (leaky)'
+    pattern: ^(mfe|mdd)_
+    rejected: true
+  rejected_predictions:
+    default_allowed_horizons: []
+    default_lag_bars: 0
+    default_lookback_minutes: 0
+    description: 'REJECTED: Prediction/probability features (leaky)'
+    pattern: ^p_
+    rejected: true
+  rejected_targets:
+    default_allowed_horizons: []
+    default_lag_bars: 0
+    default_lookback_minutes: 0
+    description: 'REJECTED: Target columns (leaky)'
+    pattern: ^(y_|target_)
+    rejected: true
+  rejected_time_to_hit:
+    default_allowed_horizons: []
+    default_lag_bars: 0
+    default_lookback_minutes: 0
+    description: 'REJECTED: Time-to-hit features (leaky)'
+    pattern: ^tth_
+    rejected: true
+  technical_indicators:
+    default_allowed_horizons:
+    - 1
+    - 2
+    - 3
+    - 5
+    - 12
+    - 24
+    - 60
+    default_lag_bars: null
+    description: Technical indicators with numeric lookback
+    pattern: ^(rsi|sma|ema|macd|bb|atr|adx)_\d+$
+  volatility_features:
+    default_allowed_horizons:
+    - 1
+    - 2
+    - 3
+    - 5
+    - 12
+    - 24
+    - 60
+    default_lag_bars: null
+    description: Volatility features
+    pattern: ^(volatility|vol_|std_|var_)
+  volume_features:
+    default_allowed_horizons:
+    - 1
+    - 2
+    - 3
+    - 5
+    - 12
+    - 24
+    - 60
+    default_lag_bars: 1
+    default_lookback_minutes: 5
+    description: Volume-based features
+    pattern: ^(volume|vol_|obv|ad|cmf)
+features:
+  _day:
+    allowed_horizons: []
+    description: Calendar/time metadata (lag_bars=0 is correct)
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: false
+    source: metadata
+  _hour:
+    allowed_horizons: []
+    description: Calendar/time metadata (lag_bars=0 is correct)
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: false
+    source: metadata
+  _month:
+    allowed_horizons: []
+    description: Calendar/time metadata (lag_bars=0 is correct)
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: false
+    source: metadata
+  _weekday:
+    allowed_horizons: []
+    description: Calendar/time metadata (lag_bars=0 is correct)
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: false
+    source: metadata
+  ad_line:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  adx_14:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=14 (indicator_period)'
+    lag_bars: 14
+    lookback_minutes: 70
+    rejected: false
+    source: derived
+  adx_x_vol:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=14 (complex_override)'
+    lag_bars: 14
+    lookback_minutes: 70
+    rejected: false
+    source: derived
+  atr_14:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=14 (indicator_period)'
+    lag_bars: 14
+    lookback_minutes: 70
+    rejected: false
+    source: derived
+  atr_x_vol:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=14 (complex_override)'
+    lag_bars: 14
+    lookback_minutes: 70
+    rejected: false
+    source: derived
+  awesome_oscillator:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=34 (complex_override)'
+    lag_bars: 34
+    lookback_minutes: 170
+    rejected: false
+    source: derived
+  barrier_5m_0.8:
+    description: 'REJECTED: Barrier features encode barrier logic'
+    reason: Barrier features encode barrier logic
+    rejected: true
+    source: derived
+  bb_lower_20:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=20 (indicator_period)'
+    lag_bars: 20
+    lookback_minutes: 100
+    rejected: false
+    source: derived
+  bb_width_20:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=20 (indicator_period)'
+    lag_bars: 20
+    lookback_minutes: 100
+    rejected: false
+    source: derived
+  bb_x_ret:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=20 (complex_override)'
+    lag_bars: 20
+    lookback_minutes: 100
+    rejected: false
+    source: derived
+  bb_x_vol:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  bb_x_volume:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  beta_60d:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=17280 (days_to_bars(60d*1440/5m))'
+    lag_bars: 17280
+    lookback_minutes: 86400
+    rejected: false
+    source: derived
+  bid_ask_spread_est:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  cci_10:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  cci_20:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=20 (indicator_period)'
+    lag_bars: 20
+    lookback_minutes: 100
+    rejected: false
+    source: derived
+  cci_x_vol:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  close:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  close_vol_frac:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  cmf:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=21 (complex_override)'
+    lag_bars: 21
+    lookback_minutes: 105
+    rejected: false
+    source: derived
+  date:
+    description: 'REJECTED: Date column - metadata, not a feature'
+    reason: Metadata column, not a feature
+    rejected: true
+    source: metadata
+  day_of_month:
+    allowed_horizons: []
+    description: Calendar/time metadata (lag_bars=0 is correct)
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: false
+    source: metadata
+  day_of_week:
+    allowed_horizons: []
+    description: Calendar/time metadata (lag_bars=0 is correct)
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: false
+    source: metadata
+  day_x_volume:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=1 (complex_override)'
+    lag_bars: 1
+    lookback_minutes: 5
+    rejected: false
+    source: derived
+  donchian_middle:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  donchian_upper:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  ease_of_movement:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=14 (complex_override)'
+    lag_bars: 14
+    lookback_minutes: 70
+    rejected: false
+    source: derived
+  effective_spread:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  ema_12:
+    allowed_horizons:
+    - 1
+    - 2
+    - 3
+    - 5
+    - 12
+    - 24
+    - 60
+    description: 12-bar exponential moving average
+    lag_bars: 12
+    lookback_minutes: 60
+    source: derived
+  ema_26:
+    allowed_horizons:
+    - 1
+    - 2
+    - 3
+    - 5
+    - 12
+    - 24
+    - 60
+    description: 26-bar exponential moving average
+    lag_bars: 26
+    lookback_minutes: 130
+    source: derived
+  flipcount_10m:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=2 (minutes_to_bars(10m/5m))'
+    lag_bars: 2
+    lookback_minutes: 10
+    reason: Auto-detected as leaky feature
+    rejected: false
+    source: derived
+  flipcount_15m:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=3 (minutes_to_bars(15m/5m))'
+    lag_bars: 3
+    lookback_minutes: 15
+    reason: Auto-detected as leaky feature
+    rejected: false
+    source: derived
+  flipcount_5m:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=1 (minutes_to_bars(5m/5m))'
+    lag_bars: 1
+    lookback_minutes: 5
+    reason: Auto-detected as leaky feature
+    rejected: false
+    source: derived
+  flipcount_60m:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=12 (minutes_to_bars(60m/5m))'
+    lag_bars: 12
+    lookback_minutes: 60
+    rejected: false
+    source: derived
+  force_index:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=13 (complex_override)'
+    lag_bars: 13
+    lookback_minutes: 65
+    rejected: false
+    source: derived
+  fractal_low:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=5 (complex_override)'
+    lag_bars: 5
+    lookback_minutes: 25
+    rejected: false
+    source: derived
+  gap_co:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  gap_x_volume:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  gk_vol_10:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  gk_vol_20:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  gk_vol_5:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=5 (volatility_window)'
+    lag_bars: 5
+    lookback_minutes: 25
+    rejected: false
+    source: derived
+  high:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  high_vol_frac:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=1 (complex_override)'
+    lag_bars: 1
+    lookback_minutes: 5
+    rejected: false
+    source: derived
+  hour_13:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  hour_of_day:
+    allowed_horizons: []
+    description: Calendar/time metadata (lag_bars=0 is correct)
+    lag_bars: 0
+    lookback_minutes: 0
+    reason: Auto-detected as leaky feature
+    rejected: true
+    source: metadata
+  hour_x_volume:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  hull_ma_10:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=10 (indicator_period)'
+    lag_bars: 10
+    lookback_minutes: 50
+    rejected: false
+    source: derived
+  hull_ma_20:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  hull_ma_5:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  ichimoku_chikou:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=52 (complex_override)'
+    lag_bars: 52
+    lookback_minutes: 260
+    rejected: false
+    source: derived
+  ichimoku_kijun:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  ichimoku_senkou_a:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=52 (complex_override)'
+    lag_bars: 52
+    lookback_minutes: 260
+    rejected: false
+    source: derived
+  ichimoku_senkou_b:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=52 (complex_override)'
+    lag_bars: 52
+    lookback_minutes: 260
+    rejected: false
+    source: derived
+  ichimoku_tenkan:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  intraday_seasonality_15m:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  intraday_seasonality_30m:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  keltner_upper:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  liquidity_ratio:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=20 (complex_override)'
+    lag_bars: 20
+    lookback_minutes: 100
+    rejected: false
+    source: derived
+  low_vol_frac:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  macd:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  macd_hist:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=26 (complex_override)'
+    lag_bars: 26
+    lookback_minutes: 130
+    rejected: false
+    source: derived
+  macd_signal:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=26 (complex_override)'
+    lag_bars: 26
+    lookback_minutes: 130
+    rejected: false
+    source: derived
+  macd_x_ret:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=26 (complex_override)'
+    lag_bars: 26
+    lookback_minutes: 130
+    rejected: false
+    source: derived
+  macd_x_vol:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=26 (complex_override)'
+    lag_bars: 26
+    lookback_minutes: 130
+    rejected: false
+    source: derived
+  macd_x_volume:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=26 (complex_override)'
+    lag_bars: 26
+    lookback_minutes: 130
+    rejected: false
+    source: derived
+  market_correlation_20d:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=5760 (days_to_bars(20d*1440/5m))'
+    lag_bars: 5760
+    lookback_minutes: 28800
+    rejected: false
+    source: derived
+  market_correlation_60d:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=17280 (days_to_bars(60d*1440/5m))'
+    lag_bars: 17280
+    lookback_minutes: 86400
+    rejected: false
+    source: derived
+  market_facilitation_index:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=1 (complex_override)'
+    lag_bars: 1
+    lookback_minutes: 5
+    rejected: false
+    source: derived
+  market_impact:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=1 (complex_override)'
+    lag_bars: 1
+    lookback_minutes: 5
+    rejected: false
+    source: derived
+  mass_index:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=25 (complex_override)'
+    lag_bars: 25
+    lookback_minutes: 125
+    rejected: false
+    source: derived
+  mfi_14:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=14 (indicator_period)'
+    lag_bars: 14
+    lookback_minutes: 70
+    rejected: false
+    source: derived
+  mfi_21:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=21 (indicator_period)'
+    lag_bars: 21
+    lookback_minutes: 105
+    rejected: false
+    source: derived
+  mom_10d:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=2880 (days_to_bars(10d*1440/5m))'
+    lag_bars: 2880
+    lookback_minutes: 14400
+    rejected: false
+    source: derived
+  mom_1d:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=288 (days_to_bars(1d*1440/5m))'
+    lag_bars: 288
+    lookback_minutes: 1440
+    rejected: false
+    source: derived
+  mom_3d:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=864 (days_to_bars(3d*1440/5m))'
+    lag_bars: 864
+    lookback_minutes: 4320
+    rejected: false
+    source: derived
+  momentum_10:
+    allowed_horizons: []
+    description: 10-bar momentum
+    lag_bars: 10
+    lookback_minutes: 50
+    rejected: true
+    source: derived
+  momentum_20:
+    allowed_horizons: []
+    description: 20-bar momentum
+    lag_bars: 20
+    lookback_minutes: 100
+    rejected: true
+    source: derived
+  momentum_x_volatility:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  month_of_year:
+    allowed_horizons: []
+    description: Calendar/time metadata (lag_bars=0 is correct)
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: false
+    source: metadata
+  n_trades:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=1 (complex_override)'
+    lag_bars: 1
+    lookback_minutes: 5
+    rejected: false
+    source: derived
+  negative_volume_index:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=1 (complex_override)'
+    lag_bars: 1
+    lookback_minutes: 5
+    rejected: false
+    source: derived
+  obv:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=1 (complex_override)'
+    lag_bars: 1
+    lookback_minutes: 5
+    rejected: false
+    source: derived
+  obv_ema:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=20 (complex_override)'
+    lag_bars: 20
+    lookback_minutes: 100
+    rejected: false
+    source: derived
+  open_loc_1d:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=288 (days_to_bars(1d*1440/5m))'
+    lag_bars: 288
+    lookback_minutes: 1440
+    rejected: false
+    source: derived
+  open_vol_frac:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  order_flow_imbalance:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  overnight_return:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  overnight_vol:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  p_up_60m_0.8:
+    description: 'REJECTED: Prediction/probability feature (leaky)'
+    reason: Prediction/probability feature (leaky)
+    rejected: true
+    source: target_proxy
+  parkinson_vol_10:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=10 (volatility_window)'
+    lag_bars: 10
+    lookback_minutes: 50
+    rejected: false
+    source: derived
+  parkinson_vol_20:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  parkinson_vol_5:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=5 (volatility_window)'
+    lag_bars: 5
+    lookback_minutes: 25
+    rejected: false
+    source: derived
+  price_impact:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=1 (complex_override)'
+    lag_bars: 1
+    lookback_minutes: 5
+    rejected: false
+    source: derived
+  price_momentum_60d:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=17280 (days_to_bars(60d*1440/5m))'
+    lag_bars: 17280
+    lookback_minutes: 86400
+    rejected: false
+    source: derived
+  price_volume_trend:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=1 (complex_override)'
+    lag_bars: 1
+    lookback_minutes: 5
+    rejected: false
+    source: derived
+  range_compression_5m:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  range_compression_60m:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  range_frac:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  realized_spread:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  realized_vol_10:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  realized_vol_20:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=20 (volatility_window)'
+    lag_bars: 20
+    lookback_minutes: 100
+    rejected: false
+    source: derived
+  realized_vol_5:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  ret2_15m:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=3 (minutes_to_bars(15m/5m))'
+    lag_bars: 3
+    lookback_minutes: 15
+    rejected: false
+    source: derived
+  ret2_5m:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=1 (minutes_to_bars(5m/5m))'
+    lag_bars: 1
+    lookback_minutes: 5
+    rejected: false
+    source: derived
+  ret2_60m:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=12 (minutes_to_bars(60m/5m))'
+    lag_bars: 12
+    lookback_minutes: 60
+    rejected: false
+    source: derived
+  ret_1:
+    allowed_horizons:
+    - 1
+    - 2
+    - 3
+    - 5
+    - 12
+    - 24
+    - 60
+    description: 1-bar lagged return
+    lag_bars: 1
+    lookback_minutes: 5
+    source: price
+  ret_10:
+    allowed_horizons:
+    - 10
+    - 12
+    - 24
+    - 60
+    description: 10-bar lagged return
+    lag_bars: 10
+    lookback_minutes: 50
+    source: price
+  ret_15:
+    allowed_horizons:
+    - 15
+    - 24
+    - 60
+    description: 15-bar lagged return
+    lag_bars: 15
+    lookback_minutes: 75
+    source: price
+  ret_15m:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=3 (minutes_to_bars(15m/5m))'
+    lag_bars: 3
+    lookback_minutes: 15
+    rejected: false
+    source: derived
+  ret_1m:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  ret_2:
+    allowed_horizons:
+    - 2
+    - 3
+    - 5
+    - 12
+    - 24
+    - 60
+    description: 2-bar lagged return
+    lag_bars: 2
+    lookback_minutes: 10
+    source: price
+  ret_30:
+    allowed_horizons:
+    - 30
+    - 60
+    description: 30-bar lagged return
+    lag_bars: 30
+    lookback_minutes: 150
+    source: price
+  ret_30m:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=6 (minutes_to_bars(30m/5m))'
+    lag_bars: 6
+    lookback_minutes: 30
+    rejected: false
+    source: derived
+  ret_5:
+    allowed_horizons:
+    - 5
+    - 12
+    - 24
+    - 60
+    description: 5-bar lagged return
+    lag_bars: 5
+    lookback_minutes: 25
+    source: price
+  ret_60:
+    allowed_horizons:
+    - 60
+    description: 60-bar lagged return
+    lag_bars: 60
+    lookback_minutes: 300
+    source: price
+  ret_60m:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=12 (minutes_to_bars(60m/5m))'
+    lag_bars: 12
+    lookback_minutes: 60
+    rejected: false
+    source: derived
+  ret_future_1:
+    description: 'REJECTED: Future return (looks into future)'
+    reason: Future return (looks into future - structurally leaky)
+    rejected: true
+    source: price
+  ret_oc:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  ret_ord_10m:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  ret_ord_15m:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=3 (minutes_to_bars(15m/5m))'
+    lag_bars: 3
+    lookback_minutes: 15
+    rejected: false
+    source: derived
+  ret_ord_30m:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=6 (minutes_to_bars(30m/5m))'
+    lag_bars: 6
+    lookback_minutes: 30
+    rejected: false
+    source: derived
+  ret_ord_5m:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=1 (minutes_to_bars(5m/5m))'
+    lag_bars: 1
+    lookback_minutes: 5
+    rejected: false
+    source: derived
+  ret_ord_60m:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  ret_zscore_10m:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=2 (minutes_to_bars(10m/5m))'
+    lag_bars: 2
+    lookback_minutes: 10
+    reason: Auto-detected as leaky feature
+    rejected: false
+    source: derived
+  ret_zscore_15m:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=3 (minutes_to_bars(15m/5m))'
+    lag_bars: 3
+    lookback_minutes: 15
+    rejected: false
+    source: derived
+  ret_zscore_30m:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=6 (minutes_to_bars(30m/5m))'
+    lag_bars: 6
+    lookback_minutes: 30
+    reason: Auto-detected as leaky feature
+    rejected: false
+    source: derived
+  ret_zscore_5m:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=1 (minutes_to_bars(5m/5m))'
+    lag_bars: 1
+    lookback_minutes: 5
+    reason: Auto-detected as leaky feature
+    rejected: false
+    source: derived
+  ret_zscore_60m:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=12 (minutes_to_bars(60m/5m))'
+    lag_bars: 12
+    lookback_minutes: 60
+    rejected: false
+    source: derived
+  roc_10:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=10 (indicator_period)'
+    lag_bars: 10
+    lookback_minutes: 50
+    rejected: false
+    source: derived
+  roc_20:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  roc_50:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=50 (indicator_period)'
+    lag_bars: 50
+    lookback_minutes: 250
+    rejected: false
+    source: derived
+  roc_x_volatility:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  rs_vol_10:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=10 (volatility_window)'
+    lag_bars: 10
+    lookback_minutes: 50
+    rejected: false
+    source: derived
+  rs_vol_20:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=20 (volatility_window)'
+    lag_bars: 20
+    lookback_minutes: 100
+    rejected: false
+    source: derived
+  rs_vol_5:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=5 (volatility_window)'
+    lag_bars: 5
+    lookback_minutes: 25
+    rejected: false
+    source: derived
+  rsi_10:
+    allowed_horizons: []
+    description: RSI with 10-bar lookback
+    lag_bars: 10
+    lookback_minutes: 50
+    rejected: true
+    source: derived
+  rsi_14:
+    allowed_horizons: []
+    description: RSI with 14-bar lookback
+    lag_bars: 14
+    lookback_minutes: 70
+    rejected: true
+    source: derived
+  rsi_21:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=21 (indicator_period)'
+    lag_bars: 21
+    lookback_minutes: 105
+    rejected: false
+    source: derived
+  rsi_30:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=30 (indicator_period)'
+    lag_bars: 30
+    lookback_minutes: 150
+    rejected: false
+    source: derived
+  rsi_5:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=5 (indicator_period)'
+    lag_bars: 5
+    lookback_minutes: 25
+    rejected: false
+    source: derived
+  rsi_7:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=7 (indicator_period)'
+    lag_bars: 7
+    lookback_minutes: 35
+    rejected: false
+    source: derived
+  rsi_x_vol:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  rsi_x_volume:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  sma_10:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=10 (indicator_period)'
+    lag_bars: 10
+    lookback_minutes: 50
+    rejected: false
+    source: derived
+  sma_20:
+    allowed_horizons:
+    - 1
+    - 2
+    - 3
+    - 5
+    - 12
+    - 24
+    - 60
+    description: 20-bar simple moving average
+    lag_bars: 20
+    lookback_minutes: 100
+    source: derived
+  sma_200:
+    allowed_horizons: []
+    description: 200-bar simple moving average
+    lag_bars: 200
+    lookback_minutes: 1000
+    rejected: true
+    source: derived
+  sma_50:
+    allowed_horizons:
+    - 1
+    - 2
+    - 3
+    - 5
+    - 12
+    - 24
+    - 60
+    description: 50-bar simple moving average
+    lag_bars: 50
+    lookback_minutes: 250
+    source: derived
+  stoch_d_14:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  stoch_d_21:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=21 (indicator_period)'
+    lag_bars: 21
+    lookback_minutes: 105
+    rejected: false
+    source: derived
+  stoch_d_5:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=5 (indicator_period)'
+    lag_bars: 5
+    lookback_minutes: 25
+    rejected: false
+    source: derived
+  stoch_k_5:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=5 (indicator_period)'
+    lag_bars: 5
+    lookback_minutes: 25
+    rejected: false
+    source: derived
+  stoch_x_ret:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=14 (complex_override)'
+    lag_bars: 14
+    lookback_minutes: 70
+    rejected: false
+    source: derived
+  stoch_x_vol:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=14 (complex_override)'
+    lag_bars: 14
+    lookback_minutes: 70
+    rejected: false
+    source: derived
+  symbol:
+    description: 'REJECTED: Symbol column - metadata, not a feature'
+    reason: Metadata column, not a feature
+    rejected: true
+    source: metadata
+  tema_20:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  time_in_profit_10m:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=2 (minutes_to_bars(10m/5m))'
+    lag_bars: 2
+    lookback_minutes: 10
+    reason: Auto-detected as leaky feature
+    rejected: false
+    source: derived
+  time_in_profit_15m:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=3 (minutes_to_bars(15m/5m))'
+    lag_bars: 3
+    lookback_minutes: 15
+    reason: Auto-detected as leaky feature
+    rejected: false
+    source: derived
+  time_in_profit_5m:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=1 (minutes_to_bars(5m/5m))'
+    lag_bars: 1
+    lookback_minutes: 5
+    reason: Auto-detected as leaky feature
+    rejected: false
+    source: derived
+  time_in_profit_60m:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=12 (minutes_to_bars(60m/5m))'
+    lag_bars: 12
+    lookback_minutes: 60
+    rejected: false
+    source: derived
+  trade_size_vol:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=5 (complex_override)'
+    lag_bars: 5
+    lookback_minutes: 25
+    rejected: false
+    source: derived
+  trading_day_of_month:
+    allowed_horizons: []
+    description: Calendar/time metadata (lag_bars=0 is correct)
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: false
+    source: metadata
+  trading_day_of_quarter:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  ts:
+    description: 'REJECTED: Timestamp column - metadata, not a feature'
+    reason: Metadata column, not a feature
+    rejected: true
+    source: metadata
+  tth_5m:
+    description: 'REJECTED: Time-to-hit requires future path'
+    lag_bars: 1
+    lookback_minutes: 5
+    reason: Time-to-hit requires future path
+    rejected: true
+    source: derived
+  turnover:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=20 (complex_override)'
+    lag_bars: 20
+    lookback_minutes: 100
+    rejected: false
+    source: derived
+  turnover_20:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=20 (indicator_period)'
+    lag_bars: 20
+    lookback_minutes: 100
+    rejected: false
+    source: derived
+  turnover_5:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=5 (indicator_period)'
+    lag_bars: 5
+    lookback_minutes: 25
+    rejected: false
+    source: derived
+  vol_15m:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=3 (minutes_to_bars(15m/5m))'
+    lag_bars: 3
+    lookback_minutes: 15
+    reason: Auto-detected as leaky feature
+    rejected: false
+    source: derived
+  vol_30m:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=6 (minutes_to_bars(30m/5m))'
+    lag_bars: 6
+    lookback_minutes: 30
+    rejected: false
+    source: derived
+  vol_5m:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  vol_60m:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=12 (minutes_to_bars(60m/5m))'
+    lag_bars: 12
+    lookback_minutes: 60
+    rejected: false
+    source: derived
+  vol_clustering_15m:
+    description: 'Fixed: lag_bars=3 (minutes_to_bars(15m/5m))'
+    lag_bars: 3
+    lookback_minutes: 15
+    rejected: false
+    source: derived
+  vol_clustering_5m:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  vol_clustering_60m:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=12 (minutes_to_bars(60m/5m))'
+    lag_bars: 12
+    lookback_minutes: 60
+    rejected: false
+    source: derived
+  vol_dollar:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  vol_over_vol_15m:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=3 (minutes_to_bars(15m/5m))'
+    lag_bars: 3
+    lookback_minutes: 15
+    rejected: false
+    source: derived
+  vol_over_vol_5m:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=1 (minutes_to_bars(5m/5m))'
+    lag_bars: 1
+    lookback_minutes: 5
+    rejected: false
+    source: derived
+  vol_over_vol_60m:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=12 (minutes_to_bars(60m/5m))'
+    lag_bars: 12
+    lookback_minutes: 60
+    rejected: false
+    source: derived
+  vol_persistence:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=20 (complex_override)'
+    lag_bars: 20
+    lookback_minutes: 100
+    rejected: false
+    source: derived
+  vol_x_ret_15m:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  vol_x_ret_60m:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=12 (minutes_to_bars(60m/5m))'
+    lag_bars: 12
+    lookback_minutes: 60
+    rejected: false
+    source: derived
+  volatility_10:
+    allowed_horizons:
+    - 1
+    - 2
+    - 3
+    - 5
+    - 12
+    - 24
+    - 60
+    description: 10-bar volatility
+    lag_bars: 10
+    lookback_minutes: 50
+    source: derived
+  volatility_20:
+    allowed_horizons:
+    - 1
+    - 2
+    - 3
+    - 5
+    - 12
+    - 24
+    - 60
+    description: 20-bar volatility
+    lag_bars: 20
+    lookback_minutes: 100
+    source: derived
+  volatility_60d:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=17280 (days_to_bars(60d*1440/5m))'
+    lag_bars: 17280
+    lookback_minutes: 86400
+    rejected: false
+    source: derived
+  volume:
+    allowed_horizons:
+    - 1
+    - 2
+    - 3
+    - 5
+    - 12
+    - 24
+    - 60
+    description: Volume (1-bar lag)
+    lag_bars: 1
+    lookback_minutes: 5
+    source: volume
+  volume_ema_20:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=20 (indicator_period)'
+    lag_bars: 20
+    lookback_minutes: 100
+    rejected: false
+    source: derived
+  volume_ema_5:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  volume_price_trend:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  volume_quantile_20d:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=5760 (days_to_bars(20d*1440/5m))'
+    lag_bars: 5760
+    lookback_minutes: 28800
+    rejected: false
+    source: derived
+  volume_ratio_20d:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=5760 (days_to_bars(20d*1440/5m))'
+    lag_bars: 5760
+    lookback_minutes: 28800
+    rejected: false
+    source: derived
+  volume_ratio_5d:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=1440 (days_to_bars(5d*1440/5m))'
+    lag_bars: 1440
+    lookback_minutes: 7200
+    rejected: false
+    source: derived
+  volume_raw:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  volume_roc_10:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=10 (indicator_period)'
+    lag_bars: 10
+    lookback_minutes: 50
+    rejected: false
+    source: derived
+  volume_roc_20:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=20 (indicator_period)'
+    lag_bars: 20
+    lookback_minutes: 100
+    rejected: false
+    source: derived
+  volume_roc_5:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=5 (indicator_period)'
+    lag_bars: 5
+    lookback_minutes: 25
+    rejected: false
+    source: derived
+  volume_sma_20:
+    allowed_horizons: []
+    description: 20-bar volume moving average
+    lag_bars: 20
+    lookback_minutes: 100
+    rejected: true
+    source: derived
+  volume_sma_5:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=5 (indicator_period)'
+    lag_bars: 5
+    lookback_minutes: 25
+    rejected: false
+    source: derived
+  volume_sma_50:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=50 (indicator_period)'
+    lag_bars: 50
+    lookback_minutes: 250
+    rejected: false
+    source: derived
+  volume_std_20d:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=5760 (days_to_bars(20d*1440/5m))'
+    lag_bars: 5760
+    lookback_minutes: 28800
+    rejected: false
+    source: derived
+  volume_volatility_20d:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=5760 (days_to_bars(20d*1440/5m))'
+    lag_bars: 5760
+    lookback_minutes: 28800
+    rejected: false
+    source: derived
+  vwap:
+    allowed_horizons: []
+    description: Volume-weighted average price (1-bar lag)
+    lag_bars: 1
+    lookback_minutes: 5
+    rejected: true
+    source: derived
+  vwap_dev:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  vwap_dev_15m:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  vwap_dev_30m:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  vwap_dev_5m:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  vwap_dev_high:
+    allowed_horizons: []
+    description: VWAP deviation high (1-bar lag)
+    lag_bars: 1
+    lookback_minutes: 5
+    rejected: true
+    source: derived
+  vwap_dev_low:
+    allowed_horizons: []
+    description: VWAP deviation low (1-bar lag)
+    lag_bars: 1
+    lookback_minutes: 5
+    rejected: true
+    source: derived
+  wd_3:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  williams_accumulation:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  williams_r_7:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  yz_vol_10:
+    allowed_horizons: []
+    description: 'AUTO-REJECTED: Detected as leaky feature'
+    lag_bars: 0
+    lookback_minutes: 0
+    rejected: true
+    source: unknown
+  yz_vol_20:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=20 (volatility_window)'
+    lag_bars: 20
+    lookback_minutes: 100
+    rejected: false
+    source: derived
+  yz_vol_5:
+    allowed_horizons: []
+    description: 'Fixed: lag_bars=5 (volatility_window)'
+    lag_bars: 5
+    lookback_minutes: 25
+    rejected: false
+    source: derived
+metadata:
+  registry_bar_minutes: 5
+  schema_version: 2
+  migration_note: Migrated from v1 on 2026-01-18, assuming 5m interval
+validation:
+  hard_rules:
+  - lag_bars >= 0
+  - allowed_horizons must be non-empty for usable features
+  warnings:
+  - lag_bars == 0 and source in ['price', 'derived']
+  - source == 'unknown'

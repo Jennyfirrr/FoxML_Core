@@ -1,0 +1,577 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later OR Commercial
+# Copyright (c) 2025-2026 Fox ML Infrastructure LLC
+
+"""
+SST (Single Source of Truth) Contract Module
+
+Centralized normalization and validation functions for:
+- Family name normalization
+- Target horizon resolution
+- Tracker input adaptation (string/Enum-safe)
+- Feature drop reason tracking
+
+This ensures consistency across all pipeline layers.
+"""
+
+import re
+import logging
+from typing import Optional, Dict, Any, Union, List
+from enum import Enum
+
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# Family Name Normalization
+# ============================================================================
+
+def normalize_family(family: Union[str, None]) -> str:
+    """
+    Canonicalize model family name to snake_case lowercase, with alias resolution.
+    
+    This is the SINGLE SOURCE OF TRUTH for family name normalization.
+    All registries (MODMAP, TRAINER_MODULE_MAP, runtime_policy, FAMILY_CAPS)
+    MUST use this function.
+    
+    Args:
+        family: Family name (can be any case/variant)
+    
+    Returns:
+        Normalized family name in snake_case lowercase with aliases resolved
+    
+    Examples:
+        "LightGBM" -> "lightgbm"
+        "XGBoost" -> "xgboost"
+        "x_g_boost" -> "xgboost"
+        "RandomForest" -> "random_forest"
+        "random_forest" -> "random_forest"
+        "mlp" -> "mlp"  (canonical - distinct from neural_network)
+        "nn" -> "neural_network"  (alias)
+    """
+    if not family or not isinstance(family, str):
+        return str(family).lower() if family else ""
+    
+    # Normalize input: strip, replace hyphens/spaces with underscores
+    family_clean = family.strip().replace("-", "_").replace(" ", "_")
+    
+    # Special cases for common variants (CRITICAL: handle before other normalization)
+    # Uses module-scope SPECIAL_CASES for SST (validated by validate_sst_contract)
+    family_lower = family_clean.lower()
+    if family_lower in SPECIAL_CASES:
+        result = SPECIAL_CASES[family_lower]
+        # Apply FAMILY_ALIASES as final step (single source of truth)
+        return FAMILY_ALIASES.get(result, result)
+    
+    # Handle specific brand names with embedded abbreviations
+    # These would otherwise be split incorrectly by CamelCase logic
+    if family_clean == "XGBoost":
+        return "xgboost"
+    if family_clean == "LightGBM":
+        return "lightgbm"
+    if family_clean == "NGBoost":
+        return "ngboost"
+    
+    # Handle all-caps abbreviations (MLP, LSTM, CNN, VAE, GAN, RNN)
+    # These should NOT be split letter-by-letter
+    if family_clean.isupper() and len(family_clean) <= 6:
+        result = family_clean.lower()
+        # Apply FAMILY_ALIASES as final step (single source of truth)
+        return FAMILY_ALIASES.get(result, result)
+    
+    # If already snake_case (has underscores), just lowercase
+    if "_" in family_clean:
+        result = family_clean.lower().replace("__", "_")
+        # Apply FAMILY_ALIASES as final step (single source of truth)
+        return FAMILY_ALIASES.get(result, result)
+    
+    # Convert TitleCase/CamelCase to snake_case
+    # Split on capital letters: "LightGBM" -> ["", "Light", "GBM"]
+    parts = re.split(r'(?=[A-Z])', family_clean)
+    parts = [p for p in parts if p]  # Remove empty strings
+    
+    if len(parts) == 1:
+        # Single word, just lowercase
+        result = parts[0].lower()
+        # Apply FAMILY_ALIASES as final step (single source of truth)
+        return FAMILY_ALIASES.get(result, result)
+    
+    # Join parts with underscores, all lowercase
+    result = "_".join(p.lower() for p in parts)
+    
+    # Clean up: remove double underscores
+    result = result.replace("__", "_")
+    
+    # Apply FAMILY_ALIASES as final step (single source of truth)
+    return FAMILY_ALIASES.get(result, result)
+
+
+# ============================================================================
+# Family Aliases (Single Source of Truth)
+# ============================================================================
+
+# Known aliases for family names
+# These map common variants to canonical names
+# NOTE: Only include TRUE synonyms here. Do NOT include canonical keys that exist in TRAINER_MODULE_MAP.
+# e.g., 'mlp' is a distinct trainer, not an alias for 'neural_network'
+FAMILY_ALIASES = {
+    'nn': 'neural_network',
+    'gbm': 'lightgbm',
+    # xgb, lgb, lgbm handled in SPECIAL_CASES below
+}
+
+# Special case mappings for normalize_family()
+# These handle common abbreviations and malformed variants
+# NOTE: Do NOT include canonical self-maps (e.g., 'xgboost': 'xgboost')
+# NOTE: Mis-normalized abbreviations (e.g., 'm_l_p') should go here to fix them
+SPECIAL_CASES = {
+    # Brand name fixes (if somehow mis-normalized before reaching here)
+    "light_g_b_m": "lightgbm",   # Fix malformed CamelCase split from "LightGBM"
+    "x_g_boost": "xgboost",      # Fix malformed CamelCase split
+    "n_g_boost": "ngboost",      # Fix malformed CamelCase split from "NGBoost"
+    "xgb": "xgboost",
+    "lgb": "lightgbm",
+    "lgbm": "lightgbm",
+    # Fix mis-normalized all-caps abbreviations (M-L-P → m_l_p → mlp)
+    "m_l_p": "mlp",
+    "l_s_t_m": "lstm",
+    "c_n_n": "cnn1d",
+    "c_n_n_1d": "cnn1d",
+    "v_a_e": "vae",
+    "g_a_n": "gan",
+    # Short aliases
+    "cnn": "cnn1d",
+}
+
+
+# ============================================================================
+# Feature Selectors (NOT Training Families)
+# ============================================================================
+
+# Families used ONLY for feature selection stage in this codebase.
+# These are NOT valid training families even though some (like catboost)
+# are trainers in general ML. In our pipeline, they're FS-only.
+FEATURE_SELECTORS = frozenset({
+    'random_forest',       # Used for FS importance, not trained
+    'catboost',            # Used for FS importance, not trained
+    'lasso',               # Used for FS coefficient selection
+    'mutual_information',  # Statistical FS method
+    'univariate_selection',  # Statistical FS method
+    'elastic_net',         # Used for FS coefficient selection
+    'ridge',               # Used for FS coefficient selection
+    'lasso_cv'             # Used for FS coefficient selection
+})
+
+
+# ============================================================================
+# SST Contract Validation
+# ============================================================================
+
+def validate_sst_contract(canonical_keys: set) -> list:
+    """
+    Validate FAMILY_ALIASES and SPECIAL_CASES against canonical keys.
+    
+    This function ensures alias mappings are consistent with the canonical
+    registry (e.g., TRAINER_MODULE_MAP). Called at startup by registry_validation.py.
+    
+    Checks:
+    1. No alias key may be a canonical key (strict - no exceptions)
+    2. Alias target must exist in canonical_keys
+    3. Literal key conflicts across sources (same key, different targets)
+    4. Normalization collisions across alias keys
+    5. No alias chains (target must not be an alias key)
+    6. No cycles
+    7. Keys and targets must be already normalized
+    
+    Args:
+        canonical_keys: Set of canonical family/trainer keys to validate against
+    
+    Returns:
+        List of error strings (empty if valid)
+    """
+    errors = []
+
+    def _base_normalize(s: str) -> str:
+        return s.strip().lower().replace("-", "_").replace(" ", "_")
+
+    sources = [
+        ("SPECIAL_CASES", SPECIAL_CASES),
+        ("FAMILY_ALIASES", FAMILY_ALIASES),
+    ]
+
+    # Flatten entries so nothing gets overwritten by ** merge
+    entries = []
+    for source, amap in sources:
+        for k, v in amap.items():
+            entries.append((source, k, v))
+
+    literal_seen = {}  # key -> (source, target)
+    norm_seen = {}     # normalized_key -> (source, original_key)
+
+    for source, k, v in entries:
+        nk = _base_normalize(k)
+        nv = _base_normalize(v)
+
+        # 1) Keys and targets must be already normalized
+        if k != nk:
+            errors.append(f"{source}: alias key '{k}' is not normalized (expected '{nk}')")
+        if v != nv:
+            errors.append(f"{source}: alias target '{v}' is not normalized (expected '{nv}')")
+
+        # 2) Alias key must NOT be a canonical key (strict - no exceptions)
+        if k in canonical_keys:
+            errors.append(f"{source}: alias '{k}' shadows canonical key '{k}'")
+
+        # 3) Alias target must exist in canonical_keys
+        if v not in canonical_keys:
+            errors.append(f"{source}: alias '{k}' -> '{v}' targets missing canonical key '{v}'")
+
+        # 4) Literal conflicts across sources (same key, different targets)
+        if k in literal_seen and literal_seen[k][1] != v:
+            prev_source, prev_v = literal_seen[k]
+            errors.append(
+                f"Alias key '{k}' defined twice with different targets: "
+                f"{prev_source} -> '{prev_v}' vs {source} -> '{v}'"
+            )
+        else:
+            literal_seen.setdefault(k, (source, v))
+
+        # 5) Normalization collisions across alias keys
+        if nk in norm_seen and norm_seen[nk][1] != k:
+            prev_source, prev_k = norm_seen[nk]
+            errors.append(
+                f"Normalization collision: '{k}' ({source}) and '{prev_k}' ({prev_source}) "
+                f"both normalize to '{nk}'"
+            )
+        else:
+            norm_seen.setdefault(nk, (source, k))
+
+    # Build combined mapping for chain/cycle detection (safe now - conflicts already detected)
+    combined = {k: v for _, k, v in entries}
+
+    # 6) Chain detection: if target is also an alias key, that's a chain
+    for k, v in combined.items():
+        if v in combined:
+            errors.append(f"Alias chain: '{k}' -> '{v}' but '{v}' is also an alias key")
+
+    # 7) Cycle detection (defensive) with path tracking
+    def walk(start: str) -> None:
+        path = []
+        cur = start
+        while cur in combined:
+            if cur in path:
+                cycle_str = " -> ".join(path + [cur])
+                errors.append(f"Alias cycle detected: {cycle_str}")
+                return
+            path.append(cur)
+            cur = combined[cur]
+
+    for _, k, _ in entries:
+        walk(k)
+
+    return errors
+
+
+def is_trainer_family(name: str) -> bool:
+    """
+    Check if family is a trainer (not a feature selector in this codebase).
+    
+    Args:
+        name: Family name (any case/variant)
+    
+    Returns:
+        True if this is a training family, False if it's a feature selector
+    
+    Examples:
+        is_trainer_family("lightgbm") -> True
+        is_trainer_family("mutual_information") -> False
+        is_trainer_family("random_forest") -> False (FS-only in our pipeline)
+    """
+    if not name:
+        return False
+    normalized = normalize_family(name)
+    # Apply alias
+    normalized = FAMILY_ALIASES.get(normalized, normalized)
+    return normalized not in FEATURE_SELECTORS
+
+
+def filter_trainers(families: List[str]) -> List[str]:
+    """
+    Filter and normalize to only trainer families.
+    
+    This is the SINGLE SOURCE OF TRUTH for filtering training families.
+    
+    - Preserves first-occurrence order
+    - Deduplicates (keeps first occurrence)
+    - Normalizes aliases (nn -> neural_network, xgb -> xgboost, etc.)
+    - Filters out feature selectors
+    - Skips empty/whitespace-only strings
+    
+    Args:
+        families: List of family names (may contain duplicates, aliases, whitespace)
+    
+    Returns:
+        Deduplicated, normalized list of trainer families in stable order
+    
+    Examples:
+        filter_trainers(['a', 'A', ' b ', 'a']) -> ['a', 'b']
+        filter_trainers(['lightgbm', 'mutual_information', 'xgboost']) -> ['lightgbm', 'xgboost']
+        filter_trainers(['mlp', 'MLP']) -> ['mlp']  # mlp is canonical, not an alias
+        filter_trainers(['nn', 'NN']) -> ['neural_network']  # nn is an alias
+    """
+    if not families:
+        return []
+    
+    seen = set()
+    result = []
+    for f in families:
+        if not f or not isinstance(f, str):
+            continue
+        # Normalize
+        normalized = normalize_family(f)
+        if not normalized:
+            continue  # Whitespace-only input
+        # Apply alias
+        normalized = FAMILY_ALIASES.get(normalized, normalized)
+        if not normalized:
+            continue
+        # Filter feature selectors
+        if normalized in FEATURE_SELECTORS:
+            continue
+        # Dedupe
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result
+
+
+# ============================================================================
+# Target Horizon Resolution
+# ============================================================================
+
+def resolve_target_horizon_minutes(target: str, config: Optional[Dict[str, Any]] = None) -> Optional[int]:
+    """
+    Resolve target horizon in minutes from target name.
+    
+    This is the SINGLE SOURCE OF TRUTH for horizon extraction.
+    Handles special cases like *_same_day, *_5d, etc.
+    
+    Args:
+        target: Target column name (e.g., 'fwd_ret_oc_same_day', 'fwd_ret_5d', 'y_will_peak_60m_0.8')
+        config: Optional config dict with horizon_extraction patterns
+    
+    Returns:
+        Horizon in minutes, or None if cannot be determined (should NOT default silently)
+    
+    Special Cases:
+        - *_same_day: Returns 390 minutes (6.5 hours = trading session)
+        - *_oc_same_day: Returns 390 minutes (open-to-close same day)
+        - fwd_ret_5d: Returns 5 * 1440 = 7200 minutes
+        - fwd_ret_1d: Returns 1440 minutes
+    """
+    if not target or not isinstance(target, str):
+        return None
+    
+    target_lower = target.lower()
+    
+    # Special cases for same-day targets
+    if "same_day" in target_lower or "oc_same_day" in target_lower:
+        # Same-day open-to-close: ~6.5 hours = 390 minutes
+        return 390
+    
+    # Load config if not provided
+    if config is None:
+        try:
+            from TRAINING.ranking.utils.leakage_filtering import _load_leakage_config
+            config = _load_leakage_config()
+        except Exception:
+            pass
+    
+    # Default patterns (from excluded_features.yaml structure)
+    # CRITICAL FIX: Use trading days calendar for day-based horizons
+    # Trading session = 6.5 hours = 390 minutes (9:30 AM - 4:00 PM ET)
+    # This matches the calendar used by target labels (trading days, not calendar days)
+    patterns = [
+        {'regex': r'(\d+)m', 'multiplier': 1},      # 60m -> 60
+        {'regex': r'(\d+)h', 'multiplier': 60},     # 2h -> 120
+        {'regex': r'(\d+)d', 'multiplier': 390},   # 1d -> 390 (trading session), 5d -> 1950 (5 trading sessions)
+    ]
+    
+    # FIX 3: Only check config if it's a dict (ExperimentConfig objects don't have horizon_extraction anyway)
+    # Explicit check to avoid TypeError when config is an ExperimentConfig object
+    if config is not None and isinstance(config, dict):
+        if 'horizon_extraction' in config:
+            patterns = config['horizon_extraction'].get('patterns', patterns)
+    
+    for pattern_config in patterns:
+        regex = pattern_config.get('regex')
+        multiplier = pattern_config.get('multiplier', 1)
+        
+        if regex:
+            match = re.search(regex, target, re.IGNORECASE)
+            if match:
+                value = int(match.group(1))
+                return value * multiplier
+    
+    # No match found - return None (do NOT default silently)
+    return None
+
+
+# ============================================================================
+# Tracker Input Adapter (String/Enum-Safe)
+# ============================================================================
+
+def tracker_input_adapter(value: Any, field_name: str = "value") -> str:
+    """
+    Adapt value for tracker input (handles both strings and Enum-like objects).
+    
+    This prevents 'str' object has no attribute 'name' errors.
+    
+    Args:
+        value: Value to adapt (can be str, Enum, or object with .name/.value attribute)
+        field_name: Name of field (for error messages)
+    
+    Returns:
+        String representation of value
+    
+    Examples:
+        "CROSS_SECTIONAL" -> "CROSS_SECTIONAL"
+        Enum.CROSS_SECTIONAL -> "CROSS_SECTIONAL" (if has .name)
+        TaskSpec(...) -> "regression" (if has .task attribute)
+    """
+    if value is None:
+        return None
+    
+    # If already a string, return as-is
+    if isinstance(value, str):
+        return value
+    
+    # Try .name attribute (for Enums)
+    if hasattr(value, 'name'):
+        try:
+            return str(value.name)
+        except Exception:
+            pass
+    
+    # Try .value attribute (for Enums with values)
+    if hasattr(value, 'value'):
+        try:
+            return str(value.value)
+        except Exception:
+            pass
+    
+    # Try common attribute names (task, objective, etc.)
+    for attr in ['task', 'objective', 'stage', 'view', 'family']:
+        if hasattr(value, attr):
+            try:
+                attr_value = getattr(value, attr)
+                # Recursively adapt if it's not a string
+                if isinstance(attr_value, str):
+                    return attr_value
+                return tracker_input_adapter(attr_value, attr)
+            except Exception:
+                pass
+    
+    # Fallback: convert to string
+    return str(value)
+
+
+# ============================================================================
+# Feature Drop Reason Tracking
+# ============================================================================
+
+class FeatureDropReason:
+    """Reason codes for feature drops"""
+    MISSING_FROM_POLARS = "missing_from_polars"
+    DROPPED_BY_DTYPE = "dropped_by_dtype"
+    DROPPED_BY_NAN = "dropped_by_nan"
+    DROPPED_BY_REGISTRY = "dropped_by_registry"
+    DROPPED_BY_LOOKBACK = "dropped_by_lookback"
+    DROPPED_BY_TARGET_CONDITIONAL = "dropped_by_target_conditional"
+    UNKNOWN = "unknown"
+
+
+def track_feature_drops(
+    requested: List[str],
+    allowed: List[str],
+    kept: List[str],
+    used: List[str],
+    drop_reasons: Optional[Dict[str, str]] = None
+) -> Dict[str, Any]:
+    """
+    Track feature drops through the pipeline.
+    
+    Args:
+        requested: Features requested (from feature selection)
+        allowed: Features allowed by registry/filtering
+        kept: Features kept after dtype/nan filtering
+        used: Features actually used in training
+        drop_reasons: Optional dict mapping feature -> reason code
+    
+    Returns:
+        Dict with drop statistics and lists
+    """
+    requested_set = set(requested) if requested else set()
+    allowed_set = set(allowed) if allowed else set()
+    kept_set = set(kept) if kept else set()
+    used_set = set(used) if used else set()
+    
+    stats = {
+        "requested": len(requested_set),
+        "allowed": len(allowed_set),
+        "kept": len(kept_set),
+        "used": len(used_set),
+        "dropped_by_registry": list(requested_set - allowed_set),
+        "dropped_by_dtype_nan": list(allowed_set - kept_set),
+        "dropped_after_kept": list(kept_set - used_set),
+        "drop_reasons": drop_reasons or {}
+    }
+    
+    # Calculate ratios
+    if stats["requested"] > 0:
+        stats["allowed_ratio"] = stats["allowed"] / stats["requested"]
+        stats["kept_ratio"] = stats["kept"] / stats["requested"]
+        stats["used_ratio"] = stats["used"] / stats["requested"]
+    else:
+        stats["allowed_ratio"] = 0.0
+        stats["kept_ratio"] = 0.0
+        stats["used_ratio"] = 0.0
+    
+    return stats
+
+
+def validate_feature_drops(stats: Dict[str, Any], threshold: float = 0.5, target: str = "unknown") -> bool:
+    """
+    Validate that feature drops are within acceptable threshold.
+    
+    Args:
+        stats: Stats from track_feature_drops
+        threshold: Minimum ratio of used/requested (default: 0.5 = 50%)
+        target: Target name (for error messages)
+    
+    Returns:
+        True if valid, False if excessive drops
+    
+    Raises:
+        ValueError: If drops exceed threshold and strict mode
+    """
+    if stats["requested"] == 0:
+        logger.warning(f"[{target}] No features requested - cannot validate drops")
+        return False
+    
+    used_ratio = stats["used_ratio"]
+    
+    if used_ratio < threshold:
+        error_msg = (
+            f"🚨 CRITICAL [{target}]: Excessive feature drops detected. "
+            f"Requested={stats['requested']}, Used={stats['used']} "
+            f"(ratio={used_ratio:.1%} < threshold={threshold:.1%}). "
+            f"Dropped by registry: {len(stats['dropped_by_registry'])}, "
+            f"Dropped by dtype/nan: {len(stats['dropped_by_dtype_nan'])}, "
+            f"Dropped after kept: {len(stats['dropped_after_kept'])}. "
+            f"This indicates a pipeline bug."
+        )
+        logger.error(error_msg)
+        raise ValueError(error_msg)
+    
+    return True
+

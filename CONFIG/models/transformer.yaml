@@ -1,0 +1,52 @@
+# Transformer Model Configuration
+# Time-series transformer with self-attention mechanism
+
+model_family: "Transformer"
+description: "Transformer model for sequential data"
+
+hyperparameters:
+  # Training
+  epochs: 50
+  batch_size: 512
+  # patience: auto-injected from defaults (10)
+  learning_rate: 0.001
+
+  # Dynamic batch size reduction for long sequences
+  # NOTE: These thresholds are in BAR COUNT (not time). Memory usage scales with:
+  #   O(batch_size * heads * seq_len^2) due to attention matrix
+  # At different intervals, the same bar count represents different time periods:
+  #   - 1m: 200 bars = 200 min (3.3 hours)
+  #   - 5m: 200 bars = 1000 min (16.7 hours)
+  #   - 15m: 200 bars = 3000 min (50 hours)
+  # This is quadratic, so transformers are more sensitive to sequence length.
+  max_seq_for_full_batch: 200  # Reduce batch size if sequence > this (bars)
+  
+  # Architecture
+  d_model: 128  # Model dimension
+  heads: 8  # Number of attention heads
+  ff_dim: 256  # Feed-forward dimension
+  dropout: 0.1
+  
+  # Sequence
+  sequence_length: null  # Auto-detected from input
+
+# Variants
+variants:
+  small:
+    d_model: 64
+    heads: 4
+    ff_dim: 128
+    dropout: 0.1
+    
+  medium:
+    d_model: 128
+    heads: 8
+    ff_dim: 256
+    dropout: 0.1
+    
+  large:
+    d_model: 256
+    heads: 16
+    ff_dim: 512
+    dropout: 0.2
+

@@ -1,0 +1,26 @@
+# Registry Patch Operations Configuration
+# 
+# This config drives explicit ops stage operations (promotion, unblocking, query).
+# NEVER runs during normal pipeline execution - only in REGISTRY_PATCH_OPS stage.
+
+promotion:
+  enabled: false  # Set to true to enable promotion ops
+  output_dirs: []  # List of output directories to scan for patches (relative to repo root)
+  targets: null  # Optional: specific targets to promote (null = all targets)
+  review_mode: false  # If true, log what would be promoted but don't write files
+
+unblocking:
+  enabled: false  # Set to true to enable unblock ops
+  unblocks: []  # List of unblock specs:
+    # - target: "fwd_ret_5m"
+    #   bar_minutes: 5  # Optional: compatibility metadata
+    #   features:
+    #     feature_name:
+    #       - 1  # horizon_bars to unblock
+    #       - 3
+    #   reason: "Manual unblock after investigation"
+
+query:
+  enabled: false  # Set to true to enable query/explanation ops
+  targets: []  # List of targets to query
+  features: []  # Optional: specific features to explain (empty = all excluded features)

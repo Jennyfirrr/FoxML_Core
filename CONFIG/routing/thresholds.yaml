@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later OR Commercial
+# Copyright (c) 2025-2026 Fox ML Infrastructure LLC
+
+# Routing Thresholds Configuration
+# ================================
+# Centralized thresholds for target routing decisions.
+# These thresholds determine which view (CROSS_SECTIONAL, SYMBOL_SPECIFIC, BOTH, BLOCKED)
+# each target should use based on dual-view evaluation results.
+
+routing:
+  thresholds:
+    # Cross-sectional skill01 threshold
+    # Targets with skill01 >= this value AND good symbol coverage route to CROSS_SECTIONAL
+    # skill01 is normalized [0,1]: for regression IC, for classification AUC-excess
+    cs_skill01: 0.65
+    auc_threshold: 0.65  # Legacy alias for cs_skill01
+
+    # Symbol-specific skill01 threshold
+    # Symbols with skill01 >= this value are considered "good performers"
+    symbol_skill01: 0.60
+    symbol_auc_threshold: 0.60  # Legacy alias for symbol_skill01
+
+    # Fraction of symbols that must have skill01 >= symbol_skill01 for good coverage
+    # Used to determine if CS performance is broadly distributed or concentrated
+    frac_symbols_good: 0.5
+
+    # Suspicious score thresholds (potential leakage detection)
+    # Scores above these values trigger additional validation (tstat > 3.0 check)
+    suspicious_cs_skill01: 0.90
+    suspicious_auc: 0.90  # Legacy alias
+    suspicious_symbol_skill01: 0.95
+    suspicious_symbol_auc: 0.95  # Legacy alias
+
+    # IQR threshold for detecting concentrated performance
+    # If IQR > this value, performance is considered concentrated -> BOTH route
+    concentrated_iqr: 0.15
+
+    # Minimum tstat for legitimate high scores
+    # High skill01 + tstat > this = legitimate signal, not blocked
+    min_stable_tstat: 3.0
+
+  # Dev mode settings
+  # When enabled, thresholds are relaxed for testing with small datasets
+  dev_mode:
+    enabled: false
+    # Relaxation amounts (applied as offsets from production thresholds)
+    cs_relaxation: 0.25      # T_cs = max(0.40, T_cs - 0.25)
+    symbol_relaxation: 0.25  # T_sym = max(0.35, T_sym - 0.25)
+    frac_relaxation: 0.3     # T_frac = max(0.2, T_frac - 0.3)
+    suspicious_cs_raise: 0.05   # min(0.98, T_suspicious_cs + 0.05)
+    suspicious_sym_raise: 0.03  # min(0.98, T_suspicious_sym + 0.03)
+
+# Routing decision rules:
+# =======================
+# 1. BLOCKED (highest priority):
+#    - skill01 >= suspicious_cs_skill01 AND tstat < min_stable_tstat
+#    - OR max_symbol_skill01 >= suspicious_symbol_skill01 AND tstat < min_stable_tstat
+#    - OR CS failed AND no symbol >= symbol_skill01
+#
+# 2. CROSS_SECTIONAL:
+#    - skill01 >= cs_skill01 AND frac_symbols_good >= frac_symbols_good threshold
+#
+# 3. SYMBOL_SPECIFIC:
+#    - skill01 < cs_skill01 AND exists symbol with skill01 >= symbol_skill01
+#
+# 4. BOTH:
+#    - skill01 >= cs_skill01 BUT concentrated performance
+#    - (IQR > concentrated_iqr OR frac_symbols_good < threshold)
+#
+# 5. Default: CROSS_SECTIONAL (fallback)

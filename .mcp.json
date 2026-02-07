@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "foxml-config": {
+      "command": "python",
+      "args": ["-m", "foxml_config.server"],
+      "cwd": "/home/Jennifer/trader/MCP_SERVERS"
+    },
+    "foxml-sst": {
+      "command": "python",
+      "args": ["-m", "foxml_sst.server"],
+      "cwd": "/home/Jennifer/trader/MCP_SERVERS"
+    },
+    "foxml-artifact": {
+      "command": "python",
+      "args": ["-m", "foxml_artifact.server"],
+      "cwd": "/home/Jennifer/trader/MCP_SERVERS"
+    },
+    "foxml-live-dev": {
+      "command": "python",
+      "args": ["-m", "foxml_live_dev.server"],
+      "cwd": "/home/Jennifer/trader/MCP_SERVERS"
+    }
+  }
+}

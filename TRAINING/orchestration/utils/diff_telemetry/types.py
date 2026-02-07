@@ -1,0 +1,632 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later OR Commercial
+# Copyright (c) 2025-2026 Fox ML Infrastructure LLC
+
+"""
+Diff Telemetry Types
+
+Data classes and enums for diff telemetry system.
+"""
+
+from dataclasses import dataclass, field, asdict
+from enum import Enum
+from typing import Dict, Any, Optional, List, Tuple
+import logging
+import hashlib
+
+logger = logging.getLogger(__name__)
+
+# =============================================================================
+# COMPARISON GROUP VALIDATION CONSTANTS
+# =============================================================================
+
+# Base required fields (always required)
+REQUIRED_FIELDS_BY_STAGE_BASE = {
+    "TARGET_RANKING": [
+        "dataset_signature",
+        "task_signature", 
+        "routing_signature",
+        "n_effective",
+        "split_signature",  # CRITICAL: CV split identity
+        "feature_signature",  # CRITICAL: Different features = different results
+    ],
+    "FEATURE_SELECTION": [
+        "dataset_signature",
+        "task_signature",
+        "routing_signature", 
+        "n_effective",
+        "split_signature",  # CRITICAL: CV split identity
+        "feature_signature",
+        "hyperparameters_signature",
+        "train_seed",
+    ],
+    "TRAINING": [
+        "dataset_signature",
+        "task_signature",
+        "routing_signature",
+        "n_effective",
+        "split_signature",  # CRITICAL: CV split identity
+        "model_family",
+        "feature_signature",
+        "hyperparameters_signature",
+        "train_seed",
+    ],
+}
+
+# Additional fields required only in strict mode
+REQUIRED_FIELDS_BY_STAGE_STRICT_EXTRA = {
+    "TARGET_RANKING": [],
+    "FEATURE_SELECTION": ["library_versions_signature"],
+    "TRAINING": ["library_versions_signature"],
+}
+
+# Schema version for ComparisonGroup structure
+# Increment if structure changes to prevent key collisions
+COMPARISON_GROUP_SCHEMA_VERSION = 1
+
+
+class ChangeSeverity(str, Enum):
+    """Severity levels for changes."""
+    CRITICAL = "critical"  # Hard invariants (splits, targets, leakage)
+    MAJOR = "major"  # Important but not breaking (hyperparams, versions)
+    MINOR = "minor"  # Soft changes (metrics, minor config)
+    NONE = "none"  # No meaningful change
+
+
+class ComparabilityStatus(str, Enum):
+    """Comparability status for runs."""
+    COMPARABLE = "comparable"  # Same comparison group, can diff
+    INCOMPARABLE = "incomparable"  # Different groups, don't diff
+    PARTIAL = "partial"  # Some overlap, diff with warnings
+
+
+@dataclass
+class ResolvedRunContext:
+    """Resolved run context (SST) - all outcome-influencing metadata resolved at source.
+    
+    This ensures snapshots have non-null values for all required fields, preventing
+    false comparability from None values and ensuring auditability.
+    """
+    # Data provenance (required for all stages)
+    n_symbols: Optional[int] = None
+    symbols: Optional[List[str]] = None
+    date_start: Optional[str] = None  # ISO format
+    date_end: Optional[str] = None  # ISO format
+    n_rows_total: Optional[int] = None
+    n_effective: Optional[int] = None
+    data_fingerprint: Optional[str] = None
+    data_dir: Optional[str] = None  # Data directory path for run recreation
+    
+    # Task provenance (required for all stages)
+    target: Optional[str] = None
+    labeling_impl_hash: Optional[str] = None
+    horizon_minutes: Optional[int] = None
+    objective: Optional[str] = None
+    target_fingerprint: Optional[str] = None
+    
+    # Split provenance (required for all stages)
+    cv_method: Optional[str] = None
+    folds: Optional[int] = None
+    purge_minutes: Optional[float] = None
+    embargo_minutes: Optional[Any] = None  # Can be dict with kind/reason
+    leakage_filter_version: Optional[str] = None
+    split_seed: Optional[int] = None
+    fold_assignment_hash: Optional[str] = None
+    split_protocol_fingerprint: Optional[str] = None
+    
+    # Feature provenance (required for FEATURE_SELECTION and TRAINING)
+    feature_names: Optional[List[str]] = None
+    feature_set_id: Optional[str] = None
+    feature_pipeline_signature: Optional[str] = None
+    n_features: Optional[int] = None
+    feature_fingerprint: Optional[str] = None
+    
+    # Stage strategy (stage-specific)
+    ranking_strategy: Optional[str] = None  # For TARGET_RANKING
+    feature_selection_strategy: Optional[str] = None  # For FEATURE_SELECTION
+    trainer_strategy: Optional[str] = None  # For TRAINING
+    model_family: Optional[str] = None  # For TRAINING (required)
+    model_families: Optional[List[str]] = None  # For TARGET_RANKING/FEATURE_SELECTION (list of families used)
+    hyperparameters: Optional[Dict[str, Any]] = None  # Hyperparameters dict for run recreation
+    feature_selection: Optional[Dict[str, Any]] = None  # Feature selection parameters (selection_mode, selection_params, aggregation)
+    
+    # Config provenance
+    min_cs: Optional[int] = None
+    max_cs_samples: Optional[int] = None
+    
+    # Environment (tracked but not outcome-influencing)
+    python_version: Optional[str] = None
+    library_versions: Optional[Dict[str, str]] = None
+    cuda_version: Optional[str] = None
+    
+    # Experiment tracking
+    experiment_id: Optional[str] = None
+    
+    # View/routing
+    view: Optional[str] = None
+    routing_signature: Optional[str] = None
+
+
+@dataclass
+class ComparisonGroup:
+    """Defines what makes runs comparable.
+    
+    CRITICAL: Only runs with EXACTLY the same outcome-influencing metadata are comparable.
+    This includes:
+    - Exact n_effective (sample size) - 5k runs only compare against 5k runs
+    - Same dataset (universe, date range, min_cs, max_cs_samples)
+    - Same task (target, horizon, objective)
+    - Same routing/view configuration
+    - Same split configuration (CV method, folds, purge/embargo)
+    - Same model_family (different families produce different outcomes)
+    - Same feature set (different features produce different outcomes)
+    - Same hyperparameters (learning_rate, max_depth, etc. - CRITICAL: impact outcomes)
+    - Same train_seed (CRITICAL: different seeds = different outcomes)
+    - Same library versions (CRITICAL: different versions = different outcomes)
+    - Same universe_sig (for CS: different symbol sets = different outcomes)
+    - Same symbol (for SS: AAPL only compares to AAPL, not AVGO)
+    
+    Runs are stored together ONLY if they match exactly on all these dimensions.
+    """
+    experiment_id: Optional[str] = None
+    dataset_signature: Optional[str] = None  # Hash of universe + time rules + min_cs + max_cs_samples
+    task_signature: Optional[str] = None  # Hash of target + horizon + objective
+    routing_signature: Optional[str] = None  # Hash of routing config
+    split_signature: Optional[str] = None  # Hash of CV/split configuration (CRITICAL: different splits = different outcomes)
+    n_effective: Optional[int] = None  # Exact sample size (CRITICAL: must match exactly)
+    model_family: Optional[str] = None  # Model family (CRITICAL: different families = different outcomes)
+    feature_signature: Optional[str] = None  # Hash of feature set (CRITICAL: different features = different outcomes)
+    hyperparameters_signature: Optional[str] = None  # Hash of hyperparameters (CRITICAL: different HPs = different outcomes)
+    train_seed: Optional[int] = None  # Training seed (CRITICAL: different seeds = different outcomes)
+    library_versions_signature: Optional[str] = None  # Hash of library versions (CRITICAL: different versions = different outcomes)
+    universe_sig: Optional[str] = None  # Universe signature (CRITICAL: different symbol sets = different outcomes for CS)
+    symbol: Optional[str] = None  # Symbol ticker (CRITICAL: for SS, AAPL only compares to AAPL, not AVGO)
+    
+    def validate(self, stage: str, strict: bool = False) -> Tuple[bool, Optional[List[str]]]:
+        """Validate comparison group has all required fields for stage.
+        
+        CRITICAL: Unknown stages are treated as invalid (no silent bypass).
+        
+        Args:
+            stage: Stage name (TARGET_RANKING, FEATURE_SELECTION, TRAINING)
+            strict: If True, raise on invalid; if False, return (False, missing_fields)
+        
+        Returns:
+            (is_valid, missing_fields) - missing_fields is None if valid
+        """
+        # CRITICAL: Unknown stage is invalid (no silent bypass)
+        if stage not in REQUIRED_FIELDS_BY_STAGE_BASE:
+            if strict:
+                raise ValueError(
+                    f"Unknown stage '{stage}' - cannot validate ComparisonGroup. "
+                    f"Known stages: {list(REQUIRED_FIELDS_BY_STAGE_BASE.keys())}"
+                )
+            return False, [f"<unknown_stage:{stage}>"]
+        
+        # Get base required fields
+        required = list(REQUIRED_FIELDS_BY_STAGE_BASE.get(stage, []))
+        
+        # Add strict-only fields if in strict mode
+        if strict:
+            strict_extra = REQUIRED_FIELDS_BY_STAGE_STRICT_EXTRA.get(stage, [])
+            required.extend(strict_extra)
+        
+        missing = []
+        
+        for field_name in required:
+            value = getattr(self, field_name, None)
+            # CRITICAL: Use explicit checks, never truthy filtering
+            if value is None or (isinstance(value, str) and value == ""):
+                missing.append(field_name)
+        
+        if missing:
+            if strict:
+                raise ValueError(
+                    f"ComparisonGroup missing required fields for {stage}: {missing}. "
+                    f"Cannot generate valid comparison key."
+                )
+            return False, missing
+        return True, None
+    
+    def to_key(self, stage: str, strict: bool = False) -> Optional[str]:
+        """Generate comparison group key.
+        
+        CRITICAL: Returns None if group is invalid (non-strict) or raises (strict).
+        Never returns "default" or partial keys.
+        
+        CRITICAL: Stage is REQUIRED (no None allowed) to prevent invalid keys.
+        
+        Args:
+            stage: Stage name for validation (TARGET_RANKING, FEATURE_SELECTION, TRAINING) - REQUIRED
+            strict: If True, raise on invalid; if False, return None + log warning
+        
+        Returns:
+            Comparison key string, or None if invalid (non-strict mode)
+        """
+        # CRITICAL: Stage is required
+        if stage is None:
+            raise ValueError("Stage is required for to_key() - cannot generate key without stage")
+        
+        # Validate (will raise in strict mode if invalid)
+        try:
+            is_valid, missing = self.validate(stage, strict=strict)
+            if not is_valid:
+                if strict:
+                    raise  # Already raised in validate()
+                # Non-strict: log and return None
+                logger.warning(
+                    f"ComparisonGroup invalid for {stage}: missing {missing}. "
+                    f"Returning None key (not comparable)."
+                )
+                return None
+        except ValueError:
+            if strict:
+                raise
+            return None
+        
+        # CRITICAL: Include schema version to prevent collisions from structure changes
+        parts = [f"schema={COMPARISON_GROUP_SCHEMA_VERSION}"]
+        
+        # CRITICAL: Include stage in key to prevent cross-stage collisions
+        parts.append(f"stage={stage}")
+        
+        # Serialize ALL fields explicitly (NO truthy filtering - use explicit None/empty checks)
+        # Use deterministic field order (alphabetical by field name for canonical ordering)
+        
+        # Helper to escape pipe delimiters in free-text fields
+        def escape_value(v: str) -> str:
+            if v is None:
+                return "<NONE>"
+            # Replace pipe with escaped form
+            return str(v).replace("|", "\\|")
+        
+        # Optional: experiment_id
+        exp_val = escape_value(self.experiment_id) if self.experiment_id is not None else "<NONE>"
+        parts.append(f"exp={exp_val}")
+        
+        # Required: dataset_signature (use full signature, not truncated)
+        data_val = self.dataset_signature if self.dataset_signature is not None else "<NONE>"
+        parts.append(f"data={data_val}")
+        
+        # Required: task_signature (use full signature)
+        task_val = self.task_signature if self.task_signature is not None else "<NONE>"
+        parts.append(f"task={task_val}")
+        
+        # Required: routing_signature (use full signature)
+        route_val = self.routing_signature if self.routing_signature is not None else "<NONE>"
+        parts.append(f"route={route_val}")
+        
+        # Required: split_signature (use full signature)
+        split_val = self.split_signature if self.split_signature is not None else "<NONE>"
+        parts.append(f"split={split_val}")
+        
+        # Required: n_effective
+        n_val = self.n_effective if self.n_effective is not None else "<NONE>"
+        parts.append(f"n={n_val}")
+        
+        # Optional: model_family (required for TRAINING)
+        family_val = escape_value(self.model_family) if self.model_family is not None else "<NONE>"
+        parts.append(f"family={family_val}")
+        
+        # Optional: feature_signature (required for FEATURE_SELECTION, TRAINING) - use full signature
+        features_val = self.feature_signature if self.feature_signature is not None else "<NONE>"
+        parts.append(f"features={features_val}")
+        
+        # Optional: hyperparameters_signature (required for FEATURE_SELECTION, TRAINING) - use full signature
+        hps_val = self.hyperparameters_signature if self.hyperparameters_signature is not None else "<NONE>"
+        parts.append(f"hps={hps_val}")
+        
+        # Required: train_seed (for FEATURE_SELECTION, TRAINING)
+        seed_val = self.train_seed if self.train_seed is not None else "<NONE>"
+        parts.append(f"seed={seed_val}")
+        
+        # Optional: library_versions_signature (required in strict mode) - use full signature
+        libs_val = self.library_versions_signature if self.library_versions_signature is not None else "<NONE>"
+        parts.append(f"libs={libs_val}")
+        
+        # Optional: universe_sig (use full signature)
+        universe_val = self.universe_sig if self.universe_sig is not None else "<NONE>"
+        parts.append(f"universe={universe_val}")
+        
+        # Optional: symbol
+        symbol_val = escape_value(self.symbol) if self.symbol is not None else "<NONE>"
+        parts.append(f"symbol={symbol_val}")
+        
+        # CRITICAL: Never return "default" - return joined parts (or None if validation failed)
+        return "|".join(parts)
+    
+    def to_dir_name(self, stage: str = "TRAINING") -> str:
+        """Generate compact, filesystem-safe directory name from comparison group.
+        
+        New format: cg-{cg_hash}_u-{universe_sig[:8]}_c-{config_sig[:8]}
+        
+        Where:
+        - cg_hash = sha256("u="+universe_sig+";c="+config_sig)[:12] (derived from u+c, prevents drift)
+        - universe_sig = Universe signature (separate from config)
+        - config_sig = Config signature (computed via compute_config_signature())
+        
+        NOTE: n_effective is NOT in directory name (moved to run leaf metadata).
+        This allows runs with different sample sizes but same config to be grouped together.
+        
+        NOTE: This method does NOT validate required fields. It generates a directory
+        name from whatever fields are available. This is intentional because:
+        - At startup, not all fields are known yet (split_signature, task_signature, etc.)
+        - Validation should only happen when comparing runs, not when creating directories
+        
+        Args:
+            stage: Stage name (included in config signature for uniqueness)
+        """
+        from TRAINING.common.utils.config_hashing import sha256_short
+        
+        # Compute config signature (includes all behavior-changing knobs except universe)
+        config_sig = compute_config_signature(
+            dataset_signature=self.dataset_signature,
+            task_signature=self.task_signature,
+            routing_signature=self.routing_signature,
+            split_signature=self.split_signature,
+            feature_signature=self.feature_signature,  # CRITICAL: Different features = different outcomes
+            hyperparameters_signature=self.hyperparameters_signature,
+            registry_overlay_signature=getattr(self, 'registry_overlay_signature', None),
+            leakage_filter_version=getattr(self, 'leakage_filter_version', None),
+            model_family=self.model_family,
+        )
+        
+        # Universe signature (separate from config)
+        universe_sig = self.universe_sig or ""
+        
+        # If no signatures available, use fallback
+        if not config_sig and not universe_sig:
+            return "cg-unknown"
+        
+        # Derive cg_hash from u+c (explicit definition, prevents drift)
+        # Format: "u={universe_sig};c={config_sig}"
+        cg_key = f"u={universe_sig};c={config_sig}"
+        cg_hash = sha256_short(cg_key, 12)  # 12 chars for uniqueness
+        
+        # Build directory name: cg-{cg_hash}_u-{universe_sig[:8]}_c-{config_sig[:8]}
+        # Include short prefixes for human readability
+        universe_prefix = universe_sig[:8] if universe_sig else "none"
+        config_prefix = config_sig[:8] if config_sig else "none"
+        
+        dir_name = f"cg-{cg_hash}_u-{universe_prefix}_c-{config_prefix}"
+        
+        # Sanitize for filesystem safety
+        import re
+        dir_name = re.sub(r'[^a-zA-Z0-9_-]', '', dir_name)
+        
+        # Limit length (shouldn't be needed, but safety check)
+        if len(dir_name) > 200:
+            dir_name = f"cg-{cg_hash}"
+        
+        return dir_name if dir_name else "cg-unknown"
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return asdict(self)
+
+
+def compute_config_signature(
+    dataset_signature: Optional[str] = None,
+    task_signature: Optional[str] = None,
+    routing_signature: Optional[str] = None,
+    split_signature: Optional[str] = None,
+    feature_signature: Optional[str] = None,  # CRITICAL: Different features = different outcomes
+    hyperparameters_signature: Optional[str] = None,
+    registry_overlay_signature: Optional[str] = None,
+    leakage_filter_version: Optional[str] = None,
+    model_family: Optional[str] = None,  # Included via hyperparameters_signature, but explicit for clarity
+) -> str:
+    """
+    Compute canonical config signature from behavior-changing knobs.
+    
+    Canonical definition: hash of everything that changes behavior except universe membership.
+    Universe has its own signature (separate).
+    
+    Includes:
+    - dataset_signature: Dataset identity (symbols, date range, row-shaping filters)
+    - task_signature: Target + horizon + objective
+    - routing_signature: Routing/view configuration
+    - split_signature: CV split configuration (folds, purge/embargo, leakage guards)
+    - feature_signature: Feature set identity (CRITICAL: different features = different outcomes)
+    - hyperparameters_signature: Model family + key hyperparameters (model_family is implicitly included)
+    - registry_overlay_signature: Effective gating outcome (exclusions - unblocks)
+    - leakage_filter_version: Leakage filter version
+    
+    Excludes:
+    - universe_sig: Separate signature (universe membership)
+    - n_effective: Outcome, not identity (different sample sizes are still comparable if same config)
+    - train_seed: Belongs in replicate_key (different seeds are replicates, still comparable)
+    - paths, timestamps, machine IDs: Non-deterministic
+    
+    Args:
+        dataset_signature: Dataset signature (64-char SHA256)
+        task_signature: Task signature (64-char SHA256)
+        routing_signature: Routing signature (64-char SHA256)
+        split_signature: Split signature (64-char SHA256)
+        feature_signature: Feature set signature (64-char SHA256) - CRITICAL: different features = different outcomes
+        hyperparameters_signature: Hyperparameters signature (includes model_family)
+        registry_overlay_signature: Registry overlay signature (64-char SHA256)
+        leakage_filter_version: Leakage filter version string
+        model_family: Model family (included via hyperparameters, but explicit for clarity)
+    
+    Returns:
+        64-character hexadecimal config signature
+    """
+    from TRAINING.common.utils.config_hashing import canonical_json, sha256_full
+    
+    # Build canonical payload with sig_version for future-proofing
+    payload = {
+        "sig_version": 2,  # Bumped from 1 to 2: added feature_signature
+        "dataset_signature": dataset_signature,
+        "task_signature": task_signature,
+        "routing_signature": routing_signature,
+        "split_signature": split_signature,
+        "feature_signature": feature_signature,  # CRITICAL: Different features = different outcomes
+        "hyperparameters_signature": hyperparameters_signature,  # Includes model_family
+        "registry_overlay_signature": registry_overlay_signature,
+        "leakage_filter_version": leakage_filter_version,
+    }
+    
+    # Canonical JSON serialization (deterministic)
+    json_str = canonical_json(payload)
+    
+    # Full 64-char SHA256 hash
+    return sha256_full(json_str)
+
+
+@dataclass
+class NormalizedSnapshot:
+    """Normalized snapshot for diffing (SST-compliant)."""
+    # Core identifiers
+    run_id: str
+    timestamp: str
+    stage: str  # TARGET_RANKING, FEATURE_SELECTION, TRAINING
+    view: Optional[str] = None  # CROSS_SECTIONAL, SYMBOL_SPECIFIC
+    target: Optional[str] = None
+    symbol: Optional[str] = None
+    experiment_id: Optional[str] = None  # Experiment identifier for tracking
+    
+    # Monotonic sequence number for correct ordering (assigned at save time)
+    # This ensures correct "prev run" selection regardless of mtime/timestamp quirks
+    snapshot_seq: Optional[int] = None
+    
+    # Attempt identifier for rerun tracking (default 0 for first attempt)
+    # Used to group outputs by attempt in attempt-specific subdirectories
+    attempt_id: int = 0
+    
+    # Fingerprint schema version (for compatibility checking)
+    fingerprint_schema_version: str = "1.0"  # FINGERPRINT_SCHEMA_VERSION
+    metrics_schema_version: str = "1.1"  # Bump when metrics structure changes (added 2026-01)
+    scoring_schema_version: str = "1.1"  # Phase 3.1: SE-based stability, skill-gating, classification centering
+    
+    # Fingerprints (for change detection)
+    config_fingerprint: Optional[str] = None  # Full fingerprint (includes run_id/timestamp) - for metadata
+    deterministic_config_fingerprint: Optional[str] = None  # Deterministic fingerprint (excludes run_id/timestamp) - for comparison
+    data_fingerprint: Optional[str] = None
+    feature_fingerprint: Optional[str] = None
+    target_fingerprint: Optional[str] = None
+    
+    # Output digests (for artifact/metric reproducibility verification)
+    metrics_sha256: Optional[str] = None  # SHA256 of metrics dict (enables metric reproducibility comparison)
+    artifacts_manifest_sha256: Optional[str] = None  # SHA256 of artifacts manifest (enables artifact reproducibility comparison)
+    predictions_sha256: Optional[str] = None  # SHA256 of predictions (if available, enables prediction reproducibility comparison)
+    
+    # Fingerprint source descriptions (for auditability)
+    fingerprint_sources: Dict[str, str] = field(default_factory=dict)
+    # e.g., {"fold_assignment_hash": "hash over row_id→fold_id mapping"}
+    
+    # Inputs (what was fed to the run)
+    inputs: Dict[str, Any] = field(default_factory=dict)
+    
+    # Process (what happened during execution)
+    process: Dict[str, Any] = field(default_factory=dict)
+    
+    # Outputs (what was produced)
+    outputs: Dict[str, Any] = field(default_factory=dict)
+    
+    # Comparability
+    comparison_group: Optional[ComparisonGroup] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        result = asdict(self)
+        if self.comparison_group:
+            result['comparison_group'] = self.comparison_group.to_dict()
+        return result
+    
+    def to_hash(self) -> str:
+        """Generate hash of normalized snapshot (for deduplication)."""
+        import hashlib
+        import json
+        import numpy as np
+        # Hash only the diffable parts (exclude run_id, timestamp)
+        hashable = {
+            'stage': self.stage,
+            'view': self.view,
+            'target': self.target,
+            'symbol': self.symbol,
+            'config_fingerprint': self.config_fingerprint,
+            'data_fingerprint': self.data_fingerprint,
+            'feature_fingerprint': self.feature_fingerprint,
+            'target_fingerprint': self.target_fingerprint,
+            'inputs': self._normalize_for_hash(self.inputs),
+            'process': self._normalize_for_hash(self.process),
+            'outputs': self._normalize_for_hash(self.outputs)
+        }
+        # SST: Use canonical_json + sha256_short for consistent hashing
+        from TRAINING.common.utils.config_hashing import canonical_json, sha256_short
+        json_str = canonical_json(hashable)
+        return sha256_short(json_str, 16)
+    
+    @staticmethod
+    def _normalize_for_hash(obj: Any) -> Any:
+        """Normalize object for hashing (sort, round floats, etc.)."""
+        import numpy as np
+        if isinstance(obj, dict):
+            return {k: NormalizedSnapshot._normalize_for_hash(v) for k, v in sorted(obj.items())}
+        elif isinstance(obj, (list, tuple)):
+            return [NormalizedSnapshot._normalize_for_hash(v) for v in sorted(obj) if v is not None]
+        elif isinstance(obj, float):
+            # Round to 6 decimal places for stability
+            return round(obj, 6) if not np.isnan(obj) and not np.isinf(obj) else None
+        elif isinstance(obj, (int, str, bool, type(None))):
+            return obj
+        else:
+            return str(obj)
+
+
+@dataclass
+class DiffResult:
+    """Result of diffing two snapshots."""
+    prev_run_id: Optional[str]  # Previous run ID (None if no previous run)
+    current_run_id: str
+    comparable: bool
+    comparability_reason: Optional[str] = None
+    
+    # Previous run metadata (for auditability and validation)
+    prev_timestamp: Optional[str] = None  # When the previous run happened
+    prev_snapshot_seq: Optional[int] = None  # Sequence number of previous snapshot
+    prev_stage: Optional[str] = None  # Stage of previous run (should match current)
+    prev_view: Optional[str] = None  # View of previous run (should match current)
+    comparison_source: Optional[str] = None  # Where previous run was found: "same_run", "snapshot_index", "comparison_group_directory", or None if no previous run
+    
+    # Change detection
+    changed_keys: List[str] = field(default_factory=list)  # Canonical paths
+    severity: ChangeSeverity = ChangeSeverity.NONE
+    severity_reason: Optional[str] = None  # CRITICAL: Explain why severity was set
+    
+    # Summary
+    summary: Dict[str, Any] = field(default_factory=dict)
+    
+    # Excluded factors changed (hyperparameters, seeds, versions)
+    # These are tracked but don't block comparability
+    excluded_factors_changed: Dict[str, Any] = field(default_factory=dict)
+    
+    # Patch operations (JSON-Patch style)
+    patch: List[Dict[str, Any]] = field(default_factory=list)
+    
+    # Metric deltas
+    metric_deltas: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    
+    # Trend deltas (comparison of trend analysis between consecutive runs)
+    trend_deltas: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        d['severity'] = self.severity.value
+        return d
+
+
+@dataclass
+class BaselineState:
+    """Baseline state for a comparison group."""
+    comparison_group_key: str
+    baseline_run_id: str
+    baseline_timestamp: str
+    baseline_metrics: Dict[str, float]
+    established_at: str
+    update_count: int = 0
+    regression_count: int = 0
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+

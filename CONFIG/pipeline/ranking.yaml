@@ -1,0 +1,100 @@
+# Cross-Sectional Ranking Configuration
+# Configures target construction for ranking-based training objectives
+#
+# See .claude/plans/cross-sectional-ranking-objective.md for design details
+# See TRAINING/common/targets/ for implementation
+
+pipeline:
+  # Cross-Sectional Ranking Settings
+  # Used when training models with ranking objectives (pairwise/listwise loss)
+  cross_sectional_ranking:
+    # Enable/disable cross-sectional ranking mode
+    # When enabled, targets are normalized across symbols at each timestamp
+    enabled: false
+
+    # Target construction settings
+    target:
+      # Target type determines how raw returns are normalized
+      # Options:
+      #   - "cs_percentile": Cross-sectional percentile rank [0, 1] (recommended)
+      #     - Bounded, robust, directly encodes ordering
+      #     - Best for pairwise/listwise ranking losses
+      #   - "cs_zscore": Robust z-score using median/MAD
+      #     - Preserves magnitude information
+      #     - Good when signal strength matters
+      #   - "vol_scaled": Volatility-adjusted cross-sectional returns
+      #     - Risk-adjusted relative performance
+      #     - Requires pre-computed volatility column
+      type: "cs_percentile"
+
+      # Forward return column to normalize (source of raw returns)
+      return_col: "fwd_ret_5m"
+
+      # Timestamp column for grouping (cross-sectional normalization)
+      time_col: "ts"
+
+      # Whether to residualize (subtract market mean) before ranking
+      # Recommended: true - removes "market up, everyone looks good" effect
+      residualize: true
+
+      # Winsorization bounds for clipping extreme values
+      # For percentile: clips to [lower, upper] percentile
+      # For zscore: clips to [-winsorize_std, +winsorize_std]
+      winsorize:
+        percentile: [0.01, 0.99]  # 1st and 99th percentile
+        zscore_std: 3.0           # Standard deviations for z-score
+
+      # Minimum symbols required per timestamp
+      # Timestamps with fewer symbols are skipped (NaN targets)
+      min_symbols: 5
+
+      # Volatility column (required for vol_scaled type only)
+      # Must be pre-computed using past data only (no leakage)
+      vol_col: "rolling_vol_20"
+
+    # Loss function settings (Phase 3)
+    loss:
+      # Loss type for ranking optimization
+      # Options:
+      #   - "pairwise": Pairwise logistic loss on winner/loser pairs (recommended to start)
+      #   - "listwise": Listwise softmax loss over full cross-section
+      #   - "pointwise": Standard MSE (baseline, not true ranking loss)
+      type: "pairwise"
+
+      # Pairwise loss settings
+      pairwise:
+        # Top percentile to sample "winners" from
+        sample_top_pct: 0.2   # Top 20%
+        # Bottom percentile to sample "losers" from
+        sample_bottom_pct: 0.2  # Bottom 20%
+        # Maximum pairs to sample per timestamp
+        pairs_per_timestamp: 100
+        # Margin for hinge loss (0 = logistic loss)
+        margin: 0.0
+
+      # Listwise loss settings
+      listwise:
+        # Softmax temperature (lower = harder softmax)
+        temperature: 1.0
+
+    # Batching settings (Phase 2)
+    batching:
+      # Number of timestamps per batch (B dimension)
+      timestamps_per_batch: 32
+      # Number of symbols per timestamp (M dimension)
+      # null = use all symbols, or set to subsample
+      symbols_per_timestamp: null
+      # Minimum symbols required to include a timestamp
+      min_symbols_per_timestamp: 50
+
+    # Metrics settings (Phase 4)
+    metrics:
+      # Primary metric for model selection
+      primary: "spearman_ic"
+      # Metrics to report during training
+      report:
+        - "spearman_ic"
+        - "top_bottom_spread"
+        - "turnover"
+      # Number of top/bottom symbols for spread calculation
+      spread_quantile: 0.1  # Top/bottom 10%

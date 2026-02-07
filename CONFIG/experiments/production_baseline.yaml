@@ -1,0 +1,178 @@
+# ============================================================================
+# PRODUCTION BASELINE TRAINING (Large-Scale: 70M+ rows)
+# ============================================================================
+# Optimized for large universe (728 symbols, ~70M rows) cross-sectional training.
+#
+# SCALING NOTES:
+#   At 70M rows, you have massive statistical power. Multi-model ensembles
+#   provide diminishing returns - a single LightGBM gives ~95% of the signal.
+#   Random Forest and other O(n²) models are disabled (would take hours).
+#
+# Usage (DETERMINISTIC - recommended for production):
+#   bin/run_deterministic.sh python TRAINING/orchestration/intelligent_trainer.py \
+#     --experiment-config production_baseline \
+#     --output-dir TRAINING/results/prod_run
+#
+# Usage (quick dev run - non-deterministic):
+#   python -m TRAINING.orchestration.intelligent_trainer \
+#     --experiment-config production_baseline \
+#     --output-dir TRAINING/results/dev_run
+# ============================================================================
+
+experiment:
+  name: production_baseline
+  description: "Production training optimized for 70M+ row datasets"
+
+# ============================================================================
+# DATA CONFIGURATION
+# ============================================================================
+data:
+  # Large universe: 728 symbols × ~97k timestamps = ~70M rows
+  data_dir: data/data_labeled/interval=5m
+  # symbols: null means use all available symbols in data_dir
+  interval: 5m
+  # Memory-safe for 128GB RAM:
+  # - 100k rows × 728 symbols × 100 cols × 4 bytes (float32) = ~29GB
+  # - With Polars→Pandas spike: ~60GB peak
+  # - Safe margin for model training overhead
+  max_samples_per_symbol: 100000
+  max_rows_per_symbol: 100000
+  max_rows_train: 75000000 # 75M total rows max
+  max_cs_samples: 100000 # No CS sampling needed (728 < 100k)
+  min_cs: 10 # Require 10+ symbols per timestamp
+
+# ============================================================================
+# TARGET SELECTION
+# ============================================================================
+intelligent_training:
+  auto_targets: true
+  top_n_targets: 3 # Train all available targets
+  max_targets_to_evaluate: 15 # Evaluate all targets
+
+  # Exclude leaky/problematic targets
+  exclude_target_patterns:
+    - "_raw$"
+    - "^debug_"
+
+  auto_features: true
+  top_m_features: 100
+
+  # Standard single-task training
+  strategy: default
+
+  run_leakage_diagnostics: true
+
+  # Lazy loading: Load data per-target instead of all upfront (50% memory reduction)
+  lazy_loading:
+    enabled: true
+    verify_memory_release: false # Set true for debugging memory issues
+    log_memory_usage: true
+    fail_on_fallback: true # Fail immediately if can't use lazy loading (prevents OOM)
+    # Feature probing: Single-symbol importance filtering (additional 67% memory reduction)
+    probe_features: true
+    probe_top_n: 100
+    probe_rows: 10000
+
+# ============================================================================
+# TARGET ROUTING - CROSS-SECTIONAL ONLY
+# ============================================================================
+# For large universes, disable symbol-specific routing entirely
+# SS would create 728 × N_families models, negating memory savings
+target_routing:
+  max_symbols_for_ss: 0 # Disable SS for ANY universe size (force CS only)
+  ss_fallback_route: CROSS_SECTIONAL
+
+# ============================================================================
+# MODEL TRAINING (Large-Scale Optimized)
+# ============================================================================
+# At 70M rows, model scaling matters:
+#   - LightGBM/XGBoost/CatBoost: O(n log n) - fast, use histogram binning
+#   - Ridge/ElasticNet: O(n) - very fast, good baseline
+#   - Random Forest: O(n × trees × depth) - SLOW, hours at this scale
+#   - SVM/KNN: O(n²) - don't even try
+#
+# For large datasets: gradient boosters + linear models only
+training:
+  model_families:
+    - lightgbm # ~5 min at 70M rows
+    - xgboost # ~5-10 min
+    - catboost # ~10-15 min (GPU recommended)
+    - ridge # ~30 sec
+    - elasticnet # ~1 min
+    # Disabled for large-scale (too slow):
+    # - random_forest   # ~3+ hours
+    # - extra_trees     # ~3+ hours
+    # - svm             # days
+    # - knn             # days
+
+# ============================================================================
+# FEATURE SELECTION (Large-Scale Optimized)
+# ============================================================================
+# At 70M rows, a single LightGBM gives extremely stable feature importance.
+# Multi-model ensemble adds <5% accuracy for 10x compute cost.
+feature_selection:
+  model_families:
+    lightgbm:
+      enabled: true
+    # Optional for robustness check:
+    # xgboost:
+    #   enabled: true
+
+# ============================================================================
+# TARGET RANKING (Large-Scale Optimized)
+# ============================================================================
+# Same logic: at 70M rows, LightGBM alone provides stable predictability scores.
+# The confidence intervals are tiny with this much data.
+target_ranking:
+  model_families:
+    lightgbm:
+      enabled: true
+    xgboost:
+      enabled: true
+
+# ============================================================================
+# CROSS-VALIDATION (Large-Scale Optimized)
+# ============================================================================
+# At 70M rows, each CV fold is ~14M rows - plenty for stable estimates.
+# Fewer folds = faster, and you don't need 10-fold precision at this scale.
+cross_validation:
+  n_splits: 3 # 3 folds sufficient (each fold ~23M train, ~47M test)
+  purge_bars: 17 # ~85 min purge at 5m interval (prevents leakage)
+  embargo_bars: 3 # ~15 min embargo (extra safety margin)
+
+# ============================================================================
+# MODEL HYPERPARAMETERS
+# ============================================================================
+# Base hyperparameters are in CONFIG/models/*.yaml files.
+# These have been updated for large-scale (70M row) training with:
+#   - Higher min_data_in_leaf (500-1000) to prevent overfitting
+#   - More trees (2000) with early stopping
+#   - Slower learning rate (0.02) for better generalization
+#   - Strong regularization (lambda_l2=1.0)
+#
+# Key files updated:
+#   - CONFIG/models/lightgbm.yaml
+#   - CONFIG/models/xgboost.yaml
+#   - CONFIG/models/catboost.yaml (new)
+#
+# Variants available: lightweight, small_data, large_scale, very_large
+
+# ============================================================================
+# TIMEOUTS (Safety Net)
+# ============================================================================
+# If someone re-enables slow models, these prevent runaway jobs
+timeouts:
+  family_timeout_seconds: 1800 # 30 min max per family (kills RF if accidentally enabled)
+  target_timeout_seconds: 7200 # 2 hour max per target
+
+# ============================================================================
+# PARALLEL EXECUTION
+# ============================================================================
+multi_target:
+  parallel_targets: true
+  skip_on_error: true
+  save_summary: true
+
+threading:
+  parallel:
+    enabled: true

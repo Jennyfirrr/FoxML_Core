@@ -1,0 +1,219 @@
+# Raw OHLCV Sequence Test Configuration
+# Based on determinism_test.yaml but with RAW SEQUENCE MODE enabled
+# Purpose: Test raw OHLCV sequence training without computed features
+#
+# KEY DIFFERENCES FROM determinism_test.yaml:
+#   - input_mode: "raw_sequence" (skips feature computation)
+#   - Stages 1 & 2 (target ranking, feature selection) are SKIPPED
+#   - Only sequence-compatible models trained (LSTM, Transformer, CNN1D)
+#   - Uses rolling windows of raw OHLCV bars as input
+#
+# Usage:
+#   bin/run_deterministic.sh python TRAINING/orchestration/intelligent_trainer.py \
+#     --experiment-config raw_test --output-dir TRAINING/results/raw_test
+#
+# LEAKAGE PROTECTION:
+#   - Sequences end at time t, target is return from t to t+horizon
+#   - No overlap between input sequence and prediction horizon
+#   - Purge gaps prevent train/val contamination
+#
+# OVERFITTING MITIGATION:
+#   - Early stopping (patience=5)
+#   - Dropout in model architectures (0.2-0.3)
+#   - L2 regularization where applicable
+#   - Cross-sectional validation (temporal split, never random)
+#   - Small model capacity for testing (larger for production)
+
+experiment:
+  name: raw_test
+  description: "Raw OHLCV sequence test: 5 symbols, LSTM/Transformer/CNN1D, no features"
+
+# ============================================================================
+# PIPELINE CONFIGURATION - RAW SEQUENCE MODE
+# ============================================================================
+pipeline:
+  # CRITICAL: Use raw OHLCV sequences instead of computed features
+  # This SKIPS:
+  #   - Stage 1: Target Ranking (no features to rank)
+  #   - Stage 2: Feature Selection (no features to select)
+  input_mode: "raw_sequence"
+
+  # Sequence configuration for raw OHLCV mode
+  sequence:
+    # Sequence length in minutes (64 bars @ 5min = 320 minutes)
+    length_minutes: 320
+
+    # OHLCV channels - these become the 5 input features
+    channels: ["open", "high", "low", "close", "volume"]
+
+    # Normalization method:
+    #   - "returns": (x[t] - x[t-1]) / x[t-1] for price, raw for volume
+    #   - "log_returns": log(x[t] / x[t-1]) for price, log(volume) for volume
+    #   - "minmax": MinMax scaling within each sequence
+    #   - "none": No normalization (not recommended)
+    normalization: "log_returns"
+
+    # Gap handling:
+    #   - "split": Don't span time gaps (market close, etc)
+    #   - "fill": Forward fill across gaps (risky for long gaps)
+    gap_handling: "split"
+    gap_tolerance: 1.5  # Gap detection: interval * tolerance
+
+# ============================================================================
+# DATA CONFIGURATION - SAME AS determinism_test.yaml
+# ============================================================================
+data:
+  data_dir: data/data_labeled/interval=5m
+  symbols: [AAPL, MSFT, GOOGL, TSLA, NVDA]
+  interval: 5m
+
+  # Sample limits for quick testing
+  max_samples_per_symbol: 2000
+  max_rows_per_symbol: 2000
+  max_rows_train: 10000
+  max_cs_samples: 2000
+  min_cs: 3
+
+# ============================================================================
+# INTELLIGENT TRAINING CONFIGURATION
+# ============================================================================
+intelligent_training:
+  # Auto-discover targets from data
+  auto_targets: true
+
+  # Only train top N targets (fewer for quick test)
+  top_n_targets: 5
+  max_targets_to_evaluate: 15
+
+  # IGNORED in raw_sequence mode (no features)
+  auto_features: false
+  top_m_features: 0
+
+  # Training strategy
+  strategy: single_task
+
+  # Skip leakage diagnostics (raw mode has simpler leakage profile)
+  run_leakage_diagnostics: false
+
+  # Exclude problematic target patterns
+  exclude_target_patterns:
+    - "fwd_ret_20d"
+    - "fwd_ret_15d"
+    - "_raw$"
+    - "^debug_"
+
+  # Lazy loading for memory efficiency
+  lazy_loading:
+    enabled: true
+    verify_memory_release: false
+    log_memory_usage: true
+    fail_on_fallback: false
+
+# ============================================================================
+# TARGET ROUTING - CROSS-SECTIONAL ONLY
+# ============================================================================
+target_routing:
+  max_symbols_for_ss: 0  # Force CS only
+  ss_fallback_route: CROSS_SECTIONAL
+
+# ============================================================================
+# TRAINING CONFIGURATION - SEQUENCE MODELS ONLY
+# ============================================================================
+training:
+  # Only sequence-compatible model families
+  # Non-sequence families (lightgbm, xgboost, etc) are auto-filtered out
+  model_families:
+    - lstm
+    - transformer
+    - cnn1d
+
+  # OVERFITTING MITIGATION: Model-specific settings
+  # These override CONFIG/models/{family}.yaml defaults
+  lstm:
+    epochs: 30
+    patience: 5           # Early stopping
+    dropout: 0.3          # Higher dropout for regularization
+    recurrent_dropout: 0.2
+    lstm_units: 64        # Smaller capacity for testing
+    learning_rate: 0.001
+    batch_size: 256
+
+  transformer:
+    epochs: 30
+    patience: 5
+    dropout: 0.3
+    d_model: 32           # Smaller capacity
+    heads: 2
+    learning_rate: 0.001
+    batch_size: 256
+
+  cnn1d:
+    epochs: 30
+    patience: 5
+    dropout: 0.3
+    filters: [32, 64]     # Smaller capacity
+    learning_rate: 0.001
+    batch_size: 256
+
+# ============================================================================
+# FEATURE SELECTION - SKIPPED IN RAW SEQUENCE MODE
+# ============================================================================
+# This section is ignored when input_mode="raw_sequence"
+feature_selection:
+  model_families: []  # Empty - no feature selection
+
+# ============================================================================
+# SAFETY & LEAKAGE DETECTION
+# ============================================================================
+# Raw OHLCV mode has a simpler leakage profile:
+#   - No computed features that could accidentally include future data
+#   - Main concern: target alignment (sequence ends before prediction starts)
+#   - Temporal validation split prevents train/test contamination
+safety:
+  leakage_detection:
+    lookback_budget:
+      mode: auto
+      auto_rule: k_times_horizon
+      k: 10.0
+      min_minutes: 240.0
+      max_minutes: 28800.0
+    policy: drop
+    over_budget_action: drop
+
+# ============================================================================
+# DETERMINISM - DISABLE PARALLELISM
+# ============================================================================
+multi_target:
+  parallel_targets: false
+  skip_on_error: true
+  save_summary: true
+
+multi_model_feature_selection:
+  parallel_symbols: false
+
+threading:
+  parallel:
+    max_workers_process: 1
+    max_workers_thread: 1
+    enabled: false
+
+# ============================================================================
+# DECISIONS
+# ============================================================================
+decisions:
+  apply_mode: "off"
+  min_level_to_apply: 2
+  use_bayesian: false
+
+# ============================================================================
+# VERIFICATION
+# ============================================================================
+# After running:
+#   1. Check that Stage 1 (Target Ranking) shows "SKIPPED - Raw Sequence Mode"
+#   2. Check that Stage 2 (Feature Selection) shows "SKIPPED - Raw Sequence Mode"
+#   3. Check that only LSTM/Transformer/CNN1D models are trained
+#   4. Verify model_meta.json has:
+#      - input_mode: "raw_sequence"
+#      - sequence_length: 64
+#      - sequence_channels: ["open", "high", "low", "close", "volume"]
+#      - sequence_normalization: "log_returns"

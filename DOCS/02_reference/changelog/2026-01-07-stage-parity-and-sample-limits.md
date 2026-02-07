@@ -1,0 +1,253 @@
+# Stage Parity, Sample Limits & Task-Type Filtering
+
+**Date**: 2026-01-07  
+**Category**: Reproducibility, Determinism, Data Consistency, Routing  
+**Impact**: High (fixes data sampling bug, adds TRAINING stage tracking, prevents garbage aggregations)
+
+## Summary
+
+Six major improvements:
+1. Fixed Feature Selection loading entire data history instead of respecting sample limits
+2. Added full parity tracking for TRAINING stage (Stage 3)
+3. Completed FS snapshot parity with TARGET_RANKING snapshots
+4. **NEW**: Task-type filtering prevents incompatible model families from polluting aggregations
+5. **NEW**: Task-aware metrics schema - no more `pos_rate: 0.0` on regression targets
+6. **NEW**: Canonical metric naming - unambiguous metric names across all stages
+
+## Problem
+
+1. **Sample Limit Bug**: `compute_cross_sectional_importance()` was loading ALL data (~188k samples per symbol) instead of respecting `max_samples_per_symbol` config (e.g., 2k)
+2. **No TRAINING Tracking**: Stage 3 had no snapshot mechanism - couldn't verify model determinism
+3. **FS Snapshot Gaps**: Missing fields like `split_signature`, `metrics_sha256`, `n_effective`
+
+## Changes
+
+### Sample Limit Consistency
+
+**Files Modified:**
+- `TRAINING/ranking/cross_sectional_feature_ranker.py`
+- `TRAINING/ranking/feature_selector.py`
+
+**Fix:**
+```python
+# Before (loading ALL data):
+mtf_data = load_mtf_data_for_ranking(data_dir, symbols)
+
+# After (respecting limit):
+mtf_data = load_mtf_data_for_ranking(data_dir, symbols, max_rows_per_symbol=max_rows_per_symbol)
+```
+
+**Impact:**
+- All 3 stages (TR/FS/TRAINING) now use consistent `.tail(N)` sampling
+- Expected: `n: 2000` per symbol instead of `n: 188779`
+
+### TRAINING Stage Full Parity Tracking
+
+**New Files:**
+- `TRAINING/training_strategies/reproducibility/__init__.py`
+- `TRAINING/training_strategies/reproducibility/schema.py`
+- `TRAINING/training_strategies/reproducibility/io.py`
+
+**New Schema (`TrainingSnapshot`):**
+```python
+@dataclass
+class TrainingSnapshot:
+    run_id: str
+    timestamp: str
+    stage: str = "TRAINING"
+    view: str  # CROSS_SECTIONAL or SYMBOL_SPECIFIC
+    target: str
+    symbol: Optional[str]
+    model_family: str
+    
+    # Fingerprints
+    model_artifact_sha256: Optional[str]  # Hash of saved model file
+    predictions_sha256: Optional[str]
+    feature_fingerprint_input: Optional[str]
+    feature_fingerprint_output: Optional[str]
+    hyperparameters_signature: Optional[str]
+    
+    # Comparison group
+    comparison_group: Dict[str, Any]  # Full parity with TR/FS
+```
+
+**Integration:**
+- `TRAINING/training_strategies/execution/training.py` calls `create_and_save_training_snapshot()` after model save
+- Global index: `globals/training_snapshot_index.json`
+
+### FS Snapshot Full Parity
+
+**Files Modified:**
+- `TRAINING/stability/feature_importance/schema.py`
+- `TRAINING/stability/feature_importance/io.py`
+- `TRAINING/stability/feature_importance/hooks.py`
+
+**New Fields in `FeatureSelectionSnapshot`:**
+- `snapshot_seq`: Sequence number
+- `metrics_sha256`: Hash of outputs.metrics
+- `artifacts_manifest_sha256`: Hash of output artifacts
+- `fingerprint_sources`: Documentation of fingerprint meanings
+- `comparison_group.n_effective`: Row count
+- `comparison_group.hyperparameters_signature`: Model config hash
+- `comparison_group.feature_registry_hash`: Feature registry version
+- `comparison_group.comparable_key`: Full reproducibility key
+
+**Seed Fix:**
+```python
+# Before (derived seed - broke consistency):
+train_seed = hash(base_seed + universe_sig)  # e.g., 198258262
+
+# After (direct seed - consistent across stages):
+train_seed = base_seed  # 42
+```
+
+## Verification
+
+After next E2E run, check:
+
+1. **Sample limits respected:**
+   ```json
+   // metadata.json
+   "per_symbol_stats": {
+     "AAPL": { "n": 2000 },  // was 188779
+     ...
+   }
+   ```
+
+2. **TRAINING snapshots created:**
+   ```
+   globals/training_snapshot_index.json
+   ```
+
+3. **FS snapshots have full parity:**
+   ```json
+   // fs_snapshot.json
+   "comparison_group": {
+     "train_seed": 42,  // was 198258262
+     "n_effective": 20000,
+     "comparable_key": "..."
+   }
+   ```
+
+### Task-Type Model Filtering
+
+Prevents incompatible model families from training on wrong task types, avoiding garbage scores in aggregations.
+
+**New in `TRAINING/training_strategies/utils.py`:**
+
+```python
+# FAMILY_CAPS now includes supported_tasks
+FAMILY_CAPS = {
+    "lightgbm": {...},  # All tasks (no restriction)
+    "elastic_net": {..., "supported_tasks": ["regression"]},
+    "logistic_regression": {..., "supported_tasks": ["binary", "multiclass"]},
+    "ngboost": {..., "supported_tasks": ["regression", "binary"]},
+    ...
+}
+
+def is_family_compatible(family: str, task_type) -> tuple:
+    """SST single source of truth for task-type filtering."""
+    ...
+```
+
+**Filter Applied in All 3 Stages:**
+- `TRAINING/ranking/predictability/model_evaluation.py` - Stage 1 (TARGET_RANKING)
+- `TRAINING/ranking/multi_model_feature_selection.py` - Stage 2 (FEATURE_SELECTION)
+- `TRAINING/training_strategies/execution/training.py` - Stage 3 (TRAINING)
+
+**Families Constrained:**
+| Family | Supported Tasks |
+|--------|-----------------|
+| elastic_net, ridge, lasso | regression |
+| logistic_regression | binary, multiclass |
+| ngboost | regression, binary |
+| quantile_lightgbm | regression |
+
+### Task-Aware Metrics Schema
+
+Fixes `pos_rate: 0.0` appearing on regression targets.
+
+**New Files:**
+- `CONFIG/ranking/metrics_schema.yaml` - Task-specific metric definitions
+- `TRAINING/ranking/predictability/metrics_schema.py` - Cached loader + `compute_target_stats()`
+
+**Behavior Change:**
+
+| Task Type | Before | After |
+|-----------|--------|-------|
+| Regression | `pos_rate: 0.0` (garbage) | `y_mean`, `y_std`, `y_min`, `y_max`, `y_finite_pct` |
+| Binary | `pos_rate: 0.35` | `pos_rate: 0.35`, `class_balance: {0: 650, 1: 350}` |
+| Multiclass | `pos_rate: 0.0` (garbage) | `class_balance: {...}`, `n_classes: 3` |
+
+### Canonical Metric Naming
+
+**Problem:**
+The `auc` field in `TargetPredictabilityScore` was overloaded:
+- Regression: stored R²
+- Binary: stored ROC-AUC
+- Multiclass: stored accuracy
+
+This caused confusion when comparing metrics across task types.
+
+**Solution:**
+Replace overloaded `auc` with task-specific, view-aware metric names.
+
+**Naming Convention:**
+```
+<metric_base>__<view>__<aggregation>
+```
+
+Where:
+- `view` = `cs` (cross-sectional) or `sym` (symbol-specific)
+- `aggregation` = `mean`, `std`, `pooled`
+
+**Examples:**
+| Task Type | View | Primary Metric Name |
+|-----------|------|---------------------|
+| REGRESSION | CROSS_SECTIONAL | `spearman_ic__cs__mean` |
+| REGRESSION | SYMBOL_SPECIFIC | `r2__sym__mean` |
+| BINARY_CLASSIFICATION | CROSS_SECTIONAL | `roc_auc__cs__mean` |
+| BINARY_CLASSIFICATION | SYMBOL_SPECIFIC | `roc_auc__sym__mean` |
+| MULTICLASS_CLASSIFICATION | CROSS_SECTIONAL | `accuracy__cs__mean` |
+
+**Files Modified:**
+- `CONFIG/ranking/metrics_schema.yaml` - Added `canonical_names` section
+- `TRAINING/ranking/predictability/metrics_schema.py` - Added `get_canonical_metric_name()`, `get_canonical_metric_names_for_output()`
+- `TRAINING/ranking/predictability/scoring.py` - Added `view` field, `primary_metric_name` property
+- `TRAINING/ranking/predictability/model_evaluation.py` - Use canonical names in metrics output
+- `TRAINING/training_strategies/reproducibility/schema.py` - Use canonical names in TrainingSnapshot
+
+**Backward Compatibility:**
+- Deprecated `auc` field kept for backward compat
+- Old code reading `auc` continues to work
+- New code should use `primary_metric_name` property
+
+## Determinism Impact
+
+**None.** Changes are:
+- Bug fix (sample limits - was loading wrong data)
+- Observational (new tracking)
+- Metadata enrichment
+- Routing (task-type filtering - skips incompatible families before training)
+- Naming (canonical metrics are cosmetic, same values)
+
+Model computation unchanged when inputs are correct.
+
+## Files Modified
+
+| File | Change |
+|------|--------|
+| `TRAINING/ranking/cross_sectional_feature_ranker.py` | Added `max_rows_per_symbol` parameter |
+| `TRAINING/ranking/feature_selector.py` | Pass sample limit to CS ranker |
+| `TRAINING/common/utils/fingerprinting.py` | Use base_seed directly |
+| `TRAINING/stability/feature_importance/schema.py` | FS snapshot full parity fields |
+| `TRAINING/stability/feature_importance/io.py` | Pass parity fields through |
+| `TRAINING/stability/feature_importance/hooks.py` | Accept parity fields |
+| `TRAINING/training_strategies/reproducibility/*` | New TRAINING snapshot module |
+| `TRAINING/training_strategies/execution/training.py` | Create training snapshots, task-type filter |
+| `TRAINING/training_strategies/utils.py` | `supported_tasks` in FAMILY_CAPS, `is_family_compatible()` |
+| `TRAINING/ranking/predictability/model_evaluation.py` | Task-type filter, task-aware metrics, canonical names |
+| `TRAINING/ranking/multi_model_feature_selection.py` | Task-type filter before family loop |
+| `CONFIG/ranking/metrics_schema.yaml` | New - task-specific metric definitions, canonical names |
+| `TRAINING/ranking/predictability/metrics_schema.py` | New - `compute_target_stats()`, `get_canonical_metric_name()` |
+| `TRAINING/ranking/predictability/scoring.py` | Added `view` field, `primary_metric_name` property |

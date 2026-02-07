@@ -1,0 +1,389 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later OR Commercial
+# Copyright (c) 2025-2026 Fox ML Infrastructure LLC
+
+"""
+Target Routing Helper
+
+Maps target confidence metrics to operational decisions (production/candidate/experimental).
+"""
+
+# DETERMINISM: Bootstrap reproducibility BEFORE any ML libraries
+import TRAINING.common.repro_bootstrap  # noqa: F401 - MUST be first ML import
+
+import json
+import logging
+from pathlib import Path
+from typing import Dict, Any, List, Optional
+import pandas as pd
+
+# SST: Import View enum for consistent view handling
+from TRAINING.orchestration.utils.scope_resolution import View
+# DETERMINISM_CRITICAL: Routing decisions must be deterministic
+from TRAINING.common.utils.determinism_ordering import iterdir_sorted, rglob_sorted, sorted_items
+
+logger = logging.getLogger(__name__)
+
+
+def classify_target_from_confidence(
+    conf: Dict[str, Any],
+    routing_config: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    Classify target based on confidence metrics into operational buckets.
+    
+    Args:
+        conf: Target confidence dict from compute_target_confidence()
+        routing_config: Optional routing rules from config (confidence.routing section)
+    
+    Returns:
+        Dict with:
+            - allowed_in_production: bool
+            - bucket: "core" | "candidate" | "experimental"
+            - note: str explanation
+    """
+    conf_level = conf.get("confidence", "LOW")
+    reason = conf.get("low_confidence_reason")
+    score_tier = conf.get("score_tier", "LOW")
+    
+    # Use config if provided, otherwise use defaults
+    if routing_config is None:
+        routing_config = {}
+    
+    # Check experimental rule (Boruta zero confirmed)
+    experimental_rule = routing_config.get('experimental', {})
+    if (conf_level == experimental_rule.get('confidence', 'LOW') and
+        reason == experimental_rule.get('low_confidence_reason', 'boruta_zero_confirmed')):
+        return {
+            "allowed_in_production": False,
+            "bucket": "experimental",
+            "note": experimental_rule.get('note', 'Boruta used and found zero robust features; fragile signal.')
+        }
+    
+    # Check core rule (HIGH confidence)
+    core_rule = routing_config.get('core', {})
+    if conf_level == core_rule.get('confidence', 'HIGH'):
+        return {
+            "allowed_in_production": True,
+            "bucket": "core",
+            "note": core_rule.get('note', 'Strong, robust signal with good agreement and Boruta support.')
+        }
+    
+    # Check candidate rule (MEDIUM confidence with score_tier requirement)
+    candidate_rule = routing_config.get('candidate', {})
+    if conf_level == candidate_rule.get('confidence', 'MEDIUM'):
+        score_tier_min = candidate_rule.get('score_tier_min', 'MEDIUM')
+        score_tier_order = {'LOW': 0, 'MEDIUM': 1, 'HIGH': 2}
+        if score_tier_order.get(score_tier, 0) >= score_tier_order.get(score_tier_min, 0):
+            return {
+                "allowed_in_production": False,
+                "bucket": "candidate",
+                "note": candidate_rule.get('note', f'Some signal present (score_tier={score_tier}) but not fully robust yet.')
+            }
+    
+    # Default fallback
+    default_rule = routing_config.get('default', {})
+    if conf_level == "MEDIUM":
+        bucket = default_rule.get('bucket', 'candidate')
+    else:
+        bucket = default_rule.get('fallback_bucket', 'experimental')
+    
+    return {
+        "allowed_in_production": False,
+        "bucket": bucket,
+        "note": default_rule.get('note', f'Signal strength: {score_tier}, robustness: {conf_level}. Needs validation.')
+    }
+
+
+def load_target_confidence(output_dir: Path, target: str, view: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """
+    Load target confidence JSON for a specific target.
+    
+    Args:
+        output_dir: Target output directory or base run directory
+        target: Target column name
+        view: Optional view name ("CROSS_SECTIONAL" or "SYMBOL_SPECIFIC"). If None, checks both views.
+    
+    Returns:
+        Confidence dict or None if not found
+    """
+    # Try target-first structure first (view-scoped)
+    from TRAINING.orchestration.utils.target_first_paths import get_target_reproducibility_dir
+    base_dir = output_dir
+    # Walk up to find run root if needed
+    # Only stop if we find a run directory (has targets/, globals/, or cache/)
+    # Don't stop at RESULTS/ - continue to find actual run directory
+    while base_dir.parent.exists():
+        if (base_dir / "targets").exists() or (base_dir / "globals").exists() or (base_dir / "cache").exists():
+            break
+        base_dir = base_dir.parent
+    
+    from TRAINING.orchestration.utils.target_first_paths import normalize_target_name
+    target_clean = normalize_target_name(target)
+    target_repro_dir = get_target_reproducibility_dir(base_dir, target_clean)
+    
+    # Check view-scoped locations (new structure)
+    views_to_check = []
+    if view:
+        views_to_check = [view]
+    else:
+        # Check both views if view not specified
+        # SST: Use View enum values
+        views_to_check = [View.CROSS_SECTIONAL.value, View.SYMBOL_SPECIFIC.value]
+    
+    for check_view in views_to_check:
+        view_dir = target_repro_dir / check_view
+        conf_path = view_dir / "target_confidence.json"
+    
+    if conf_path.exists():
+        try:
+            with open(conf_path) as f:
+                return json.load(f)
+        except Exception as e:
+                logger.debug(f"Failed to load confidence from {check_view}: {e}")
+        
+        # Also check symbol-specific subdirectories if SYMBOL_SPECIFIC
+        # SST: Use View enum for comparison
+        # DETERMINISM_CRITICAL: Routing decisions must be deterministic
+        if check_view == View.SYMBOL_SPECIFIC.value and view_dir.exists():
+            for sym_dir in iterdir_sorted(view_dir):
+                if sym_dir.is_dir() and sym_dir.name.startswith("symbol="):
+                    sym_conf_path = sym_dir / "target_confidence.json"
+                    if sym_conf_path.exists():
+                        try:
+                            with open(sym_conf_path) as f:
+                                return json.load(f)
+                        except Exception as e:
+                            logger.debug(f"Failed to load confidence from {sym_dir.name}: {e}")
+    
+    # Fallback to legacy location (target root, no view folder)
+    legacy_path = target_repro_dir / "target_confidence.json"
+    if legacy_path.exists():
+        try:
+            with open(legacy_path) as f:
+                return json.load(f)
+        except Exception as e:
+            logger.debug(f"Failed to load confidence from legacy location: {e}")
+    
+    # Final fallback to output_dir
+    legacy_path2 = output_dir / "target_confidence.json"
+    if legacy_path2.exists():
+        try:
+            with open(legacy_path2) as f:
+                return json.load(f)
+        except Exception as e:
+            logger.debug(f"Failed to load confidence from output_dir: {e}")
+    
+    return None
+
+
+def collect_run_level_confidence_summary(
+    feature_selections_dir: Path,
+    output_dir: Path,
+    routing_config: Optional[Dict[str, Any]] = None
+) -> List[Dict[str, Any]]:
+    """
+    Collect all target confidence files from a run and create run-level summary.
+    
+    Args:
+        feature_selections_dir: Directory containing per-target feature selection outputs
+        output_dir: Where to write the run-level summary
+    
+    Returns:
+        List of all target confidence dicts
+    """
+    all_confidence = []
+    
+    # Find all target_confidence.json files
+    # DETERMINISM_CRITICAL: Routing decisions must be deterministic
+    for conf_file in rglob_sorted(feature_selections_dir, "target_confidence.json"):
+        try:
+            with open(conf_file) as f:
+                conf = json.load(f)
+                all_confidence.append(conf)
+        except Exception as e:
+            logger.warning(f"Failed to load {conf_file}: {e}")
+            continue
+    
+    if not all_confidence:
+        logger.warning("No target confidence files found")
+        return []
+    
+    # Save to target-first structure (globals/)
+    from TRAINING.orchestration.utils.target_first_paths import get_globals_dir
+    globals_dir = get_globals_dir(output_dir)
+    globals_dir.mkdir(parents=True, exist_ok=True)
+
+    # SST: Sanitize confidence data to normalize enums to strings before JSON serialization
+    from TRAINING.orchestration.utils.diff_telemetry import _sanitize_for_json
+    sanitized_confidence = _sanitize_for_json(all_confidence)
+    
+    # Write run-level JSON (list of all targets) to globals/
+    # SST: Use write_atomic_json for atomic write with canonical serialization
+    from TRAINING.common.utils.file_utils import write_atomic_json
+    run_summary_path = globals_dir / "target_confidence_summary.json"
+    write_atomic_json(run_summary_path, sanitized_confidence)
+    logger.info(f"✅ Saved run-level confidence summary: {len(all_confidence)} targets to {run_summary_path}")
+    
+    # Write CSV summary for easy inspection to globals/ (target-first only)
+    csv_path = globals_dir / "target_confidence_summary.csv"
+    summary_rows = []
+    for conf in all_confidence:
+        routing = classify_target_from_confidence(conf, routing_config=routing_config)
+        summary_rows.append({
+            'target': conf.get('target', 'unknown'),
+            'confidence': conf.get('confidence', 'LOW'),
+            'score_tier': conf.get('score_tier', 'LOW'),
+            'low_confidence_reason': conf.get('low_confidence_reason', ''),
+            'auc': conf.get('auc', 0.0),
+            'max_score': conf.get('max_score', 0.0),
+            'mean_strong_score': conf.get('mean_strong_score', 0.0),
+            'agreement_ratio': conf.get('agreement_ratio', 0.0),
+            'model_coverage_ratio': conf.get('model_coverage_ratio', 0.0),
+            'boruta_confirmed_count': conf.get('boruta_confirmed_count', 0),
+            'boruta_tentative_count': conf.get('boruta_tentative_count', 0),
+            'bucket': routing.get('bucket', 'experimental'),
+            'allowed_in_production': routing.get('allowed_in_production', False),
+            'note': routing.get('note', '')
+        })
+    
+    df = pd.DataFrame(summary_rows)
+    df = df.sort_values(['confidence', 'score_tier'], ascending=[False, False])
+    df.to_csv(csv_path, index=False)
+    logger.info(f"✅ Saved confidence summary CSV: {csv_path}")
+    
+    return all_confidence
+
+
+def save_target_routing_metadata(
+    output_dir: Path,
+    target: str,
+    conf: Dict[str, Any],
+    routing: Dict[str, Any],
+    view: Optional[str] = None
+) -> None:
+    """
+    Save routing decision metadata alongside confidence metrics.
+    
+    Structure (target-first):
+    - Per-target: targets/<target>/decision/routing_decision.json (detailed record)
+    - Global summary: globals/feature_selection_routing.json (lightweight, references per-target files)
+    
+    NOTE: This is separate from globals/routing_decisions.json (which is for target ranking routing only)
+    
+    Args:
+        output_dir: Base run output directory or target-specific directory
+        target: Target column name
+        conf: Confidence metrics
+        routing: Routing decision from classify_target_from_confidence()
+        view: View type (CROSS_SECTIONAL, SYMBOL_SPECIFIC) - if None, defaults to CROSS_SECTIONAL
+    """
+    from TRAINING.orchestration.utils.target_first_paths import (
+        get_target_decision_dir, get_globals_dir, ensure_target_structure
+    )
+    
+    # Find base run directory
+    base_dir = output_dir
+    # Only stop if we find a run directory (has targets/, globals/, or cache/)
+    # Don't stop at RESULTS/ - continue to find actual run directory
+    while base_dir.parent.exists():
+        if (base_dir / "targets").exists() or (base_dir / "globals").exists() or (base_dir / "cache").exists():
+            break
+        base_dir = base_dir.parent
+    
+    from TRAINING.orchestration.utils.target_first_paths import normalize_target_name
+    target_clean = normalize_target_name(target)
+    ensure_target_structure(base_dir, target_clean)
+    decision_dir = get_target_decision_dir(base_dir, target_clean)
+    decision_dir.mkdir(parents=True, exist_ok=True)
+    
+    # SST: Normalize view using View enum (same pattern as everywhere else)
+    from TRAINING.orchestration.utils.scope_resolution import View
+    try:
+        view_enum = View.from_string(view) if view else View.CROSS_SECTIONAL
+        view_normalized = view_enum.value
+    except (ValueError, AttributeError):
+        view_normalized = View.CROSS_SECTIONAL.value
+    
+    # SST: Use stage-scoped paths (same pattern as get_scoped_artifact_dir)
+    # FEATURE_SELECTION stage is always used for these paths (this function is called from feature selection)
+    stage_prefix = "stage=FEATURE_SELECTION"
+    base_path = f"targets/{target_clean}/reproducibility/{stage_prefix}/{view_normalized}"
+    
+    # Note: For SYMBOL_SPECIFIC, actual files are under symbol= subdirectories
+    # This path reference is approximate - readers should search symbol= subdirs for SYMBOL_SPECIFIC view
+    
+    # Save per-target decision (detailed record with full confidence and routing info)
+    routing_path = decision_dir / "routing_decision.json"
+    routing_data = {
+        target: {
+            'target': target,
+            'view': view_normalized,  # Add view information for completeness
+            'confidence': conf,
+            'routing': routing,
+            # Reference to where selected features can be found (stage-scoped paths)
+            'selected_features_path': f"{base_path}/selected_features.txt",
+            'feature_selection_summary_path': f"{base_path}/feature_selection_summary.json"
+        }
+    }
+    
+    # SST: Use write_atomic_json for atomic write with canonical serialization
+    from TRAINING.common.utils.file_utils import write_atomic_json
+    write_atomic_json(routing_path, routing_data)
+    
+    logger.debug(f"Saved per-target routing decision for {target} to {routing_path}")
+    
+    # CRITICAL: Update lightweight summary in globals/feature_selection_routing.json
+    # This is separate from globals/routing_decisions.json (which is for target ranking)
+    globals_dir = get_globals_dir(base_dir)
+    globals_dir.mkdir(parents=True, exist_ok=True)
+    feature_routing_file = globals_dir / "feature_selection_routing.json"
+    
+    # Load existing feature selection routing (merge, don't overwrite)
+    existing_routing = {}
+    if feature_routing_file.exists():
+        try:
+            with open(feature_routing_file) as f:
+                data = json.load(f)
+                existing_routing = data.get('routing_decisions', {})
+        except Exception as e:
+            logger.warning(f"Failed to load existing feature selection routing: {e}")
+    
+    # Normalize view (default to CROSS_SECTIONAL if not provided)
+    # SST: Use View.from_string() for consistent normalization
+    try:
+        view_normalized = View.from_string(view).value if view else View.CROSS_SECTIONAL.value
+    except (ValueError, AttributeError):
+        view_normalized = View.CROSS_SECTIONAL.value
+    
+    # Create key with view: target:view (e.g., "fwd_ret_5d:CROSS_SECTIONAL")
+    routing_key = f"{target}:{view_normalized}"
+    
+    # Update with this target's routing decision (lightweight - just key info)
+    existing_routing[routing_key] = {
+        'confidence': conf.get('confidence', 'LOW'),
+        'score_tier': conf.get('score_tier', 'LOW'),
+        'bucket': routing.get('bucket', 'experimental'),
+        'allowed_in_production': routing.get('allowed_in_production', False),
+        'view': view_normalized,  # Add view information
+        # Reference to per-target file for full details
+        'details_path': f"targets/{target_clean}/decision/routing_decision.json"
+    }
+    
+    # Save updated feature selection routing summary
+    routing_data_globals = {
+        'routing_decisions': existing_routing,
+        'summary': {
+            'total_targets': len(existing_routing),
+            'high_confidence': sum(1 for r in existing_routing.values() if r.get('confidence') == 'HIGH'),
+            'medium_confidence': sum(1 for r in existing_routing.values() if r.get('confidence') == 'MEDIUM'),
+            'low_confidence': sum(1 for r in existing_routing.values() if r.get('confidence') == 'LOW'),
+            'production_allowed': sum(1 for r in existing_routing.values() if r.get('allowed_in_production', False))
+        }
+    }
+    
+    # SST: Use write_atomic_json for atomic write with canonical serialization
+    from TRAINING.common.utils.file_utils import write_atomic_json
+    write_atomic_json(feature_routing_file, routing_data_globals)
+    
+    logger.info(f"Updated feature selection routing summary in {feature_routing_file}")
+

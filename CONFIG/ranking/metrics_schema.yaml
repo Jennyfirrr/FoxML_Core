@@ -1,0 +1,170 @@
+# Task-Specific Metrics Schema
+# Defines which metrics are valid for each task type
+#
+# Keys are actual JSON field names persisted in metrics.json (not display names)
+# Schema loaded once and cached via @lru_cache
+
+regression:
+  # Distribution stats for continuous targets
+  target_stats:
+    - y_mean
+    - y_std
+    - y_min
+    - y_max
+    - y_finite_pct
+  # Fields that should NEVER appear for regression
+  exclude:
+    - pos_rate
+    - class_balance
+    - precision
+    - recall
+    - f1
+
+binary_classification:
+  # Class balance stats for binary targets
+  target_stats:
+    - pos_rate        # Fraction of samples with pos_label
+    - class_balance   # Dict of {label: count}
+  # Default positive label (override in TaskSpec if needed)
+  pos_label: 1
+  # Fields that should NEVER appear for binary classification
+  exclude:
+    - y_mean
+    - y_std
+    - y_min
+    - y_max
+    - r2
+    - rmse
+    - mae
+
+multiclass_classification:
+  # Class balance stats for multiclass targets
+  target_stats:
+    - class_balance   # Dict of {label: count}
+    - n_classes       # Number of unique classes
+  # pos_rate is NOT emitted for multiclass (use class_balance instead)
+  exclude:
+    - pos_rate
+    - y_mean
+    - y_std
+    - y_min
+    - y_max
+    - r2
+    - rmse
+    - mae
+
+# =============================================================================
+# Canonical Metric Naming
+# =============================================================================
+# Format: <metric_base>__<view>__<aggregation>
+# - view: cs (cross-sectional) or sym (symbol-specific)
+# - aggregation: mean, std, pooled
+#
+# This eliminates the overloaded "auc" field that stored different metrics
+# depending on task type (R2 for regression, ROC-AUC for binary, etc.)
+
+canonical_names:
+  regression:
+    cross_sectional:
+      # Rank IC (Spearman correlation per timestamp, averaged over time)
+      primary: spearman_ic__cs__mean
+      std: spearman_ic__cs__std
+      secondary:
+        - r2__cs__pooled
+        - mae__cs__pooled
+    symbol_specific:
+      # R2 per symbol over time, averaged across symbols
+      primary: r2__sym__mean
+      std: r2__sym__std
+      secondary:
+        - spearman_corr__sym__mean
+        - rmse__sym__mean
+  
+  binary_classification:
+    cross_sectional:
+      # ROC-AUC per timestamp, averaged over time
+      primary: roc_auc__cs__mean
+      std: roc_auc__cs__std
+      secondary:
+        - pr_auc__cs__mean
+        - log_loss__cs__mean
+    symbol_specific:
+      # ROC-AUC per symbol over time, averaged across symbols
+      primary: roc_auc__sym__mean
+      std: roc_auc__sym__std
+      secondary:
+        - pr_auc__sym__mean
+  
+  multiclass_classification:
+    cross_sectional:
+      primary: accuracy__cs__mean
+      std: accuracy__cs__std
+      secondary:
+        - macro_f1__cs__mean
+    symbol_specific:
+      primary: accuracy__sym__mean
+      std: accuracy__sym__std
+
+# =============================================================================
+# Scoring Configuration (P1 - Phase 3.1)
+# =============================================================================
+# Versioned parameters for composite score calculation.
+# Hash of this section becomes scoring_signature for reproducibility.
+#
+# Phase 3.1 fixes:
+# - SE-based stability (not std-based) for cross-family comparability
+# - Skill-gated composite (skill * quality, not additive)
+# - Classification centering (AUC-excess, not raw AUC)
+# - Deterministic invalid slice filtering
+
+scoring:
+  version: "1.2"  # Bump for eligibility gates and quality formula change (removed stability from quality)
+  
+  # Skill normalization via t-stat
+  # skill_tstat = mean / (std / sqrt(n)) = mean / se
+  # skill_score_01 = sigmoid(skill_tstat / skill_squash_k)
+  skill_squash_k: 3.0  # Higher = more compression toward 0.5
+  tcap: 12.0  # Clamp t-stat to [-tcap, tcap] to prevent extreme values
+  se_floor: 1e-6  # Minimum SE to prevent division by zero
+  
+  # Stability normalization (SE-based, not std-based for cross-family comparability)
+  # stability = 1 - clamp(se / se_ref, 0, 1)
+  se_ref: 0.02  # Reference SE for normalization
+  se_ref_by_task:
+    regression: 0.02
+    binary_classification: 0.015
+    multiclass_classification: 0.02
+  
+  # Invalid slice filtering
+  min_samples_per_slice: 10  # Minimum samples per slice (timestamp or symbol)
+  
+  # Component weights (for quality = coverage × registry × sample_size)
+  # w_stab removed: stability no longer in quality (SE already in t-stat)
+  # Quality is now: coverage × registry × sample_size (multiplicative, not weighted sum)
+  weights:
+    w_cov: 0.3  # Coverage weight (kept for backward compatibility, not used in new formula)
+    # w_stab removed: stability no longer in quality (SE already in t-stat)
+  
+  # Composite form: skill * quality (prevents no-skill targets from ranking high)
+  composite_form: "skill_times_quality_v1"
+  
+  # Primary metric by task type (for t-stat computation)
+  # Both are centered at null baseline ≈ 0
+  primary_metric_by_type:
+    regression: "spearman_ic"  # Null baseline ≈ 0
+    classification: "auc_excess"  # Null baseline ≈ 0 (AUC - 0.5)
+  
+  # Model bonus (multiplicative boost for model agreement)
+  model_bonus:
+    enabled: true
+    max_bonus: 0.10    # Maximum 10% boost
+    per_model: 0.02    # 2% per model
+  
+  # Eligibility gates (hard requirements for ranking)
+  eligibility:
+    registry_coverage_warn_threshold: 0.95  # Advisory threshold for logging/warnings (does not block ranking)
+    enforce_registry_coverage_gate: false   # Set to true to block ranking when coverage < threshold (default: false, advisory only)
+    require_registry_coverage_in_eval: true  # NEW: In eval mode, require registry_coverage_rate (None fails gate)
+    min_n_for_ranking: 20  # Hard gate: n_slices_valid < this → invalid_for_ranking
+    min_n_for_full_quality: 30  # Soft penalty threshold: n < this gets quality penalty (but still valid if >= min_n_for_ranking)
+    # Optional: Add min_n_effective_for_ranking or min_date_span_days for future enhancement

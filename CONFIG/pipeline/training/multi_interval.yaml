@@ -1,0 +1,30 @@
+# Multi-Interval Experiment Configuration
+# Defaults for running experiments across multiple data intervals
+#
+# These defaults are used when no experiment config is provided.
+# Experiment configs (CONFIG/experiments/*.yaml) can override these.
+
+# Intervals to train at (in minutes)
+intervals: [5]  # Default to 5m only
+
+# Primary interval for comparison baseline
+primary_interval: 5
+
+# Cross-interval validation settings
+cross_validation:
+  enabled: false  # Disabled by default
+  train_intervals: [5]  # Train at 5m
+  validate_intervals: [1, 5, 15]  # Validate across intervals
+
+# Feature transfer settings (warm-start from coarser intervals)
+feature_transfer:
+  enabled: false  # Disabled by default
+  source_interval: null  # Transfer FROM this interval (e.g., 15)
+  target_interval: null  # Transfer TO this interval (e.g., 5)
+  transfer_method: warm_start  # "warm_start" or "feature_projection"
+
+# Comparison settings
+comparison:
+  metrics: [auc, ic, sharpe]
+  primary_metric: auc
+  generate_report: true

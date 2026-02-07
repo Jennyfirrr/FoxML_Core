@@ -1,0 +1,73 @@
+# XGBoost Model Configuration
+# Optimized for large-scale datasets (10M+ rows)
+
+model_family: "XGBoost"
+description: "Gradient Boosting - large-scale optimized"
+
+# LARGE-SCALE NOTES (70M rows):
+# - Higher min_child_weight prevents overfitting (like min_data_in_leaf)
+# - tree_method: "hist" is critical for speed on large data
+# - Slower learning rate = more trees = better ensemble
+
+hyperparameters:
+  # Tree structure - moderate depth, strong leaf constraints
+  max_depth: 9              # Moderate depth
+  min_child_weight: 100     # HIGH - prevents overfitting on large data
+  gamma: 0.5                # Min split gain
+
+  # Feature/sample sampling
+  subsample: 0.8
+  colsample_bytree: 0.7
+
+  # Regularization - strong for large datasets
+  reg_alpha: 0.1            # L1 regularization
+  reg_lambda: 1.0           # L2 regularization (stronger)
+
+  # Learning
+  learning_rate: 0.02       # Slower = more trees = better
+  n_estimators: 2000        # High limit, early stopping will cap
+  early_stopping_rounds: 50
+
+  # Performance - CRITICAL for large data
+  tree_method: "hist"       # Histogram-based (fast for large data)
+  n_jobs: -1                # Use all cores
+  verbosity: 0
+
+# Variants for different use cases
+variants:
+  # For quick ranking/feature selection
+  lightweight:
+    max_depth: 6
+    min_child_weight: 20
+    learning_rate: 0.05
+    n_estimators: 300
+    early_stopping_rounds: 20
+    reg_lambda: 0.1
+
+  # Small datasets (<1M rows)
+  small_data:
+    max_depth: 7
+    min_child_weight: 10
+    learning_rate: 0.03
+    n_estimators: 1000
+    early_stopping_rounds: 50
+    reg_lambda: 0.5
+
+  # Large datasets (10M+ rows) - DEFAULT behavior
+  large_scale:
+    max_depth: 9
+    min_child_weight: 100
+    learning_rate: 0.02
+    n_estimators: 2000
+    early_stopping_rounds: 50
+    reg_lambda: 1.0
+
+  # Very large datasets (50M+ rows)
+  very_large:
+    max_depth: 10
+    min_child_weight: 500
+    learning_rate: 0.01
+    n_estimators: 3000
+    early_stopping_rounds: 100
+    reg_alpha: 0.5
+    reg_lambda: 2.0

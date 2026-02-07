@@ -1,0 +1,160 @@
+name: foxml_env
+channels:
+  - conda-forge
+  - defaults
+  - pytorch
+  - nvidia
+
+dependencies:
+  # Python
+  - python=3.10
+
+  # Core Scientific Computing
+  - numpy>=2.0.0,<3.0.0  # Tested with 2.2.6
+  - pandas>=2.0.0,<3.0.0  # Tested with 2.3.3
+  - scipy>=1.10.0,<2.0.0  # Tested with 1.15.3
+  
+  # Data Handling & Storage
+  - pyarrow>=20.0.0  # Tested with 22.0.0
+  - fastparquet>=2024.0.0  # Tested with 2024.11.0
+  - h5py>=3.15.0  # Tested with 3.15.1
+  - tables>=3.8.0
+  
+  # Machine Learning Core
+  - scikit-learn>=1.7.0  # Tested with 1.7.2
+  - joblib>=1.5.0  # Tested with 1.5.2
+  
+  # Deep Learning (Optional - if using neural networks)
+  - pytorch>=2.0.0
+  - torchvision>=0.15.0
+  - pytorch-cuda=12.1  # Match your CUDA version (13.0 compatible)
+  
+  # TensorFlow (with CUDA support)
+  - tensorflow>=2.19.0  # Tested with 2.19.1 (CUDA 12.9)
+  - keras>=3.12.0  # Tested with 3.12.0
+  
+  # XGBoost (must be built from source with CUDA for GPU support)
+  # See SCRIPTS/build_xgboost_cuda.sh
+  # Tested with 3.2.0-dev (built from source)
+  
+  # Statistical & Time Series
+  - statsmodels>=0.14.0
+  - ta-lib>=0.4.0  # Technical analysis
+  
+  # Visualization
+  - matplotlib>=3.10.0  # Tested with 3.10.7
+  - seaborn>=0.12.0
+  - plotly>=6.0.0  # Tested with 6.4.0
+  
+  # Configuration & Utilities
+  - pyyaml>=6.0
+  - toml>=0.10.0
+  - python-dotenv>=1.0.0
+  
+  # Progress Bars & Logging
+  - tqdm>=4.65.0
+  - colorlog>=6.7.0
+  
+  # System Utilities
+  - psutil>=7.0.0  # Tested with 7.0.0
+  
+  # Financial Data
+  # NOTE: Market data libraries are NOT included. Production customers are expected to plug in their own data feeds.
+  # FoxML Core is a pipeline infrastructure, not a data provider.
+  
+  # API & Networking
+  - requests>=2.31.0
+  - aiohttp>=3.8.0
+  - websockets>=11.0
+  
+  # Database (if needed)
+  - sqlalchemy>=2.0.0
+  - psycopg2>=2.9.0
+  
+  # Jupyter & Development Tools
+  - jupyter>=1.0.0
+  - jupyterlab>=4.0.0
+  - ipython>=8.12.0
+  - ipywidgets>=8.0.0
+  
+  # Testing
+  - pytest>=7.3.0
+  - pytest-cov>=4.1.0
+  
+  # Code Quality
+  - black>=23.0.0
+  - ruff>=0.0.270
+  - mypy>=1.3.0
+  
+  # Build Tools (for LightGBM CUDA build)
+  - cmake>=3.26.0
+  - make
+  - gcc_linux-64>=11.0.0
+  - gxx_linux-64>=11.0.0
+  
+  # CUDA Toolkit (matches system CUDA 12.9)
+  - cuda-toolkit=12.9  # Tested with CUDA 12.9
+  - cuda-nvcc=12.9  # For building XGBoost/LightGBM with CUDA
+  - cudnn>=8.9.0
+  
+  # Pip packages (installed via pip after conda)
+  - pip>=23.0.0
+  
+  # Pip-only packages
+  - pip:
+    # Broker and execution adapters are NOT included in this environment.
+    # FoxML Core is broker-agnostic; production execution is handled via internal/commercial adapters.
+    # Trading integration modules have been removed from the core repository.
+    
+    # Additional ML Libraries
+    - ngboost>=0.4.0
+    - optuna>=3.2.0  # Hyperparameter optimization
+    - shap>=0.42.0  # Model explainability
+    
+    # Time Series Specific
+    - arch>=6.2.0  # ARCH/GARCH models
+    
+    # Monitoring & Alerts
+    - ntfy>=2.7.0  # Notifications
+    
+    # Additional utilities
+    - python-dateutil>=2.8.2
+    - pytz>=2023.3
+    
+    # Polars (for efficient cross-sectional data processing)
+    - polars>=1.35.0  # Tested with 1.35.2
+    
+    # NOTE: LightGBM with CUDA must be built from source
+    # Do NOT install lightgbm via pip - it's CPU only
+    # After creating this environment, build LightGBM with:
+    #   bash SCRIPTS/build_lightgbm_cuda.sh
+    #
+    # NOTE: XGBoost with CUDA must be built from source
+    # Do NOT install xgboost via pip/conda - GPU support not available
+    # After creating this environment, build XGBoost with:
+    #   bash SCRIPTS/build_xgboost_cuda.sh
+
+# Post-installation instructions:
+# 1. Create environment:
+#    conda env create -f environment.yml
+#
+# 2. Activate environment:
+#    conda activate foxml_env
+#
+# 3. Set MKL threading layer to avoid OpenMP conflicts:
+#    export MKL_THREADING_LAYER=GNU
+#    (This prevents Intel OpenMP conflicts with LightGBM/XGBoost)
+#    (Or add to ~/.bashrc/.zshrc for persistence)
+#
+# 4. Build LightGBM with CUDA (RTX 3080):
+#    bash SCRIPTS/build_lightgbm_cuda.sh
+#
+# 5. Build XGBoost with CUDA (RTX 3080):
+#    bash SCRIPTS/build_xgboost_cuda.sh
+#
+# 6. Verify GPU setup:
+#    python SCRIPTS/check_gpu_setup.py
+#
+# 7. Test feature selection:
+#    python SCRIPTS/select_features.py --symbols AAPL
+
