@@ -398,6 +398,33 @@ class ModelLoader:
             "sequence_normalization": metadata.get("sequence_normalization", "returns"),
         }
 
+    def get_cs_ranking_config(
+        self,
+        target: str,
+        family: str,
+        view: str = "CROSS_SECTIONAL",
+    ) -> Dict[str, Any]:
+        """
+        Get cross-sectional ranking configuration for a model.
+
+        CONTRACT: INTEGRATION_CONTRACTS.md v1.4
+        Returns the cross_sectional_ranking block from model_meta.json,
+        or empty dict if model is not CS-ranked.
+
+        Args:
+            target: Target name
+            family: Model family name
+            view: View type
+
+        Returns:
+            CS ranking config dict, or {} if not a CS ranking model.
+        """
+        _, metadata = self.load_model(target, family, view)
+        cs_config = metadata.get("cross_sectional_ranking")
+        if cs_config and cs_config.get("enabled", False):
+            return dict(cs_config)
+        return {}
+
     def get_feature_list(
         self,
         target: str,

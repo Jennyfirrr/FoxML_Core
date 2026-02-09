@@ -62,6 +62,7 @@ from LIVE_TRADING.common.types import (
 )
 from LIVE_TRADING.brokers.interface import Broker
 from LIVE_TRADING.prediction.predictor import MultiHorizonPredictor
+from LIVE_TRADING.prediction.cs_ranking_predictor import CrossSectionalRankingPredictor
 from LIVE_TRADING.blending.horizon_blender import HorizonBlender
 from LIVE_TRADING.arbitration.horizon_arbiter import HorizonArbiter
 from LIVE_TRADING.gating.barrier_gate import BarrierGate
@@ -224,6 +225,16 @@ class TradingEngine:
             # No predictor - engine will only work for testing without predictions
             self.predictor = None
             logger.warning("No predictor or run_root provided - engine in limited mode")
+
+        # CS ranking predictor (wraps the regular predictor)
+        if self.predictor is not None:
+            self.cs_predictor = CrossSectionalRankingPredictor(
+                loader=self.predictor.loader,
+                engine=self.predictor.engine,
+                predictor=self.predictor,
+            )
+        else:
+            self.cs_predictor = None
 
         self.blender = HorizonBlender()
         self.arbiter = HorizonArbiter()
@@ -691,10 +702,43 @@ class TradingEngine:
                 kill_switch_reason=risk_status.kill_switch_reason,
             )
 
+        # CS ranking pre-prediction: collect and rank all symbols cross-sectionally
+        cs_ranked_preds: Dict[str, Any] = {}
+        if self.cs_predictor and self.predictor:
+            target = self.targets[0] if self.targets else self.config.default_target
+            cs_families = self.cs_predictor.get_cs_families(target)
+            if cs_families:
+                self._set_stage("prediction")
+                universe: Dict[str, Any] = {}
+                adv_map: Dict[str, float] = {}
+                for sym in symbols:
+                    try:
+                        universe[sym] = self.data_provider.get_historical(sym, period="1mo")
+                        adv_map[sym] = self.data_provider.get_adv(sym)
+                    except Exception as e:
+                        logger.debug(f"CS ranking: no data for {sym}: {e}")
+                try:
+                    cs_ranked_preds = self.cs_predictor.predict(
+                        target=target,
+                        universe=universe,
+                        horizons=self.config.horizons,
+                        data_timestamp=current_time,
+                        adv_map=adv_map,
+                    )
+                    if cs_ranked_preds:
+                        logger.info(
+                            f"CS ranking: ranked {len(cs_ranked_preds)} symbols "
+                            f"across {len(cs_families)} families"
+                        )
+                except Exception as e:
+                    logger.warning(f"CS ranking pre-prediction failed: {e}")
+
         # Process each symbol
         for symbol in symbols:
             try:
-                decision = self._process_symbol(symbol, current_time)
+                decision = self._process_symbol(
+                    symbol, current_time, cs_ranked_preds.get(symbol)
+                )
                 decisions.append(decision)
 
                 # Execute if TRADE
@@ -757,6 +801,7 @@ class TradingEngine:
         self,
         symbol: str,
         current_time: datetime,
+        cs_predictions: Optional[Any] = None,
     ) -> TradeDecision:
         """
         Process a single symbol through the pipeline.
@@ -764,6 +809,7 @@ class TradingEngine:
         Args:
             symbol: Trading symbol
             current_time: Current timestamp
+            cs_predictions: Pre-computed CS ranking AllPredictions (optional)
 
         Returns:
             TradeDecision
@@ -853,6 +899,15 @@ class TradingEngine:
         except Exception as e:
             logger.warning(f"Prediction failed for {symbol}: {e}")
             return self._create_hold_decision(symbol, f"prediction_error: {e}", current_time, trace)
+
+        # Merge CS ranking predictions into pointwise predictions
+        if cs_predictions is not None:
+            for horizon, cs_hp in sorted_items(cs_predictions.horizons):
+                if horizon in all_preds.horizons:
+                    # Add CS families alongside pointwise families
+                    all_preds.horizons[horizon].predictions.update(cs_hp.predictions)
+                else:
+                    all_preds.horizons[horizon] = cs_hp
 
         # Update trace with predictions
         if trace:

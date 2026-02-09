@@ -13,6 +13,7 @@ from .predictor import (
     HorizonPredictions,
     AllPredictions,
 )
+from .cs_ranking_predictor import CrossSectionalRankingPredictor
 
 __all__ = [
     "ZScoreStandardizer",
@@ -23,4 +24,5 @@ __all__ = [
     "ModelPrediction",
     "HorizonPredictions",
     "AllPredictions",
+    "CrossSectionalRankingPredictor",
 ]
