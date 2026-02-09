@@ -18,6 +18,8 @@ import pandas as pd
 from CONFIG.config_loader import get_cfg
 from TRAINING.common.utils.determinism_ordering import sorted_items
 
+from TRAINING.training_strategies.utils import _normalize_ohlcv_sequence
+
 from LIVE_TRADING.common.constants import HORIZONS
 from LIVE_TRADING.models.loader import ModelLoader
 from LIVE_TRADING.models.inference import InferenceEngine
@@ -338,7 +340,15 @@ class MultiHorizonPredictor:
         family: str,
     ) -> Optional[np.ndarray]:
         """
-        Prepare raw OHLCV sequence for inference. Implemented in Phase 2.
+        Prepare raw OHLCV sequence for inference.
+
+        Extracts OHLCV columns from prices DataFrame, applies the same
+        normalization used during training (SST), and returns the latest
+        normalized bar to push into the ring buffer one bar at a time.
+
+        CONTRACT: INTEGRATION_CONTRACTS.md v1.3
+        - sequence_normalization must match training
+        - sequence_channels must be ["open", "high", "low", "close", "volume"]
 
         Args:
             prices: OHLCV DataFrame
@@ -346,12 +356,49 @@ class MultiHorizonPredictor:
             family: Model family
 
         Returns:
-            Normalized OHLCV bar (5,) or None
+            Normalized OHLCV bar (5,) or None on error
         """
-        raise NotImplementedError(
-            f"Raw OHLCV preparation not yet implemented for {family}/{target}. "
-            f"See .claude/plans/live-phase2-raw-ohlcv-inference.md"
-        )
+        seq_config = self.loader.get_sequence_config(target, family)
+        if not seq_config:
+            logger.error(f"No sequence config for {target}:{family}")
+            return None
+
+        seq_len = seq_config["sequence_length"]
+        normalization = seq_config["sequence_normalization"]
+        channels = seq_config["sequence_channels"]
+
+        # Map channel names to DataFrame columns (case-insensitive)
+        col_map = {}
+        for ch in channels:
+            matched = next(
+                (c for c in prices.columns if c.lower() == ch.lower()), None
+            )
+            col_map[ch] = matched
+
+        missing = [ch for ch in channels if col_map[ch] is None]
+        if missing:
+            logger.error(f"Missing OHLCV columns for {target}:{family}: {missing}")
+            return None
+
+        # Extract columns in channel order; +1 for normalization context
+        ohlcv_cols = [col_map[ch] for ch in channels]
+        ohlcv_df = prices[ohlcv_cols].tail(seq_len + 1)
+
+        if len(ohlcv_df) < 2:
+            logger.warning(
+                f"Insufficient data for {target}:{family}: "
+                f"need >= 2 bars, got {len(ohlcv_df)}"
+            )
+            return None
+
+        ohlcv_array = ohlcv_df.values.astype(np.float32)
+
+        # Normalize using the SST function from TRAINING
+        normalized = _normalize_ohlcv_sequence(ohlcv_array, method=normalization)
+
+        # Return the latest bar as a 1D array to push into the ring buffer.
+        # The buffer accumulates bars over time; we push one per cycle.
+        return normalized[-1]  # shape: (5,)
 
     def _predict_single(
         self,
