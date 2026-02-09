@@ -58,7 +58,7 @@ impl TrainingLauncherView {
 
     /// Scan CONFIG/experiments/ for available configs
     fn scan_configs(&mut self) {
-        let config_dir = PathBuf::from("CONFIG/experiments");
+        let config_dir = crate::config::config_dir().join("experiments");
         if !config_dir.exists() {
             self.configs = vec!["production_baseline".to_string()];
             return;
@@ -94,7 +94,7 @@ impl TrainingLauncherView {
         let config_name = self.configs.get(self.selected_config)
             .map(|s| s.as_str())
             .unwrap_or("run");
-        self.output_dir = format!("RESULTS/{}_{}", config_name, now.format("%Y%m%d_%H%M"));
+        self.output_dir = format!("{}/{}_{}", crate::config::results_dir().display(), config_name, now.format("%Y%m%d_%H%M"));
     }
 
     /// Get the command that will be run
@@ -358,7 +358,8 @@ impl super::ViewTrait for TrainingLauncherView {
         Ok(())
     }
 
-    fn handle_key(&mut self, key: KeyCode) -> Result<bool> {
+    fn handle_key(&mut self, key: KeyCode) -> Result<super::ViewAction> {
+        use super::ViewAction;
         // Handle output editing mode
         if self.editing_output {
             match key {
@@ -377,7 +378,7 @@ impl super::ViewTrait for TrainingLauncherView {
                 }
                 _ => {}
             }
-            return Ok(false);
+            return Ok(ViewAction::Continue);
         }
 
         // Clear message on any key
@@ -386,7 +387,7 @@ impl super::ViewTrait for TrainingLauncherView {
         // Normal navigation
         match key {
             KeyCode::Char('q') | KeyCode::Esc => {
-                return Ok(true); // Go back
+                return Ok(ViewAction::Back);
             }
             KeyCode::Tab => {
                 // Cycle focus
@@ -458,6 +459,6 @@ impl super::ViewTrait for TrainingLauncherView {
             _ => {}
         }
 
-        Ok(false)
+        Ok(ViewAction::Continue)
     }
 }

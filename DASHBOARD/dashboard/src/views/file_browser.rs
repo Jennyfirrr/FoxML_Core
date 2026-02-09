@@ -6,6 +6,7 @@ use anyhow::Result;
 use crossterm::event::KeyCode;
 use ratatui::prelude::*;
 use ratatui::widgets::*;
+use chrono::{DateTime, Local};
 use std::fs;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -69,19 +70,9 @@ impl FileEntry {
 
     fn modified_str(&self) -> String {
         self.modified
-            .and_then(|t| {
-                t.duration_since(SystemTime::UNIX_EPOCH)
-                    .ok()
-                    .map(|d| {
-                        let secs = d.as_secs();
-                        // Simple date formatting
-                        let days = secs / 86400;
-                        let years = days / 365 + 1970;
-                        let day_of_year = days % 365;
-                        let month = day_of_year / 30 + 1;
-                        let day = day_of_year % 30 + 1;
-                        format!("{:04}-{:02}-{:02}", years, month.min(12), day.min(31))
-                    })
+            .map(|t| {
+                let dt: DateTime<Local> = t.into();
+                dt.format("%Y-%m-%d %H:%M").to_string()
             })
             .unwrap_or_else(|| "-".to_string())
     }
@@ -258,16 +249,68 @@ impl FileBrowserView {
     }
 
     /// Enter selected directory or open file
-    fn enter_selected(&mut self) {
+    fn enter_selected(&mut self) -> super::ViewAction {
         if self.entries.is_empty() {
-            return;
+            return super::ViewAction::Continue;
         }
 
         let entry = &self.entries[self.selected];
         if entry.is_dir {
             self.navigate_to(entry.path.clone());
+            return super::ViewAction::Continue;
         }
-        // For files, we could open in config editor if it's a config file
+
+        // Check if it's a text file we can open in an editor
+        if self.is_text_file(&entry.path) {
+            let abs_path = if entry.path.is_absolute() {
+                entry.path.clone()
+            } else {
+                std::env::current_dir()
+                    .unwrap_or_default()
+                    .join(&entry.path)
+            };
+            return super::ViewAction::SpawnEditor(abs_path);
+        }
+
+        // Binary file — can't open
+        super::ViewAction::Continue
+    }
+
+    /// Check if a file is likely a text file based on extension
+    fn is_text_file(&self, path: &PathBuf) -> bool {
+        let extension = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+
+        matches!(
+            extension.as_str(),
+            "txt"
+                | "md"
+                | "rs"
+                | "py"
+                | "yaml"
+                | "yml"
+                | "toml"
+                | "json"
+                | "sh"
+                | "bash"
+                | "css"
+                | "html"
+                | "js"
+                | "ts"
+                | "tsx"
+                | "jsx"
+                | "sql"
+                | "log"
+                | "cfg"
+                | "conf"
+                | "ini"
+                | "lock"
+                | "xml"
+                | "csv"
+                | ""
+        )
     }
 
     /// Render file list
@@ -465,10 +508,11 @@ impl super::ViewTrait for FileBrowserView {
         Ok(())
     }
 
-    fn handle_key(&mut self, key: KeyCode) -> Result<bool> {
+    fn handle_key(&mut self, key: KeyCode) -> Result<super::ViewAction> {
+        use super::ViewAction;
         match key {
             KeyCode::Char('q') | KeyCode::Esc => {
-                return Ok(true); // Go back
+                return Ok(ViewAction::Back);
             }
             // Navigation
             KeyCode::Up | KeyCode::Char('k') => {
@@ -495,7 +539,7 @@ impl super::ViewTrait for FileBrowserView {
                 self.preview_scroll = (self.preview_scroll + 10).min(max_scroll);
             }
             KeyCode::Enter => {
-                self.enter_selected();
+                return Ok(self.enter_selected());
             }
             KeyCode::Backspace => {
                 // Go to parent
@@ -513,14 +557,14 @@ impl super::ViewTrait for FileBrowserView {
                 self.refresh_entries();
             }
             // Quick jumps
-            KeyCode::Char('1') => self.navigate_to(PathBuf::from("CONFIG")),
-            KeyCode::Char('2') => self.navigate_to(PathBuf::from("RESULTS")),
-            KeyCode::Char('3') => self.navigate_to(PathBuf::from("TRAINING")),
-            KeyCode::Char('4') => self.navigate_to(PathBuf::from("LIVE_TRADING")),
-            KeyCode::Char('5') => self.navigate_to(PathBuf::from("DASHBOARD")),
+            KeyCode::Char('1') => self.navigate_to(crate::config::config_dir()),
+            KeyCode::Char('2') => self.navigate_to(crate::config::results_dir()),
+            KeyCode::Char('3') => self.navigate_to(crate::config::project_root().join("TRAINING")),
+            KeyCode::Char('4') => self.navigate_to(crate::config::project_root().join("LIVE_TRADING")),
+            KeyCode::Char('5') => self.navigate_to(crate::config::project_root().join("DASHBOARD")),
             _ => {}
         }
 
-        Ok(false)
+        Ok(ViewAction::Continue)
     }
 }

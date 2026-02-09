@@ -6,6 +6,7 @@
 use anyhow::Result;
 use ratatui::prelude::*;
 use ratatui::widgets::*;
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -18,10 +19,10 @@ use crate::ui::borders::Separators;
 use crate::ui::panels::Panel;
 
 /// Path to training events file (written by Python TrainingEventEmitter)
-const TRAINING_EVENTS_FILE: &str = "/tmp/foxml_training_events.jsonl";
+fn training_events_file() -> PathBuf { crate::config::training_events_file() }
 
 /// Path to PID file for process detection
-const TRAINING_PID_FILE: &str = "/tmp/foxml_training.pid";
+fn training_pid_file() -> PathBuf { crate::config::training_pid_file() }
 
 /// Information from PID file
 struct PidInfo {
@@ -44,6 +45,9 @@ pub struct TrainingRun {
     targets_total: i64,
 }
 
+/// How long before a cached scan is considered stale (seconds)
+const SCAN_STALENESS_SECS: u64 = 60;
+
 /// Training view - training pipeline monitoring
 pub struct TrainingView {
     runs: Vec<TrainingRun>,
@@ -62,6 +66,9 @@ pub struct TrainingView {
     live_targets_total: i64,
     live_message: Option<String>,
     is_monitoring: bool,
+    // Throughput tracking (4d)
+    target_completion_times: VecDeque<std::time::Instant>,
+    last_stage_for_throughput: String,
 }
 
 impl TrainingView {
@@ -81,6 +88,8 @@ impl TrainingView {
             live_targets_total: 0,
             live_message: None,
             is_monitoring: false,
+            target_completion_times: VecDeque::with_capacity(20),
+            last_stage_for_throughput: String::new(),
         };
         // Auto-scan on initialization
         let _ = view.scan_runs();
@@ -100,7 +109,7 @@ impl TrainingView {
 
     /// Recover current training state from existing events file
     fn recover_current_state(&mut self) {
-        let file = match fs::File::open(TRAINING_EVENTS_FILE) {
+        let file = match fs::File::open(&training_events_file()) {
             Ok(f) => f,
             Err(_) => {
                 self.event_file_pos = 0;
@@ -177,7 +186,7 @@ impl TrainingView {
     fn read_new_events(&mut self) -> Vec<TrainingEvent> {
         let mut events = Vec::new();
 
-        let file = match fs::File::open(TRAINING_EVENTS_FILE) {
+        let file = match fs::File::open(&training_events_file()) {
             Ok(f) => f,
             Err(_) => return events, // File doesn't exist yet
         };
@@ -226,13 +235,24 @@ impl TrainingView {
                 self.live_message = event.message.clone();
             }
             "stage_change" => {
-                self.live_stage = event.effective_stage().to_string();
+                let new_stage = event.effective_stage().to_string();
+                // Reset throughput tracking on stage change
+                if new_stage != self.last_stage_for_throughput {
+                    self.target_completion_times.clear();
+                    self.last_stage_for_throughput = new_stage.clone();
+                }
+                self.live_stage = new_stage;
             }
             "target_start" => {
                 self.live_current_target = event.target.clone();
             }
             "target_complete" => {
                 self.live_targets_complete = event.targets_complete;
+                // Track completion time for throughput calculation
+                if self.target_completion_times.len() >= 20 {
+                    self.target_completion_times.pop_front();
+                }
+                self.target_completion_times.push_back(std::time::Instant::now());
             }
             "run_complete" => {
                 // Clear live state on completion
@@ -453,7 +473,7 @@ impl TrainingView {
             // Verify the process is still running
             if run_info.is_alive {
                 // Try to get output dir from the events file
-                if let Ok(content) = fs::read_to_string(TRAINING_EVENTS_FILE) {
+                if let Ok(content) = fs::read_to_string(&training_events_file()) {
                     // Find events for this run_id
                     for line in content.lines().rev() {
                         if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
@@ -499,7 +519,7 @@ impl TrainingView {
 
     /// Read PID file and check if process is alive
     fn read_pid_file() -> Option<PidInfo> {
-        let content = fs::read_to_string(TRAINING_PID_FILE).ok()?;
+        let content = fs::read_to_string(&training_pid_file()).ok()?;
         let json: serde_json::Value = serde_json::from_str(&content).ok()?;
 
         let pid = json.get("pid")?.as_u64()? as u32;
@@ -552,6 +572,84 @@ impl TrainingView {
         path_str.to_string()
     }
 
+    // ── Public methods for app.rs integration ─────────────────────
+
+    /// Get the PID and run_id of the currently running training process (if any)
+    pub fn running_pid(&self) -> Option<(u32, String)> {
+        if let Some(info) = Self::read_pid_file() {
+            if info.is_alive {
+                return Some((info.pid, info.run_id));
+            }
+        }
+        None
+    }
+
+    /// Get the selected run's run_id
+    pub fn selected_run_id(&self) -> Option<&str> {
+        self.runs.get(self.selected).map(|r| r.run_id.as_str())
+    }
+
+    /// Check if the selected run is currently running
+    pub fn is_selected_running(&self) -> bool {
+        self.runs.get(self.selected).map_or(false, |r| r.status == "running")
+    }
+
+    /// Cancel a training run by PID (send SIGTERM)
+    pub fn cancel_run(&mut self, pid: u32) -> Result<String> {
+        let output = std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .output()?;
+
+        if output.status.success() {
+            // Update UI state
+            if let Some(run_id) = &self.live_run_id {
+                let msg = format!("Sent SIGTERM to training run {} (PID {})", run_id, pid);
+                self.live_message = Some(format!("Cancelling... (PID {})", pid));
+                Ok(msg)
+            } else {
+                Ok(format!("Sent SIGTERM to PID {}", pid))
+            }
+        } else {
+            let err = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("Failed to send SIGTERM to PID {}: {}", pid, err)
+        }
+    }
+
+    /// Maybe rescan if cached results are stale (used for background staleness)
+    pub fn maybe_rescan(&mut self) {
+        if self.last_scan.elapsed().as_secs() >= SCAN_STALENESS_SECS {
+            let _ = self.scan_runs();
+        }
+    }
+
+    /// Compute current throughput (targets per minute) and ETA
+    fn throughput_and_eta(&self) -> Option<(f64, f64)> {
+        if self.target_completion_times.len() < 3 {
+            return None; // Not enough data
+        }
+        let first = self.target_completion_times.front()?;
+        let last = self.target_completion_times.back()?;
+        let elapsed_secs = last.duration_since(*first).as_secs_f64();
+        if elapsed_secs < 1.0 {
+            return None;
+        }
+        // N completions happened over elapsed_secs (N-1 intervals)
+        let completions = self.target_completion_times.len() as f64 - 1.0;
+        let targets_per_min = (completions / elapsed_secs) * 60.0;
+
+        let remaining = (self.live_targets_total - self.live_targets_complete) as f64;
+        let eta_min = if targets_per_min > 0.0 {
+            remaining / targets_per_min
+        } else {
+            0.0
+        };
+
+        Some((targets_per_min, eta_min))
+    }
+
+    // ── Rendering ────────────────────────────────────────────────
+
     /// Render header with monitoring status
     fn render_header(&self, frame: &mut Frame, area: Rect) {
         let status_indicator = if self.is_monitoring && self.live_run_id.is_some() {
@@ -589,7 +687,7 @@ impl TrainingView {
         frame.render_widget(Paragraph::new(title), area);
     }
 
-    /// Render live progress panel
+    /// Render live progress panel with stage details and throughput
     fn render_live_progress(&self, frame: &mut Frame, area: Rect) {
         let block = Panel::new(&self.theme).title("Live Progress").block();
         let inner = block.inner(area);
@@ -608,11 +706,13 @@ impl TrainingView {
                 Constraint::Length(1), // Stage
                 Constraint::Length(1), // Progress bar
                 Constraint::Length(1), // Target info
+                Constraint::Length(1), // Throughput / ETA
                 Constraint::Length(1), // Message
+                Constraint::Min(0),   // Spacer
             ])
             .split(inner);
 
-        // Stage
+        // Stage with run_id
         let stage_color = match self.live_stage.as_str() {
             "ranking" => self.theme.warning,
             "feature_selection" => self.theme.accent,
@@ -620,11 +720,16 @@ impl TrainingView {
             "completed" => self.theme.success,
             _ => self.theme.text_muted,
         };
-        let stage_line = Line::from(vec![
+
+        let mut stage_spans = vec![
             Span::styled("Stage: ", Style::default().fg(self.theme.text_muted)),
             Span::styled(&self.live_stage, Style::default().fg(stage_color).bold()),
-        ]);
-        frame.render_widget(Paragraph::new(stage_line), rows[0]);
+        ];
+        if let Some(ref run_id) = self.live_run_id {
+            stage_spans.push(Span::styled("  │  ", Style::default().fg(self.theme.border)));
+            stage_spans.push(Span::styled(format!("Run: {}", run_id), Style::default().fg(self.theme.text_secondary)));
+        }
+        frame.render_widget(Paragraph::new(Line::from(stage_spans)), rows[0]);
 
         // Progress bar
         let progress_bar_width = rows[1].width.saturating_sub(10) as usize;
@@ -640,23 +745,39 @@ impl TrainingView {
             .style(Style::default().fg(self.theme.accent));
         frame.render_widget(progress_line, rows[1]);
 
-        // Target info
+        // Target info (stage detail - 4c)
         let target_info = if let Some(target) = &self.live_current_target {
             format!("Target: {} ({}/{})", target, self.live_targets_complete, self.live_targets_total)
         } else if self.live_targets_total > 0 {
             format!("Targets: {}/{}", self.live_targets_complete, self.live_targets_total)
         } else {
-            "".to_string()
+            String::new()
         };
         let target_line = Paragraph::new(target_info)
             .style(Style::default().fg(self.theme.text_secondary));
         frame.render_widget(target_line, rows[2]);
 
+        // Throughput and ETA (4d)
+        let throughput_text = if let Some((tpm, eta)) = self.throughput_and_eta() {
+            if eta > 60.0 {
+                format!("Speed: {:.1} targets/min  │  ETA: ~{:.0}h {:.0}m", tpm, (eta / 60.0).floor(), eta % 60.0)
+            } else {
+                format!("Speed: {:.1} targets/min  │  ETA: ~{:.0} min", tpm, eta)
+            }
+        } else if self.live_targets_complete > 0 {
+            "Speed: Computing...".to_string()
+        } else {
+            String::new()
+        };
+        let throughput_line = Paragraph::new(throughput_text)
+            .style(Style::default().fg(self.theme.text_muted));
+        frame.render_widget(throughput_line, rows[3]);
+
         // Message
         if let Some(msg) = &self.live_message {
             let msg_line = Paragraph::new(msg.as_str())
                 .style(Style::default().fg(self.theme.text_muted));
-            frame.render_widget(msg_line, rows[3]);
+            frame.render_widget(msg_line, rows[4]);
         }
     }
 
@@ -716,12 +837,16 @@ impl TrainingView {
 
     /// Render footer with keybindings
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
-        let keybinds = vec![
+        let mut keybinds = vec![
             ("↑↓/jk", "Navigate"),
             ("r", "Refresh"),
-            ("c", "Clear events"),
-            ("b/Esc", "Back"),
         ];
+        // Show cancel option if a running process exists
+        if self.running_pid().is_some() {
+            keybinds.push(("x", "Cancel Run"));
+        }
+        keybinds.push(("c", "Clear events"));
+        keybinds.push(("b/Esc", "Back"));
 
         let mut spans = Vec::new();
         for (i, (key, desc)) in keybinds.iter().enumerate() {
@@ -765,11 +890,14 @@ impl super::ViewTrait for TrainingView {
         let bg = Block::default().style(Style::default().bg(self.theme.background));
         frame.render_widget(bg, area);
 
+        // Maybe rescan if stale (4b: cached scanning)
+        self.maybe_rescan();
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(2),  // Header
-                Constraint::Length(6),  // Live progress
+                Constraint::Length(8),  // Live progress (with throughput/ETA)
                 Constraint::Min(10),    // Run list
                 Constraint::Length(2),  // Footer
             ])
@@ -791,11 +919,12 @@ impl super::ViewTrait for TrainingView {
         Ok(())
     }
 
-    fn handle_key(&mut self, key: crossterm::event::KeyCode) -> Result<bool> {
+    fn handle_key(&mut self, key: crossterm::event::KeyCode) -> Result<super::ViewAction> {
+        use super::ViewAction;
         match key {
             crossterm::event::KeyCode::Char('r') => {
                 self.scan_runs()?;
-                Ok(false)
+                Ok(ViewAction::Continue)
             }
             crossterm::event::KeyCode::Char('c') => {
                 // Clear live state and reset file position to end
@@ -807,38 +936,38 @@ impl super::ViewTrait for TrainingView {
                 self.live_targets_total = 0;
                 self.live_message = None;
                 // Reset to end of file
-                if let Ok(file) = fs::File::open(TRAINING_EVENTS_FILE) {
+                if let Ok(file) = fs::File::open(&training_events_file()) {
                     if let Ok(metadata) = file.metadata() {
                         self.event_file_pos = metadata.len();
                     }
                 }
-                Ok(false)
+                Ok(ViewAction::Continue)
             }
             crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
                 if self.selected > 0 {
                     self.selected -= 1;
                 }
-                Ok(false)
+                Ok(ViewAction::Continue)
             }
             crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
                 if self.selected < self.runs.len().saturating_sub(1) {
                     self.selected += 1;
                 }
-                Ok(false)
+                Ok(ViewAction::Continue)
             }
             crossterm::event::KeyCode::Char('g') => {
                 // Go to top (gg)
                 self.selected = 0;
-                Ok(false)
+                Ok(ViewAction::Continue)
             }
             crossterm::event::KeyCode::Char('G') => {
                 // Go to bottom (G)
                 if !self.runs.is_empty() {
                     self.selected = self.runs.len() - 1;
                 }
-                Ok(false)
+                Ok(ViewAction::Continue)
             }
-            _ => Ok(false),
+            _ => Ok(ViewAction::Continue),
         }
     }
 }

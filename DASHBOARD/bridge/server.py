@@ -14,12 +14,13 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, Header, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -75,6 +76,56 @@ alpaca_event_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=1000)
 
 # Control state file path
 CONTROL_STATE_FILE = Path(os.getenv("FOXML_STATE_DIR", "state")) / "control_state.json"
+
+# Auth token for control endpoints (generated on startup, written to file for dashboard)
+_AUTH_TOKEN = secrets.token_urlsafe(32)
+_AUTH_TOKEN_FILE = Path(os.getenv("FOXML_TMP_DIR", "/tmp")) / "foxml_bridge_token"
+
+
+def _write_auth_token() -> None:
+    """Write auth token to file for dashboard to read."""
+    try:
+        _AUTH_TOKEN_FILE.write_text(_AUTH_TOKEN)
+        _AUTH_TOKEN_FILE.chmod(0o600)
+        logger.info(f"Auth token written to {_AUTH_TOKEN_FILE}")
+    except Exception as e:
+        logger.error(f"Failed to write auth token: {e}")
+
+
+def _verify_auth(authorization: Optional[str]) -> None:
+    """Verify bearer token on control endpoints. Raises HTTPException on failure."""
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization header required")
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Bearer token required")
+    token = authorization[7:]
+    if token != _AUTH_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid auth token")
+
+# Sharpe ratio tracking — rolling P&L snapshots for return calculation
+import statistics
+_pnl_history: List[float] = []
+_last_pnl_snapshot: Optional[float] = None
+
+
+def _update_pnl_and_get_sharpe(current_pnl: float) -> Optional[float]:
+    """Track daily P&L snapshots and compute annualized Sharpe ratio."""
+    global _last_pnl_snapshot
+    if _last_pnl_snapshot is not None:
+        daily_return = current_pnl - _last_pnl_snapshot
+        _pnl_history.append(daily_return)
+        # Keep rolling window of 252 trading days
+        if len(_pnl_history) > 252:
+            _pnl_history.pop(0)
+    _last_pnl_snapshot = current_pnl
+
+    if len(_pnl_history) < 2:
+        return None
+    mean_ret = statistics.mean(_pnl_history)
+    std_ret = statistics.stdev(_pnl_history)
+    if std_ret == 0:
+        return None
+    return round((mean_ret / std_ret) * (252 ** 0.5), 4)
 
 
 def on_event(event: Event) -> None:
@@ -153,6 +204,9 @@ async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown."""
     # Startup
     logger.info("IPC Bridge starting up...")
+
+    # Write auth token for dashboard to read
+    _write_auth_token()
 
     if OBSERVABILITY_AVAILABLE:
         # Subscribe to all events
@@ -260,12 +314,14 @@ async def get_metrics() -> Dict[str, Any]:
     
     # Read from MetricsRegistry
     try:
+        daily_pnl = metrics.daily_pnl.get()
+        sharpe = _update_pnl_and_get_sharpe(daily_pnl)
         return {
             "portfolio_value": metrics.portfolio_value.get(),
-            "daily_pnl": metrics.daily_pnl.get(),
+            "daily_pnl": daily_pnl,
             "cash_balance": metrics.cash_balance.get(),
             "positions_count": metrics.positions_count.get(),
-            "sharpe_ratio": None,  # TODO: Calculate from metrics
+            "sharpe_ratio": sharpe,
             "trades_total": metrics.trades_total.get(),
             "cycles_total": metrics.cycles_total.get(),
             "errors_total": metrics.errors_total.get(),
@@ -278,6 +334,10 @@ async def get_metrics() -> Dict[str, Any]:
             "daily_pnl": 0.0,
             "cash_balance": 0.0,
             "positions_count": 0,
+            "sharpe_ratio": None,
+            "trades_total": 0,
+            "cycles_total": 0,
+            "errors_total": 0,
         }
 
 
@@ -875,7 +935,7 @@ def on_training_event(event: Dict[str, Any]) -> None:
     try:
         training_event_queue.put_nowait(event)
     except asyncio.QueueFull:
-        logger.debug("Training event queue full, dropping event")
+        logger.warning("Training event queue full, dropping event")
 
 
 @app.websocket("/ws/training")
@@ -972,13 +1032,14 @@ class KillSwitchRequest(BaseModel):
 
 
 @app.post("/api/control/pause")
-async def pause_engine() -> Dict[str, Any]:
+async def pause_engine(authorization: Optional[str] = Header(None)) -> Dict[str, Any]:
     """
     Pause trading engine (stop processing cycles).
-    
+
     Returns:
         Status response
     """
+    _verify_auth(authorization)
     state = await _read_control_state()
     state["paused"] = True
     await _write_control_state(state)
@@ -987,18 +1048,19 @@ async def pause_engine() -> Dict[str, Any]:
     
     return {
         "status": "paused",
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
 @app.post("/api/control/resume")
-async def resume_engine() -> Dict[str, Any]:
+async def resume_engine(authorization: Optional[str] = Header(None)) -> Dict[str, Any]:
     """
     Resume trading engine.
-    
+
     Returns:
         Status response
     """
+    _verify_auth(authorization)
     state = await _read_control_state()
     state["paused"] = False
     await _write_control_state(state)
@@ -1007,21 +1069,25 @@ async def resume_engine() -> Dict[str, Any]:
     
     return {
         "status": "resumed",
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
 @app.post("/api/control/kill_switch")
-async def toggle_kill_switch(request: KillSwitchRequest) -> Dict[str, Any]:
+async def toggle_kill_switch(
+    request: KillSwitchRequest,
+    authorization: Optional[str] = Header(None),
+) -> Dict[str, Any]:
     """
     Toggle manual kill switch.
-    
+
     Args:
         request: Kill switch action (enable/disable) and optional reason
-        
+
     Returns:
         Current kill switch state
     """
+    _verify_auth(authorization)
     if request.action not in ("enable", "disable"):
         raise HTTPException(status_code=400, detail="action must be 'enable' or 'disable'")
     
@@ -1041,7 +1107,7 @@ async def toggle_kill_switch(request: KillSwitchRequest) -> Dict[str, Any]:
     return {
         "kill_switch_active": state["kill_switch_active"],
         "kill_switch_reason": state["kill_switch_reason"],
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 

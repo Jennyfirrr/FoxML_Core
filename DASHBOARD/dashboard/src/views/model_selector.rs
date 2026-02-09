@@ -102,7 +102,7 @@ impl ModelSelectorView {
 
     /// Scan RESULTS/ for training runs (all subdirectories)
     fn scan_runs(&mut self) {
-        let results_dir = PathBuf::from("RESULTS");
+        let results_dir = crate::config::results_dir();
         if !results_dir.exists() {
             self.runs = Vec::new();
             return;
@@ -272,8 +272,77 @@ impl ModelSelectorView {
         }
     }
 
-    /// Set the selected run as active for live trading
-    fn set_active_run(&mut self) -> Result<String> {
+    /// Get the selected run's ID (for confirmation dialog message)
+    pub fn selected_run_id(&self) -> Option<&str> {
+        self.runs.get(self.selected).map(|r| r.run_id.as_str())
+    }
+
+    /// Validate a run before activation
+    fn validate_run(run: &RunInfo) -> Result<Vec<String>> {
+        let mut warnings = Vec::new();
+
+        // Check manifest exists
+        let manifest_path = run.path.join("manifest.json");
+        if !manifest_path.exists() {
+            anyhow::bail!("No manifest.json found in {}", run.path.display());
+        }
+
+        // Check for model files (look for common patterns)
+        let has_models = Self::has_model_files(&run.path);
+        if !has_models {
+            anyhow::bail!("No compiled model files found in {}", run.path.display());
+        }
+
+        // Warn about partial runs
+        if run.completed_targets < run.target_count && run.target_count > 0 {
+            warnings.push(format!(
+                "Partial run: only {}/{} targets completed",
+                run.completed_targets, run.target_count
+            ));
+        }
+
+        // Warn about failed status
+        if run.status == "failed" {
+            warnings.push("Run has 'failed' status".to_string());
+        }
+
+        Ok(warnings)
+    }
+
+    /// Check if a run directory contains model files
+    fn has_model_files(path: &std::path::Path) -> bool {
+        // Look for common model file extensions
+        let model_extensions = ["pkl", "joblib", "h5", "keras", "pt", "pth", "onnx", "bin"];
+
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let entry_path = entry.path();
+                if entry_path.is_file() {
+                    if let Some(ext) = entry_path.extension().and_then(|e| e.to_str()) {
+                        if model_extensions.contains(&ext) {
+                            return true;
+                        }
+                    }
+                }
+                // Also check subdirectories (models may be in target subdirs)
+                if entry_path.is_dir() {
+                    if let Ok(sub_entries) = fs::read_dir(&entry_path) {
+                        for sub_entry in sub_entries.filter_map(|e| e.ok()) {
+                            if let Some(ext) = sub_entry.path().extension().and_then(|e| e.to_str()) {
+                                if model_extensions.contains(&ext) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Set the selected run as active for live trading (public for confirmation dialog)
+    pub fn activate_selected(&mut self) -> Result<String> {
         if self.runs.is_empty() {
             return Ok("No runs available".to_string());
         }
@@ -282,6 +351,9 @@ impl ModelSelectorView {
             self.selected = self.runs.len().saturating_sub(1);
         }
         let run = &self.runs[self.selected];
+
+        // Validate before activation (5e)
+        let warnings = Self::validate_run(run)?;
 
         // Create LIVE_TRADING/models directory if needed
         let models_dir = PathBuf::from("LIVE_TRADING/models");
@@ -298,7 +370,12 @@ impl ModelSelectorView {
 
         self.active_run = Some(run.run_id.clone());
 
-        Ok(format!("Set {} as active model", run.run_id))
+        let mut msg = format!("Set {} as active model", run.run_id);
+        if !warnings.is_empty() {
+            msg.push_str(&format!(" (warnings: {})", warnings.join("; ")));
+        }
+
+        Ok(msg)
     }
 
     /// Render run list
@@ -587,7 +664,8 @@ impl super::ViewTrait for ModelSelectorView {
         Ok(())
     }
 
-    fn handle_key(&mut self, key: KeyCode) -> Result<bool> {
+    fn handle_key(&mut self, key: KeyCode) -> Result<super::ViewAction> {
+        use super::ViewAction;
         // Clear message on key
         self.message = None;
 
@@ -596,7 +674,7 @@ impl super::ViewTrait for ModelSelectorView {
                 if self.show_detail {
                     self.show_detail = false;
                 } else {
-                    return Ok(true); // Go back
+                    return Ok(ViewAction::Back);
                 }
             }
             // Navigation
@@ -633,11 +711,8 @@ impl super::ViewTrait for ModelSelectorView {
                 }
             }
             KeyCode::Char('a') => {
-                // Set as active
-                match self.set_active_run() {
-                    Ok(msg) => self.message = Some((msg, false)),
-                    Err(e) => self.message = Some((format!("Error: {}", e), true)),
-                }
+                // Activation now handled via confirmation dialog in App
+                // This is a no-op here; App intercepts 'a' for ModelSelector
             }
             KeyCode::Char('r') => {
                 // Refresh
@@ -648,6 +723,6 @@ impl super::ViewTrait for ModelSelectorView {
             _ => {}
         }
 
-        Ok(false)
+        Ok(ViewAction::Continue)
     }
 }

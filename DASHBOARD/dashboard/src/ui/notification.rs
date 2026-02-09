@@ -221,13 +221,16 @@ impl NotificationManager {
                 _ => notify_rust::Urgency::Low,
             };
 
-            let _ = DesktopNotification::new()
+            if let Err(e) = DesktopNotification::new()
                 .summary(&format!("FOX ML: {}", notification.title))
                 .body(notification.message.as_deref().unwrap_or(""))
                 .icon("foxml")
                 .urgency(urgency)
                 .timeout(5000)
-                .show();
+                .show()
+            {
+                tracing::debug!("Desktop notification failed: {}", e);
+            }
         }
     }
 

@@ -42,10 +42,11 @@ impl HelpOverlay {
     /// Get navigation shortcuts
     fn navigation_shortcuts() -> Vec<ShortcutEntry> {
         vec![
-            ShortcutEntry { key: "1", description: "Trading" },
-            ShortcutEntry { key: "2", description: "Training" },
-            ShortcutEntry { key: "3", description: "Overview" },
-            ShortcutEntry { key: "b", description: "Back to Dashboard" },
+            ShortcutEntry { key: "1", description: "Trading Monitor" },
+            ShortcutEntry { key: "2", description: "Training Monitor" },
+            ShortcutEntry { key: "3", description: "System Overview" },
+            ShortcutEntry { key: "Tab", description: "Cycle Views" },
+            ShortcutEntry { key: "b/Esc", description: "Back to Dashboard" },
         ]
     }
 
@@ -53,12 +54,11 @@ impl HelpOverlay {
     fn general_shortcuts() -> Vec<ShortcutEntry> {
         vec![
             ShortcutEntry { key: "Ctrl+P", description: "Command Palette" },
-            ShortcutEntry { key: "/", description: "Command Palette" },
+            ShortcutEntry { key: "/", description: "Command Palette / Search" },
             ShortcutEntry { key: "?", description: "This Help" },
-            ShortcutEntry { key: "Esc", description: "Back / Close" },
-            ShortcutEntry { key: "Tab", description: "Cycle Views" },
             ShortcutEntry { key: "r", description: "Refresh" },
-            ShortcutEntry { key: "q", description: "Quit" },
+            ShortcutEntry { key: "j/k", description: "Navigate Down/Up" },
+            ShortcutEntry { key: "Ctrl+Q", description: "Quit" },
         ]
     }
 
@@ -73,18 +73,38 @@ impl HelpOverlay {
     /// Get trading shortcuts
     fn trading_shortcuts() -> Vec<ShortcutEntry> {
         vec![
-            ShortcutEntry { key: "K", description: "Toggle Kill Switch" },
-            ShortcutEntry { key: "P", description: "Pause/Resume" },
-            ShortcutEntry { key: "R", description: "Refresh" },
+            ShortcutEntry { key: "Ctrl+K", description: "Toggle Kill Switch" },
+            ShortcutEntry { key: "k", description: "Kill Switch (in Trading)" },
+            ShortcutEntry { key: "p", description: "Pause/Resume Trading" },
+            ShortcutEntry { key: "s", description: "Cycle Position Sort" },
+            ShortcutEntry { key: "c", description: "Toggle P&L Chart" },
+            ShortcutEntry { key: "w", description: "Connect WebSocket" },
+            ShortcutEntry { key: "Enter", description: "Position Detail" },
         ]
     }
 
     /// Get training shortcuts
     fn training_shortcuts() -> Vec<ShortcutEntry> {
         vec![
-            ShortcutEntry { key: "T", description: "Start Training" },
-            ShortcutEntry { key: "S", description: "Stop Training" },
-            ShortcutEntry { key: "L", description: "View Logs" },
+            ShortcutEntry { key: "x", description: "Cancel Training Run" },
+            ShortcutEntry { key: "c", description: "Clear Events" },
+            ShortcutEntry { key: "r", description: "Rescan Runs" },
+        ]
+    }
+
+    /// Get log viewer shortcuts
+    fn log_viewer_shortcuts() -> Vec<ShortcutEntry> {
+        vec![
+            ShortcutEntry { key: "/", description: "Search" },
+            ShortcutEntry { key: "n/N", description: "Next/Prev Match" },
+        ]
+    }
+
+    /// Get model selector shortcuts
+    fn model_selector_shortcuts() -> Vec<ShortcutEntry> {
+        vec![
+            ShortcutEntry { key: "a", description: "Activate Model" },
+            ShortcutEntry { key: "Enter", description: "Toggle Details" },
         ]
     }
 
@@ -157,11 +177,11 @@ impl HelpOverlay {
             return;
         }
 
-        // Calculate overlay size and position (centered)
-        let width = 70u16.min(area.width.saturating_sub(4));
-        let height = 22u16.min(area.height.saturating_sub(4));
-        let x = area.x + (area.width - width) / 2;
-        let y = area.y + (area.height - height) / 2;
+        // Calculate overlay size and position (centered, 70% width, 80% height)
+        let width = ((area.width as f32 * 0.7) as u16).min(area.width.saturating_sub(4));
+        let height = ((area.height as f32 * 0.8) as u16).min(area.height.saturating_sub(4));
+        let x = area.x + (area.width.saturating_sub(width)) / 2;
+        let y = area.y + (area.height.saturating_sub(height)) / 2;
 
         let overlay_area = Rect {
             x,
@@ -191,13 +211,15 @@ impl HelpOverlay {
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(inner);
 
-        // Left column
+        // Left column: Global shortcuts
         let left_sections = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(6), // Navigation
+                Constraint::Length(7), // Navigation
                 Constraint::Length(1), // Spacer
-                Constraint::Min(0),    // General
+                Constraint::Length(8), // General
+                Constraint::Length(1), // Spacer
+                Constraint::Min(0),    // Sidebar
             ])
             .split(columns[0]);
 
@@ -215,37 +237,53 @@ impl HelpOverlay {
             buf,
             theme,
         );
+        self.render_section(
+            "Sidebar",
+            &Self::sidebar_shortcuts(),
+            left_sections[4],
+            buf,
+            theme,
+        );
 
-        // Right column
+        // Right column: View-specific shortcuts
         let right_sections = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(4), // Sidebar
+                Constraint::Length(9), // Trading
                 Constraint::Length(1), // Spacer
-                Constraint::Length(5), // Trading
+                Constraint::Length(5), // Training
                 Constraint::Length(1), // Spacer
-                Constraint::Min(0),    // Training
+                Constraint::Length(4), // Log Viewer
+                Constraint::Length(1), // Spacer
+                Constraint::Min(0),    // Model Selector
             ])
             .split(columns[1]);
 
         self.render_section(
-            "Sidebar",
-            &Self::sidebar_shortcuts(),
+            "Trading View",
+            &Self::trading_shortcuts(),
             right_sections[0],
             buf,
             theme,
         );
         self.render_section(
-            "Trading",
-            &Self::trading_shortcuts(),
+            "Training View",
+            &Self::training_shortcuts(),
             right_sections[2],
             buf,
             theme,
         );
         self.render_section(
-            "Training",
-            &Self::training_shortcuts(),
+            "Log Viewer",
+            &Self::log_viewer_shortcuts(),
             right_sections[4],
+            buf,
+            theme,
+        );
+        self.render_section(
+            "Model Selector",
+            &Self::model_selector_shortcuts(),
+            right_sections[6],
             buf,
             theme,
         );
@@ -257,7 +295,7 @@ impl HelpOverlay {
             width: inner.width,
             height: 1,
         };
-        Paragraph::new("[Press any key to close]")
+        Paragraph::new("[Press ? or any key to close]")
             .style(Style::default().fg(theme.text_muted))
             .alignment(Alignment::Center)
             .render(footer_area, buf);

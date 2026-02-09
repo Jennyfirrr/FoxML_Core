@@ -13,6 +13,7 @@ use tracing_subscriber;
 
 mod app;
 mod api;
+mod config;
 mod views;
 mod widgets;
 mod themes;

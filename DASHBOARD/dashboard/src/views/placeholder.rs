@@ -36,8 +36,8 @@ impl super::ViewTrait for PlaceholderView {
         Ok(())
     }
 
-    fn handle_key(&mut self, key: crossterm::event::KeyCode) -> Result<bool> {
+    fn handle_key(&mut self, key: crossterm::event::KeyCode) -> Result<super::ViewAction> {
         // Placeholder view doesn't handle keys - let app handle them
-        Ok(false)
+        Ok(super::ViewAction::Continue)
     }
 }

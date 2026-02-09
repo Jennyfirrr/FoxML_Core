@@ -23,7 +23,7 @@ pub struct RunManager {
 
 impl RunManager {
     pub fn new() -> Result<Self> {
-        let results_dir = PathBuf::from("RESULTS/runs");
+        let results_dir = crate::config::results_dir().join("runs");
         let runs = Self::scan_runs(&results_dir)?;
         
         Ok(Self {

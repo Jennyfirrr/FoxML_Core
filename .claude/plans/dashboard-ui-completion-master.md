@@ -1,6 +1,6 @@
 # Dashboard UI Completion Master Plan
 
-**Status**: In Progress (Phase 0 Complete)
+**Status**: Superseded by `dashboard-hardening-master.md` (all views now exist and are functional)
 **Created**: 2026-01-21
 **Branch**: fix/repro-bootstrap-import-order
 

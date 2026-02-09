@@ -297,6 +297,34 @@ impl ServiceManagerView {
         self.services = services;
     }
 
+    /// Get the selected service index
+    pub fn selected_index(&self) -> usize {
+        self.selected
+    }
+
+    /// Get the selected service display name (for dialog message)
+    pub fn selected_service_name(&self) -> Option<&str> {
+        self.services.get(self.selected).map(|s| s.display_name.as_str())
+    }
+
+    /// Stop a service by index (public for confirmation dialog)
+    pub fn stop_service(&mut self, idx: usize) -> Result<String> {
+        if idx < self.services.len() {
+            self.services[idx].stop()
+        } else {
+            Ok("Invalid service index".to_string())
+        }
+    }
+
+    /// Restart a service by index (public for confirmation dialog)
+    pub fn restart_service(&mut self, idx: usize) -> Result<String> {
+        if idx < self.services.len() {
+            self.services[idx].restart()
+        } else {
+            Ok("Invalid service index".to_string())
+        }
+    }
+
     /// Refresh all services
     fn refresh_all(&mut self) {
         for service in &mut self.services {
@@ -474,13 +502,14 @@ impl super::ViewTrait for ServiceManagerView {
         Ok(())
     }
 
-    fn handle_key(&mut self, key: KeyCode) -> Result<bool> {
+    fn handle_key(&mut self, key: KeyCode) -> Result<super::ViewAction> {
+        use super::ViewAction;
         // Clear message on any key
         self.message = None;
 
         match key {
             KeyCode::Char('q') | KeyCode::Esc => {
-                return Ok(true); // Go back
+                return Ok(ViewAction::Back);
             }
             // Navigation
             KeyCode::Up | KeyCode::Char('k') => {
@@ -525,6 +554,6 @@ impl super::ViewTrait for ServiceManagerView {
             _ => {}
         }
 
-        Ok(false)
+        Ok(ViewAction::Continue)
     }
 }

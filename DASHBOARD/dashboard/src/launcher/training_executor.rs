@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 /// Path to PID file for process detection
-const TRAINING_PID_FILE: &str = "/tmp/foxml_training.pid";
+fn training_pid_file() -> PathBuf { crate::config::training_pid_file() }
 
 /// Training executor - launches and monitors training pipeline
 pub struct TrainingExecutor {
@@ -23,7 +23,7 @@ impl TrainingExecutor {
     pub fn new() -> Self {
         Self {
             experiment_config: "production_baseline".to_string(),
-            output_dir: PathBuf::from("RESULTS/prod"),
+            output_dir: crate::config::results_dir().join("prod"),
             deterministic: true,
             last_status_message: None,
         }
@@ -120,7 +120,7 @@ impl TrainingExecutor {
 
     /// Get PID of running training process, if any
     fn get_running_pid(&self) -> Option<u32> {
-        let content = fs::read_to_string(TRAINING_PID_FILE).ok()?;
+        let content = fs::read_to_string(&training_pid_file()).ok()?;
         let json: serde_json::Value = serde_json::from_str(&content).ok()?;
         let pid = json.get("pid")?.as_u64()? as u32;
 
@@ -135,7 +135,7 @@ impl TrainingExecutor {
 
     /// Get the run_id of the currently running training, if any
     pub fn get_running_run_id(&self) -> Option<String> {
-        let content = fs::read_to_string(TRAINING_PID_FILE).ok()?;
+        let content = fs::read_to_string(&training_pid_file()).ok()?;
         let json: serde_json::Value = serde_json::from_str(&content).ok()?;
 
         // Verify process is still alive first

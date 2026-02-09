@@ -15,11 +15,13 @@ pub struct DashboardClient {
     http_url: String,
     ws_url: String,
     client: Client,
+    auth_token: Option<String>,
 }
 
 impl DashboardClient {
     /// Create new client
     pub fn new(base_url: &str) -> Self {
+        let auth_token = Self::load_auth_token();
         Self {
             http_url: format!("http://{}", base_url),
             ws_url: format!("ws://{}", base_url),
@@ -27,7 +29,23 @@ impl DashboardClient {
                 .timeout(Duration::from_secs(5))
                 .build()
                 .expect("Failed to build HTTP client (TLS backend unavailable?)"),
+            auth_token,
         }
+    }
+
+    /// Load auth token from bridge token file
+    fn load_auth_token() -> Option<String> {
+        let token_path = crate::config::tmp_dir().join("foxml_bridge_token");
+        std::fs::read_to_string(token_path).ok().map(|s| s.trim().to_string())
+    }
+
+    /// Build an authenticated POST request
+    fn authenticated_post(&self, url: &str) -> reqwest::RequestBuilder {
+        let mut req = self.client.post(url);
+        if let Some(ref token) = self.auth_token {
+            req = req.header("Authorization", format!("Bearer {}", token));
+        }
+        req
     }
 
     /// Get metrics
@@ -141,7 +159,7 @@ impl DashboardClient {
     /// Pause trading engine
     pub async fn pause_engine(&self) -> Result<serde_json::Value> {
         let url = format!("{}/api/control/pause", self.http_url);
-        let response = self.client.post(&url).send().await?;
+        let response = self.authenticated_post(&url).send().await?;
         let result = response.json().await?;
         Ok(result)
     }
@@ -149,7 +167,7 @@ impl DashboardClient {
     /// Resume trading engine
     pub async fn resume_engine(&self) -> Result<serde_json::Value> {
         let url = format!("{}/api/control/resume", self.http_url);
-        let response = self.client.post(&url).send().await?;
+        let response = self.authenticated_post(&url).send().await?;
         let result = response.json().await?;
         Ok(result)
     }
@@ -161,8 +179,7 @@ impl DashboardClient {
             "action": if enable { "enable" } else { "disable" },
             "reason": reason,
         });
-        let response = self.client
-            .post(&url)
+        let response = self.authenticated_post(&url)
             .json(&body)
             .send()
             .await?;

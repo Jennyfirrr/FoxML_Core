@@ -23,7 +23,7 @@ pub struct FileBrowser {
 
 impl FileBrowser {
     pub fn new() -> Self {
-        let current_path = PathBuf::from("RESULTS");
+        let current_path = crate::config::results_dir();
         let entries = Self::list_directory(&current_path);
         
         Self {

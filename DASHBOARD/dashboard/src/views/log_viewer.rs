@@ -56,6 +56,10 @@ pub struct LogViewerView {
     file_pos: u64,
     search_query: String,
     searching: bool,
+    /// Indices of lines matching the current search query
+    search_matches: Vec<usize>,
+    /// Index into search_matches for current match navigation
+    current_match: usize,
     // UI state
     show_log_list: bool,
 }
@@ -75,11 +79,18 @@ impl LogViewerView {
             file_pos: 0,
             search_query: String::new(),
             searching: false,
+            search_matches: Vec::new(),
+            current_match: 0,
             show_log_list: false,
         };
         view.discover_logs();
         view.load_selected_log();
         view
+    }
+
+    /// Whether the search input is active (keys should be delegated)
+    pub fn is_searching(&self) -> bool {
+        self.searching
     }
 
     /// Discover available logs for current source
@@ -125,7 +136,7 @@ impl LogViewerView {
 
     /// Discover training log files from all runs
     fn discover_training_logs(&mut self) {
-        let results_dir = PathBuf::from("RESULTS");
+        let results_dir = crate::config::results_dir();
         if !results_dir.exists() {
             return;
         }
@@ -261,18 +272,45 @@ impl LogViewerView {
         }
     }
 
-    /// Load a file
+    /// Maximum bytes to read from the end of a file on initial load (1 MB)
+    const TAIL_BYTES: u64 = 1_024 * 1_024;
+
+    /// Load a file, seeking to the tail for large files to avoid OOM
     fn load_file(&mut self, path: &PathBuf) {
         match fs::File::open(path) {
-            Ok(file) => {
-                let reader = BufReader::new(&file);
-                self.lines = reader.lines().filter_map(|l| l.ok()).collect();
+            Ok(mut file) => {
+                let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+
+                if file_len > Self::TAIL_BYTES {
+                    // Large file: seek to last TAIL_BYTES and read from there
+                    let seek_pos = file_len - Self::TAIL_BYTES;
+                    if file.seek(SeekFrom::Start(seek_pos)).is_ok() {
+                        let reader = BufReader::new(&file);
+                        let mut all_lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+                        // Drop the first (likely partial) line from the seek
+                        if !all_lines.is_empty() {
+                            all_lines.remove(0);
+                        }
+                        self.lines = all_lines;
+                    } else {
+                        // Fallback: read last 10k lines
+                        let reader = BufReader::new(&file);
+                        let all: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+                        let start = all.len().saturating_sub(10_000);
+                        self.lines = all[start..].to_vec();
+                    }
+                } else {
+                    // Small file: read entirely
+                    let reader = BufReader::new(&file);
+                    self.lines = reader.lines().filter_map(|l| l.ok()).collect();
+                }
+
                 self.log_path = Some(path.clone());
                 if self.follow_mode {
                     self.scroll = self.lines.len().saturating_sub(1);
                 }
                 // Track file position for tailing
-                self.file_pos = file.metadata().map(|m| m.len()).unwrap_or(0);
+                self.file_pos = file_len;
             }
             Err(e) => {
                 self.lines = vec![format!("Failed to open {}: {}", path.display(), e)];
@@ -324,6 +362,45 @@ impl LogViewerView {
                 }
             }
         }
+    }
+
+    /// Recompute which line indices match the current search query
+    fn update_search_matches(&mut self) {
+        self.search_matches.clear();
+        self.current_match = 0;
+        if self.search_query.is_empty() {
+            return;
+        }
+        let query_lower = self.search_query.to_lowercase();
+        for (i, line) in self.lines.iter().enumerate() {
+            if line.to_lowercase().contains(&query_lower) {
+                self.search_matches.push(i);
+            }
+        }
+    }
+
+    /// Jump to the next search match
+    fn jump_to_next_match(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        // Find the first match after current scroll position
+        let after = self.search_matches.iter().position(|&m| m > self.scroll);
+        self.current_match = after.unwrap_or(0); // wrap to first match
+        self.scroll = self.search_matches[self.current_match];
+        self.follow_mode = false;
+    }
+
+    /// Jump to the previous search match
+    fn jump_to_prev_match(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        // Find the last match before current scroll position
+        let before = self.search_matches.iter().rposition(|&m| m < self.scroll);
+        self.current_match = before.unwrap_or(self.search_matches.len() - 1); // wrap to last
+        self.scroll = self.search_matches[self.current_match];
+        self.follow_mode = false;
     }
 
     /// Get log level color for a line
@@ -381,6 +458,40 @@ impl LogViewerView {
         frame.render_widget(selector, area);
     }
 
+    /// Build spans for a line, highlighting search matches with accent color
+    fn highlight_line(&self, line: &str, base_color: Color) -> Vec<Span<'_>> {
+        if self.search_query.is_empty() {
+            return vec![Span::styled(line.to_string(), Style::default().fg(base_color))];
+        }
+        let query_lower = self.search_query.to_lowercase();
+        let line_lower = line.to_lowercase();
+        let mut spans = Vec::new();
+        let mut last = 0;
+        for (start, _) in line_lower.match_indices(&query_lower) {
+            if start > last {
+                spans.push(Span::styled(
+                    line[last..start].to_string(),
+                    Style::default().fg(base_color),
+                ));
+            }
+            spans.push(Span::styled(
+                line[start..start + self.search_query.len()].to_string(),
+                Style::default().fg(self.theme.background).bg(self.theme.accent),
+            ));
+            last = start + self.search_query.len();
+        }
+        if last < line.len() {
+            spans.push(Span::styled(
+                line[last..].to_string(),
+                Style::default().fg(base_color),
+            ));
+        }
+        if spans.is_empty() {
+            spans.push(Span::styled(line.to_string(), Style::default().fg(base_color)));
+        }
+        spans
+    }
+
     /// Render log content
     fn render_content(&self, frame: &mut Frame, area: Rect) {
         let title = match &self.log_path {
@@ -394,7 +505,17 @@ impl LogViewerView {
             String::new()
         };
 
-        let full_title = format!("{}{}", title, follow_indicator);
+        let search_indicator = if !self.search_query.is_empty() {
+            format!(
+                "  [/{}: {} matches]",
+                self.search_query,
+                self.search_matches.len()
+            )
+        } else {
+            String::new()
+        };
+
+        let full_title = format!("{}{}{}", title, follow_indicator, search_indicator);
         let block = Panel::new(&self.theme)
             .title(&full_title)
             .block();
@@ -402,6 +523,7 @@ impl LogViewerView {
         frame.render_widget(block, area);
 
         let visible_height = inner.height as usize;
+        let max_line_width = inner.width as usize;
         let start = self.scroll;
         let end = (start + visible_height).min(self.lines.len());
 
@@ -412,14 +534,23 @@ impl LogViewerView {
                 let line_num = start + i + 1;
                 let color = self.line_color(line);
 
-                // Truncate long lines
-                let display_line = if line.len() > inner.width as usize - 8 {
-                    format!("{:5} {}...", line_num, &line[..inner.width as usize - 12])
+                // Truncate long lines for display
+                let display_text = if line.len() > max_line_width.saturating_sub(8) {
+                    &line[..max_line_width.saturating_sub(12)]
                 } else {
-                    format!("{:5} {}", line_num, line)
+                    line.as_str()
                 };
 
-                ListItem::new(Line::from(Span::styled(display_line, Style::default().fg(color))))
+                let mut spans = vec![Span::styled(
+                    format!("{:5} ", line_num),
+                    Style::default().fg(self.theme.text_muted),
+                )];
+                spans.extend(self.highlight_line(display_text, color));
+                if display_text.len() < line.len() {
+                    spans.push(Span::styled("...", Style::default().fg(self.theme.text_muted)));
+                }
+
+                ListItem::new(Line::from(spans))
             })
             .collect();
 
@@ -427,20 +558,44 @@ impl LogViewerView {
         frame.render_widget(list, inner);
     }
 
-    /// Render footer
+    /// Render footer (or search input bar when searching)
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
+        if self.searching {
+            // Show search input bar
+            let spans = vec![
+                Span::styled("/", Style::default().fg(self.theme.accent).bold()),
+                Span::styled(&self.search_query, Style::default().fg(self.theme.text_primary)),
+                Span::styled("█", Style::default().fg(self.theme.accent)),
+                Span::styled(
+                    format!(
+                        "  ({} matches — Enter to confirm, Esc to cancel)",
+                        self.search_matches.len()
+                    ),
+                    Style::default().fg(self.theme.text_muted),
+                ),
+            ];
+            let footer = Paragraph::new(Line::from(spans));
+            frame.render_widget(footer, area);
+            return;
+        }
+
         let mut keybinds = vec![
             ("[1-3]", "Source"),
             ("[↑↓/jk]", "Scroll"),
             ("[g/G]", "Top/Bottom"),
+            ("[/]", "Search"),
             ("[f]", "Follow"),
-            ("[r]", "Refresh"),
             ("[q]", "Back"),
         ];
 
         // Add Tab if we have multiple log files
         if self.discovered_logs.len() > 1 {
             keybinds.insert(1, ("[Tab]", "Next file"));
+        }
+
+        // Add n/N if we have search matches
+        if !self.search_matches.is_empty() {
+            keybinds.insert(4, ("[n/N]", "Next/Prev"));
         }
 
         let mut spans = Vec::new();
@@ -498,29 +653,86 @@ impl super::ViewTrait for LogViewerView {
         Ok(())
     }
 
-    fn handle_key(&mut self, key: KeyCode) -> Result<bool> {
+    fn handle_key(&mut self, key: KeyCode) -> Result<super::ViewAction> {
+        use super::ViewAction;
+
+        // Handle search input mode separately
+        if self.searching {
+            match key {
+                KeyCode::Esc => {
+                    // Cancel search, clear query
+                    self.searching = false;
+                    self.search_query.clear();
+                    self.search_matches.clear();
+                    self.current_match = 0;
+                }
+                KeyCode::Enter => {
+                    // Confirm search, exit input mode but keep filter active
+                    self.searching = false;
+                    if !self.search_matches.is_empty() {
+                        self.jump_to_next_match();
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.search_query.pop();
+                    self.update_search_matches();
+                }
+                KeyCode::Char(c) => {
+                    self.search_query.push(c);
+                    self.update_search_matches();
+                }
+                _ => {}
+            }
+            return Ok(ViewAction::Continue);
+        }
+
         match key {
             KeyCode::Char('q') | KeyCode::Esc => {
-                return Ok(true); // Go back
+                // If we have an active search, clear it first; otherwise back out
+                if !self.search_query.is_empty() {
+                    self.search_query.clear();
+                    self.search_matches.clear();
+                    self.current_match = 0;
+                } else {
+                    return Ok(ViewAction::Back);
+                }
+            }
+            // Enter search mode
+            KeyCode::Char('/') => {
+                self.searching = true;
+                self.search_query.clear();
+                self.search_matches.clear();
+                self.current_match = 0;
+            }
+            // Next/previous search match
+            KeyCode::Char('n') => {
+                self.jump_to_next_match();
+            }
+            KeyCode::Char('N') => {
+                self.jump_to_prev_match();
             }
             // Source selection
             KeyCode::Char('1') => {
                 self.source = LogSource::TrainingLogs;
                 self.load_current_source();
+                self.update_search_matches();
             }
             KeyCode::Char('2') => {
                 self.source = LogSource::TradingLogs;
                 self.load_current_source();
+                self.update_search_matches();
             }
             KeyCode::Char('3') => {
                 self.source = LogSource::SystemJournal;
                 self.load_current_source();
+                self.update_search_matches();
             }
             // Cycle through discovered log files
             KeyCode::Tab => {
                 if !self.discovered_logs.is_empty() {
                     self.selected_log = (self.selected_log + 1) % self.discovered_logs.len();
                     self.load_selected_log();
+                    self.update_search_matches();
                 }
             }
             KeyCode::BackTab => {
@@ -531,6 +743,7 @@ impl super::ViewTrait for LogViewerView {
                         self.selected_log - 1
                     };
                     self.load_selected_log();
+                    self.update_search_matches();
                 }
             }
             // Scrolling
@@ -575,9 +788,10 @@ impl super::ViewTrait for LogViewerView {
             // Refresh
             KeyCode::Char('r') => {
                 self.load_current_source();
+                self.update_search_matches();
             }
             _ => {}
         }
-        Ok(false)
+        Ok(ViewAction::Continue)
     }
 }

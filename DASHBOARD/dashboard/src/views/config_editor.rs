@@ -1,6 +1,8 @@
 //! Config Browser View - browse and preview experiment configs
 //!
-//! Read-only viewer for configs. Use external editor ($EDITOR) for modifications.
+//! Supports two editing modes:
+//! - External editor ($EDITOR): TUI suspends, editor gets full terminal access
+//! - Inline editor: built-in YAML editor with cursor/edit/save/validation
 
 use anyhow::Result;
 use crossterm::event::KeyCode;
@@ -8,8 +10,8 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 
+use crate::launcher::config_editor::ConfigEditor;
 use crate::themes::Theme;
 use crate::ui::panels::Panel;
 
@@ -23,6 +25,8 @@ pub struct ConfigEditorView {
     // Preview
     preview_content: Vec<String>,
     preview_scroll: usize,
+    // Inline editor (None = browser mode, Some = editing mode)
+    inline_editor: Option<ConfigEditor>,
     // Status
     message: Option<(String, bool)>,
 }
@@ -44,6 +48,7 @@ impl ConfigEditorView {
             scroll: 0,
             preview_content: Vec::new(),
             preview_scroll: 0,
+            inline_editor: None,
             message: None,
         };
         view.scan_configs();
@@ -56,7 +61,7 @@ impl ConfigEditorView {
         let mut configs = Vec::new();
 
         // Scan experiment configs
-        let experiments_dir = PathBuf::from("CONFIG/experiments");
+        let experiments_dir = crate::config::config_dir().join("experiments");
         if experiments_dir.exists() {
             if let Ok(entries) = fs::read_dir(&experiments_dir) {
                 for entry in entries.filter_map(|e| e.ok()) {
@@ -99,7 +104,7 @@ impl ConfigEditorView {
     }
 
     /// Update preview for selected config
-    fn update_preview(&mut self) {
+    pub fn update_preview(&mut self) {
         self.preview_content.clear();
         self.preview_scroll = 0;
 
@@ -122,30 +127,14 @@ impl ConfigEditorView {
         }
     }
 
-    /// Open selected config in external editor
-    fn open_in_editor(&mut self) {
-        if self.configs.is_empty() {
-            return;
-        }
+    /// Check if the inline editor is currently active
+    pub fn has_inline_editor(&self) -> bool {
+        self.inline_editor.is_some()
+    }
 
-        let entry = &self.configs[self.selected];
-        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".to_string());
-
-        // We can't suspend the TUI easily, so spawn in background and notify
-        match Command::new(&editor)
-            .arg(&entry.path)
-            .spawn()
-        {
-            Ok(_) => {
-                self.message = Some((
-                    format!("Opened in {} (switch to terminal)", editor),
-                    false,
-                ));
-            }
-            Err(e) => {
-                self.message = Some((format!("Failed to open editor: {}", e), true));
-            }
-        }
+    /// Get path of the currently selected config
+    fn selected_config_path(&self) -> Option<PathBuf> {
+        self.configs.get(self.selected).map(|e| e.path.clone())
     }
 
     /// Open file (for compatibility with app.rs)
@@ -270,13 +259,22 @@ impl ConfigEditorView {
 
     /// Render footer
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
-        let keybinds = vec![
-            ("[j/k]", "Navigate"),
-            ("[PgUp/PgDn]", "Scroll preview"),
-            ("[e]", "Open in $EDITOR"),
-            ("[r]", "Refresh"),
-            ("[q]", "Back"),
-        ];
+        let keybinds = if self.inline_editor.is_some() {
+            vec![
+                ("[F2]", "Save"),
+                ("[Esc]", "Close editor"),
+                ("[arrows]", "Move"),
+            ]
+        } else {
+            vec![
+                ("[j/k]", "Navigate"),
+                ("[PgUp/PgDn]", "Scroll preview"),
+                ("[e]", "$EDITOR"),
+                ("[i]", "Inline edit"),
+                ("[r]", "Refresh"),
+                ("[q]", "Back"),
+            ]
+        };
 
         let mut spans = Vec::new();
         for (i, (key, desc)) in keybinds.iter().enumerate() {
@@ -322,6 +320,14 @@ impl super::ViewTrait for ConfigEditorView {
             .margin(1)
             .split(area);
 
+        // If inline editor is active, render it full-screen in the content area
+        if let Some(ref mut editor) = self.inline_editor {
+            let theme = self.theme.clone();
+            let _ = editor.render(frame, chunks[0], &theme);
+            self.render_footer(frame, chunks[1]);
+            return Ok(());
+        }
+
         // Split content into list and preview
         let content_chunks = Layout::default()
             .direction(Direction::Horizontal)
@@ -338,13 +344,56 @@ impl super::ViewTrait for ConfigEditorView {
         Ok(())
     }
 
-    fn handle_key(&mut self, key: KeyCode) -> Result<bool> {
+    fn handle_key(&mut self, key: KeyCode) -> Result<super::ViewAction> {
+        use super::ViewAction;
+
+        // If inline editor is active, delegate keys to it
+        if let Some(ref mut editor) = self.inline_editor {
+            match key {
+                KeyCode::Esc => {
+                    // Exit inline editor
+                    self.inline_editor = None;
+                    self.update_preview();
+                    self.message = Some(("Editor closed".to_string(), false));
+                    return Ok(ViewAction::Continue);
+                }
+                KeyCode::F(2) => {
+                    // Save
+                    match editor.save() {
+                        Ok(_) => {
+                            self.message = Some(("Saved".to_string(), false));
+                            self.update_preview();
+                        }
+                        Err(e) => {
+                            self.message = Some((format!("Save failed: {}", e), true));
+                        }
+                    }
+                    return Ok(ViewAction::Continue);
+                }
+                // Movement keys
+                KeyCode::Up => { editor.move_up(); }
+                KeyCode::Down => { editor.move_down(); }
+                KeyCode::Left => { editor.move_left(); }
+                KeyCode::Right => { editor.move_right(); }
+                KeyCode::Home => { editor.move_to_line_start(); }
+                KeyCode::End => { editor.move_to_line_end(); }
+                // Editing keys
+                KeyCode::Char(c) => { editor.insert_char(c); }
+                KeyCode::Enter => { editor.insert_newline(); }
+                KeyCode::Backspace => { editor.delete_backward(); }
+                KeyCode::Delete => { editor.delete_forward(); }
+                _ => {}
+            }
+            return Ok(ViewAction::Continue);
+        }
+
+        // Browser mode
         // Clear message
         self.message = None;
 
         match key {
             KeyCode::Char('q') | KeyCode::Esc => {
-                return Ok(true); // Go back
+                return Ok(ViewAction::Back);
             }
             // List navigation
             KeyCode::Up | KeyCode::Char('k') => {
@@ -370,9 +419,25 @@ impl super::ViewTrait for ConfigEditorView {
                 let max_scroll = self.preview_content.len().saturating_sub(20);
                 self.preview_scroll = (self.preview_scroll + 20).min(max_scroll);
             }
-            // Actions
+            // Open in external editor (TUI suspension)
             KeyCode::Char('e') => {
-                self.open_in_editor();
+                if let Some(path) = self.selected_config_path() {
+                    return Ok(ViewAction::SpawnEditor(path));
+                }
+            }
+            // Open inline editor
+            KeyCode::Char('i') => {
+                if let Some(path) = self.selected_config_path() {
+                    match ConfigEditor::new(path.to_string_lossy().to_string()) {
+                        Ok(editor) => {
+                            self.inline_editor = Some(editor);
+                            self.message = Some(("Inline editor opened".to_string(), false));
+                        }
+                        Err(e) => {
+                            self.message = Some((format!("Failed to open editor: {}", e), true));
+                        }
+                    }
+                }
             }
             KeyCode::Char('r') => {
                 self.scan_configs();
@@ -382,6 +447,6 @@ impl super::ViewTrait for ConfigEditorView {
             _ => {}
         }
 
-        Ok(false)
+        Ok(ViewAction::Continue)
     }
 }

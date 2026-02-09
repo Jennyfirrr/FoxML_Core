@@ -431,7 +431,8 @@ impl super::ViewTrait for SettingsView {
         Ok(())
     }
 
-    fn handle_key(&mut self, key: KeyCode) -> Result<bool> {
+    fn handle_key(&mut self, key: KeyCode) -> Result<super::ViewAction> {
+        use super::ViewAction;
         // Clear message
         self.message = None;
 
@@ -464,12 +465,12 @@ impl super::ViewTrait for SettingsView {
                 }
                 _ => {}
             }
-            return Ok(false);
+            return Ok(ViewAction::Continue);
         }
 
         match key {
             KeyCode::Char('q') | KeyCode::Esc => {
-                return Ok(true); // Go back
+                return Ok(ViewAction::Back);
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.selected > 0 {
@@ -509,6 +510,6 @@ impl super::ViewTrait for SettingsView {
             _ => {}
         }
 
-        Ok(false)
+        Ok(ViewAction::Continue)
     }
 }

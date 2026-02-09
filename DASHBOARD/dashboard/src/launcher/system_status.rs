@@ -9,7 +9,7 @@ use std::process::Command;
 use sysinfo::System;
 
 /// Path to training PID file
-const TRAINING_PID_FILE: &str = "/tmp/foxml_training.pid";
+fn training_pid_file() -> std::path::PathBuf { crate::config::training_pid_file() }
 
 /// System status
 pub struct SystemStatus {
@@ -32,7 +32,7 @@ impl SystemStatus {
     /// Check IPC bridge status
     fn check_bridge() -> (bool, String) {
         let output = Command::new("curl")
-            .args(["-s", "-m", "1", "http://127.0.0.1:8765/health"])
+            .args(["-s", "-m", "1", &format!("http://{}/health", crate::config::bridge_url())])
             .output();
 
         match output {
@@ -70,7 +70,7 @@ impl SystemStatus {
 
     /// Check for running training process via PID file
     fn check_training_process() -> (bool, Option<String>) {
-        let content = match fs::read_to_string(TRAINING_PID_FILE) {
+        let content = match fs::read_to_string(&training_pid_file()) {
             Ok(c) => c,
             Err(_) => return (false, None),
         };

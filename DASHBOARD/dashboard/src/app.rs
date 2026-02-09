@@ -2,21 +2,38 @@
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::execute;
 use ratatui::prelude::*;
+use ratatui::widgets::Paragraph;
 use std::io;
-use tracing::{debug, info};
+use std::path::{Path, PathBuf};
+use tracing::{debug, info, warn};
 
+use crate::api::client::DashboardClient;
 use crate::themes::Theme;
 use crate::ui::{
     animation::FadeState,
+    dialog::{ConfirmDialog, DialogResult},
     CommandPalette, HelpOverlay, Notification, NotificationManager, Sidebar,
 };
+
+/// Actions that require confirmation via dialog
+#[derive(Debug)]
+enum PendingAction {
+    ToggleKillSwitch(bool),
+    ActivateModel,
+    StopService(usize),
+    RestartService(usize),
+    CancelTraining(u32), // PID to send SIGTERM
+}
 use crate::views::{
     config_editor::ConfigEditorView, file_browser::FileBrowserView, launcher::LauncherView,
     log_viewer::LogViewerView, model_selector::ModelSelectorView, overview::OverviewView,
     placeholder::PlaceholderView, service_manager::ServiceManagerView, settings::SettingsView,
     trading::TradingView, training::TrainingView, training_launcher::TrainingLauncherView,
-    View, ViewTrait,
+    View, ViewAction, ViewTrait,
 };
 
 /// Main application state
@@ -53,6 +70,20 @@ pub struct App {
     sidebar: Sidebar,
     /// View transition fade animation
     view_fade: Option<FadeState>,
+    /// Pending editor spawn (set by view, consumed by event loop)
+    pending_editor: Option<PathBuf>,
+    /// IPC bridge client for control API calls
+    client: DashboardClient,
+    /// Kill switch state (true = trading halted)
+    kill_switch_active: bool,
+    /// Active confirmation dialog (rendered on top of everything)
+    confirm_dialog: Option<ConfirmDialog>,
+    /// Action to execute if dialog is confirmed
+    pending_action: Option<PendingAction>,
+    /// Bridge connectivity state
+    bridge_connected: bool,
+    /// Last time we checked bridge health
+    last_health_check: std::time::Instant,
 }
 
 impl App {
@@ -95,6 +126,13 @@ impl App {
             help_overlay: HelpOverlay::new(),
             sidebar: Sidebar::with_default_items(),
             view_fade: Some(FadeState::fade_in(200)), // Initial fade-in
+            pending_editor: None,
+            client: DashboardClient::new(&crate::config::bridge_url()),
+            kill_switch_active: false,
+            confirm_dialog: None,
+            pending_action: None,
+            bridge_connected: false,
+            last_health_check: std::time::Instant::now(),
         })
     }
 
@@ -158,6 +196,67 @@ impl App {
         }
     }
 
+    /// Suspend TUI and spawn an external editor on the given file
+    fn suspend_for_editor(&mut self, path: &Path, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
+        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".to_string());
+        info!("Suspending TUI for editor: {} {}", editor, path.display());
+
+        // Leave TUI mode
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+
+        // Run editor synchronously (blocking)
+        let result = std::process::Command::new(&editor)
+            .arg(path)
+            .status();
+
+        // Re-enter TUI mode
+        let _ = enable_raw_mode();
+        let _ = execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture);
+
+        // Force terminal to clear and redraw
+        let _ = terminal.clear();
+
+        match result {
+            Ok(status) => {
+                if status.success() {
+                    self.notifications.push(
+                        Notification::success("Editor closed")
+                            .message(format!("{} exited successfully", editor)),
+                    );
+                } else {
+                    self.notifications.push(
+                        Notification::warning("Editor closed")
+                            .message(format!("{} exited with {}", editor, status)),
+                    );
+                }
+            }
+            Err(e) => {
+                warn!("Failed to spawn editor: {}", e);
+                self.notifications.push(
+                    Notification::warning("Editor failed")
+                        .message(format!("Failed to run {}: {}", editor, e)),
+                );
+            }
+        }
+
+        // Refresh the config editor preview since the file may have changed
+        self.config_editor_view.update_preview();
+    }
+
+    /// Process a ViewAction returned by a view's key handler
+    fn process_view_action(&mut self, action: ViewAction) {
+        match action {
+            ViewAction::Continue => {}
+            ViewAction::Back => {
+                self.switch_view(View::Launcher);
+            }
+            ViewAction::SpawnEditor(path) => {
+                self.pending_editor = Some(path);
+            }
+        }
+    }
+
     /// Run the main event loop
     pub async fn run(&mut self) -> Result<()> {
         let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -175,6 +274,26 @@ impl App {
 
             // Update sidebar hide delay
             self.sidebar.update();
+
+            // Periodic bridge health check (every 5 seconds)
+            if self.last_health_check.elapsed().as_secs() >= 5 {
+                let was_connected = self.bridge_connected;
+                self.bridge_connected = self.client.get_health().await.is_ok();
+                self.last_health_check = std::time::Instant::now();
+
+                // Notify on connectivity change
+                if was_connected && !self.bridge_connected {
+                    self.notifications.push(
+                        Notification::warning("Bridge disconnected")
+                            .message(format!("IPC bridge unreachable at {}", crate::config::bridge_url())),
+                    );
+                } else if !was_connected && self.bridge_connected {
+                    self.notifications.push(
+                        Notification::success("Bridge connected")
+                            .message("IPC bridge is reachable"),
+                    );
+                }
+            }
 
             // Update views periodically
             if self.last_update.elapsed().as_secs() >= 2 {
@@ -228,49 +347,75 @@ impl App {
                 let content_area = self.sidebar.content_area(area);
 
                 // Render current view with theme
-                match &mut self.current_view {
+                let render_result = match &mut self.current_view {
                     View::Launcher => {
-                        let _ = ViewTrait::render(&mut self.launcher_view, f, content_area);
+                        ViewTrait::render(&mut self.launcher_view, f, content_area)
                     }
                     View::Trading => {
-                        let _ = ViewTrait::render(&mut self.trading_view, f, content_area);
+                        ViewTrait::render(&mut self.trading_view, f, content_area)
                     }
                     View::Training => {
-                        let _ = ViewTrait::render(&mut self.training_view, f, content_area);
+                        ViewTrait::render(&mut self.training_view, f, content_area)
                     }
                     View::Overview => {
-                        let _ = ViewTrait::render(&mut self.overview_view, f, content_area);
+                        ViewTrait::render(&mut self.overview_view, f, content_area)
                     }
                     View::Placeholder => {
                         if let Some(ref mut placeholder) = self.placeholder_view {
-                            let _ = ViewTrait::render(placeholder, f, content_area);
+                            ViewTrait::render(placeholder, f, content_area)
+                        } else {
+                            Ok(())
                         }
                     }
                     View::TrainingLauncher => {
-                        let _ = ViewTrait::render(&mut self.training_launcher_view, f, content_area);
+                        ViewTrait::render(&mut self.training_launcher_view, f, content_area)
                     }
                     View::ConfigEditor => {
-                        let _ = ViewTrait::render(&mut self.config_editor_view, f, content_area);
+                        ViewTrait::render(&mut self.config_editor_view, f, content_area)
                     }
                     View::LogViewer => {
-                        let _ = ViewTrait::render(&mut self.log_viewer_view, f, content_area);
+                        ViewTrait::render(&mut self.log_viewer_view, f, content_area)
                     }
                     View::ServiceManager => {
-                        let _ = ViewTrait::render(&mut self.service_manager_view, f, content_area);
+                        ViewTrait::render(&mut self.service_manager_view, f, content_area)
                     }
                     View::ModelSelector => {
-                        let _ = ViewTrait::render(&mut self.model_selector_view, f, content_area);
+                        ViewTrait::render(&mut self.model_selector_view, f, content_area)
                     }
                     View::FileBrowser => {
-                        let _ = ViewTrait::render(&mut self.file_browser_view, f, content_area);
+                        ViewTrait::render(&mut self.file_browser_view, f, content_area)
                     }
                     View::Settings => {
-                        let _ = ViewTrait::render(&mut self.settings_view, f, content_area);
+                        ViewTrait::render(&mut self.settings_view, f, content_area)
                     }
+                };
+                if let Err(e) = render_result {
+                    warn!("View render error: {}", e);
                 }
 
                 // Render fade overlay for view transitions
                 self.render_fade_overlay(content_area, f.buffer_mut());
+
+                // Bridge connectivity indicator (bottom-right)
+                if area.width > 20 && area.height > 2 {
+                    let (indicator, color) = if self.bridge_connected {
+                        ("● Bridge", self.theme.success)
+                    } else {
+                        ("○ Bridge", self.theme.error)
+                    };
+                    let indicator_width = indicator.len() as u16 + 1;
+                    let indicator_area = Rect::new(
+                        area.right().saturating_sub(indicator_width + 1),
+                        area.bottom().saturating_sub(1),
+                        indicator_width,
+                        1,
+                    );
+                    let bridge_text = Paragraph::new(Span::styled(
+                        indicator,
+                        Style::default().fg(color),
+                    ));
+                    f.render_widget(bridge_text, indicator_area);
+                }
 
                 // Render overlays on top (use full area so they appear over sidebar too)
                 // Notifications (top-right)
@@ -281,6 +426,11 @@ impl App {
 
                 // Help overlay (centered)
                 self.help_overlay.render(area, f.buffer_mut(), &self.theme);
+
+                // Confirmation dialog (highest z-order)
+                if let Some(ref dialog) = self.confirm_dialog {
+                    dialog.render(area, f.buffer_mut(), &self.theme);
+                }
             })?;
 
             // Handle events
@@ -304,6 +454,11 @@ impl App {
                 }
             }
 
+            // Handle pending editor spawn (needs terminal access)
+            if let Some(path) = self.pending_editor.take() {
+                self.suspend_for_editor(&path, &mut terminal);
+            }
+
             if self.should_quit {
                 break;
             }
@@ -312,8 +467,116 @@ impl App {
         Ok(())
     }
 
+    /// Execute a confirmed pending action
+    async fn execute_pending_action(&mut self) {
+        if let Some(action) = self.pending_action.take() {
+            match action {
+                PendingAction::ToggleKillSwitch(new_state) => {
+                    match self.client.toggle_kill_switch(new_state, Some("Dashboard (confirmed)".to_string())).await {
+                        Ok(_) => {
+                            self.kill_switch_active = new_state;
+                            if new_state {
+                                self.notifications.push(
+                                    Notification::warning("Kill Switch ACTIVATED")
+                                        .message("Trading halted via kill switch"),
+                                );
+                            } else {
+                                self.notifications.push(
+                                    Notification::success("Kill Switch deactivated")
+                                        .message("Trading resumed — kill switch off"),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            self.notifications.push(
+                                Notification::warning("Kill switch failed")
+                                    .message(format!("Bridge error: {}", e)),
+                            );
+                        }
+                    }
+                }
+                PendingAction::ActivateModel => {
+                    match self.model_selector_view.activate_selected() {
+                        Ok(msg) => {
+                            self.notifications.push(
+                                Notification::success("Model activated").message(msg),
+                            );
+                        }
+                        Err(e) => {
+                            self.notifications.push(
+                                Notification::warning("Activation failed")
+                                    .message(format!("{}", e)),
+                            );
+                        }
+                    }
+                }
+                PendingAction::StopService(idx) => {
+                    match self.service_manager_view.stop_service(idx) {
+                        Ok(msg) => {
+                            self.notifications.push(
+                                Notification::info("Service stopped").message(msg),
+                            );
+                        }
+                        Err(e) => {
+                            self.notifications.push(
+                                Notification::warning("Stop failed")
+                                    .message(format!("{}", e)),
+                            );
+                        }
+                    }
+                }
+                PendingAction::RestartService(idx) => {
+                    match self.service_manager_view.restart_service(idx) {
+                        Ok(msg) => {
+                            self.notifications.push(
+                                Notification::info("Service restarted").message(msg),
+                            );
+                        }
+                        Err(e) => {
+                            self.notifications.push(
+                                Notification::warning("Restart failed")
+                                    .message(format!("{}", e)),
+                            );
+                        }
+                    }
+                }
+                PendingAction::CancelTraining(pid) => {
+                    match self.training_view.cancel_run(pid) {
+                        Ok(msg) => {
+                            self.notifications.push(
+                                Notification::warning("Training cancelled").message(msg),
+                            );
+                        }
+                        Err(e) => {
+                            self.notifications.push(
+                                Notification::warning("Cancel failed")
+                                    .message(format!("{}", e)),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Handle key press
     async fn handle_key(&mut self, key: KeyCode, modifiers: KeyModifiers) -> Result<bool> {
+        // Handle confirmation dialog first (highest priority)
+        if let Some(ref mut dialog) = self.confirm_dialog {
+            match dialog.handle_key(key) {
+                DialogResult::Confirmed => {
+                    self.confirm_dialog = None;
+                    self.execute_pending_action().await;
+                }
+                DialogResult::Cancelled => {
+                    self.confirm_dialog = None;
+                    self.pending_action = None;
+                }
+                DialogResult::Pending => {}
+            }
+            return Ok(false);
+        }
+
         // Handle command palette first if visible
         if self.command_palette.visible {
             match key {
@@ -348,6 +611,26 @@ impl App {
             return Ok(false);
         }
 
+        // If the config editor has an active inline editor, delegate ALL keys to it
+        // (except Ctrl shortcuts which are handled below)
+        if matches!(self.current_view, View::ConfigEditor)
+            && self.config_editor_view.has_inline_editor()
+            && !modifiers.contains(KeyModifiers::CONTROL)
+        {
+            let action = self.config_editor_view.handle_key(key)?;
+            self.process_view_action(action);
+            return Ok(false);
+        }
+
+        // If the log viewer is in search input mode, delegate ALL keys to it
+        if matches!(self.current_view, View::LogViewer)
+            && self.log_viewer_view.is_searching()
+        {
+            let action = self.log_viewer_view.handle_key(key)?;
+            self.process_view_action(action);
+            return Ok(false);
+        }
+
         // Global shortcuts with Ctrl modifier
         if modifiers.contains(KeyModifiers::CONTROL) {
             match key {
@@ -356,11 +639,15 @@ impl App {
                     return Ok(false);
                 }
                 KeyCode::Char('k') => {
-                    // Toggle kill switch
-                    self.notifications.push(
-                        Notification::warning("Kill switch toggled")
-                            .message("Trading kill switch state changed"),
-                    );
+                    // Toggle kill switch — requires confirmation
+                    let new_state = !self.kill_switch_active;
+                    let msg = if new_state {
+                        "ACTIVATE the kill switch? This will halt all trading immediately."
+                    } else {
+                        "Deactivate the kill switch? Trading will resume."
+                    };
+                    self.pending_action = Some(PendingAction::ToggleKillSwitch(new_state));
+                    self.confirm_dialog = Some(ConfirmDialog::new("Kill Switch", msg));
                     return Ok(false);
                 }
                 KeyCode::Char('q') => {
@@ -387,6 +674,9 @@ impl App {
                 if matches!(self.current_view, View::Launcher) {
                     self.should_quit = true;
                     return Ok(true);
+                } else if matches!(self.current_view, View::Trading) && self.trading_view.has_detail_panel() {
+                    // Close detail panel in trading view instead of navigating away
+                    self.trading_view.close_detail_panel();
                 } else {
                     self.switch_view(View::Launcher);
                 }
@@ -396,8 +686,12 @@ impl App {
                 self.help_overlay.show();
             }
             KeyCode::Char('/') => {
-                // Alternative trigger for command palette
-                self.command_palette.show();
+                // In log viewer, '/' enters search mode; elsewhere opens command palette
+                if matches!(self.current_view, View::LogViewer) {
+                    let _ = self.log_viewer_view.handle_key(key)?;
+                } else {
+                    self.command_palette.show();
+                }
             }
             KeyCode::Char('[') => {
                 // Toggle sidebar visibility
@@ -453,28 +747,28 @@ impl App {
                 // Views that handle 'r' themselves (action key, not just refresh)
                 match self.current_view {
                     View::ServiceManager => {
-                        // 'r' = restart service in ServiceManager
-                        let _ = self.service_manager_view.handle_key(key)?;
+                        let action = self.service_manager_view.handle_key(key)?;
+                        self.process_view_action(action);
                         return Ok(false);
                     }
                     View::TrainingLauncher => {
-                        // 'r' = refresh in TrainingLauncher
-                        let _ = self.training_launcher_view.handle_key(key)?;
+                        let action = self.training_launcher_view.handle_key(key)?;
+                        self.process_view_action(action);
                         return Ok(false);
                     }
                     View::ConfigEditor => {
-                        // 'r' might be used in editor
-                        let _ = self.config_editor_view.handle_key(key)?;
+                        let action = self.config_editor_view.handle_key(key)?;
+                        self.process_view_action(action);
                         return Ok(false);
                     }
                     View::ModelSelector => {
-                        // 'r' might be used in model selector
-                        let _ = self.model_selector_view.handle_key(key)?;
+                        let action = self.model_selector_view.handle_key(key)?;
+                        self.process_view_action(action);
                         return Ok(false);
                     }
                     View::FileBrowser => {
-                        // 'r' = refresh in file browser
-                        let _ = self.file_browser_view.handle_key(key)?;
+                        let action = self.file_browser_view.handle_key(key)?;
+                        self.process_view_action(action);
                         return Ok(false);
                     }
                     _ => {}
@@ -522,6 +816,25 @@ impl App {
                     View::Launcher => {
                         // Menu navigation in launcher
                         self.launcher_view.handle_key(key);
+                    }
+                    View::Trading => {
+                        // Trading view: Up/Down/j for position navigation, k for kill switch
+                        match key {
+                            KeyCode::Up => { self.trading_view.position_up(); }
+                            KeyCode::Down | KeyCode::Char('j') => { self.trading_view.position_down(); }
+                            KeyCode::Char('k') => {
+                                // Kill switch toggle from trading view (with confirmation)
+                                let new_state = !self.kill_switch_active;
+                                let msg = if new_state {
+                                    "ACTIVATE the kill switch? This will halt all trading immediately."
+                                } else {
+                                    "Deactivate the kill switch? Trading will resume."
+                                };
+                                self.pending_action = Some(PendingAction::ToggleKillSwitch(new_state));
+                                self.confirm_dialog = Some(ConfirmDialog::new("Kill Switch", msg));
+                            }
+                            _ => {}
+                        }
                     }
                     View::Training => {
                         // Training view navigation (up/down for run list)
@@ -603,74 +916,111 @@ impl App {
                 }
             }
             _ => {
-                // Delegate to current view for all other keys
-                match self.current_view {
-                    View::Training => {
-                        let _ = self.training_view.handle_key(key)?;
-                    }
-                    View::Trading => {
-                        let _ = self.trading_view.handle_key(key)?;
-                    }
-                    View::Overview => {
-                        let _ = self.overview_view.handle_key(key)?;
-                    }
-                    View::Placeholder => {
-                        // Placeholder can handle back keys
-                        if matches!(key, KeyCode::Char('b') | KeyCode::Esc) {
-                            self.switch_view(View::Launcher);
+                // Intercept destructive actions to show confirmation dialog
+                let intercepted = match (&self.current_view, key) {
+                    // Model activation requires confirmation
+                    (View::ModelSelector, KeyCode::Char('a')) => {
+                        if let Some(run_id) = self.model_selector_view.selected_run_id() {
+                            self.pending_action = Some(PendingAction::ActivateModel);
+                            self.confirm_dialog = Some(ConfirmDialog::new(
+                                "Activate Model",
+                                format!("Activate {} for live trading? This will update the active model symlink.", run_id),
+                            ));
                         }
+                        true
                     }
-                    View::TrainingLauncher => {
-                        // Training launcher handles all keys
-                        if self.training_launcher_view.handle_key(key)? {
-                            // View requested to go back
-                            self.switch_view(View::Launcher);
+                    // Service stop requires confirmation
+                    (View::ServiceManager, KeyCode::Char('x')) => {
+                        let idx = self.service_manager_view.selected_index();
+                        if let Some(name) = self.service_manager_view.selected_service_name() {
+                            self.pending_action = Some(PendingAction::StopService(idx));
+                            self.confirm_dialog = Some(ConfirmDialog::new(
+                                "Stop Service",
+                                format!("Stop {}? This will interrupt any running operations.", name),
+                            ));
                         }
+                        true
                     }
-                    View::ConfigEditor => {
-                        // Config editor handles all keys
-                        if self.config_editor_view.handle_key(key)? {
-                            // View requested to go back
-                            self.switch_view(View::Launcher);
+                    // Service restart requires confirmation
+                    (View::ServiceManager, KeyCode::Char('r')) => {
+                        let idx = self.service_manager_view.selected_index();
+                        if let Some(name) = self.service_manager_view.selected_service_name() {
+                            self.pending_action = Some(PendingAction::RestartService(idx));
+                            self.confirm_dialog = Some(ConfirmDialog::new(
+                                "Restart Service",
+                                format!("Restart {}? This will briefly interrupt the service.", name),
+                            ));
                         }
+                        true
                     }
-                    View::LogViewer => {
-                        // Log viewer handles all keys
-                        if self.log_viewer_view.handle_key(key)? {
-                            // View requested to go back
-                            self.switch_view(View::Launcher);
+                    // Training run cancellation requires confirmation
+                    (View::Training, KeyCode::Char('x')) => {
+                        if let Some((pid, run_id)) = self.training_view.running_pid() {
+                            self.pending_action = Some(PendingAction::CancelTraining(pid));
+                            self.confirm_dialog = Some(ConfirmDialog::new(
+                                "Cancel Training",
+                                format!("Cancel training run {}? This will send SIGTERM to PID {}.", run_id, pid),
+                            ));
+                        } else {
+                            self.notifications.push(
+                                Notification::info("No running training")
+                                    .message("No active training process found to cancel"),
+                            );
                         }
+                        true
                     }
-                    View::ServiceManager => {
-                        // Service manager handles all keys
-                        if self.service_manager_view.handle_key(key)? {
-                            // View requested to go back
-                            self.switch_view(View::Launcher);
+                    _ => false,
+                };
+
+                if !intercepted {
+                    // Delegate to current view for all other keys
+                    match self.current_view {
+                        View::Training => {
+                            let _ = self.training_view.handle_key(key)?;
                         }
-                    }
-                    View::ModelSelector => {
-                        // Model selector handles all keys
-                        if self.model_selector_view.handle_key(key)? {
-                            // View requested to go back
-                            self.switch_view(View::Launcher);
+                        View::Trading => {
+                            let _ = self.trading_view.handle_key(key)?;
                         }
-                    }
-                    View::FileBrowser => {
-                        // File browser handles all keys
-                        if self.file_browser_view.handle_key(key)? {
-                            // View requested to go back
-                            self.switch_view(View::Launcher);
+                        View::Overview => {
+                            let _ = self.overview_view.handle_key(key)?;
                         }
-                    }
-                    View::Settings => {
-                        // Settings handles all keys
-                        if self.settings_view.handle_key(key)? {
-                            // View requested to go back
-                            self.switch_view(View::Launcher);
+                        View::Placeholder => {
+                            // Placeholder can handle back keys
+                            if matches!(key, KeyCode::Char('b') | KeyCode::Esc) {
+                                self.switch_view(View::Launcher);
+                            }
                         }
-                    }
-                    View::Launcher => {
-                        // Launcher handles its own keys above
+                        View::TrainingLauncher => {
+                            let action = self.training_launcher_view.handle_key(key)?;
+                            self.process_view_action(action);
+                        }
+                        View::ConfigEditor => {
+                            let action = self.config_editor_view.handle_key(key)?;
+                            self.process_view_action(action);
+                        }
+                        View::LogViewer => {
+                            let action = self.log_viewer_view.handle_key(key)?;
+                            self.process_view_action(action);
+                        }
+                        View::ServiceManager => {
+                            let action = self.service_manager_view.handle_key(key)?;
+                            self.process_view_action(action);
+                        }
+                        View::ModelSelector => {
+                            let action = self.model_selector_view.handle_key(key)?;
+                            self.process_view_action(action);
+                        }
+                        View::FileBrowser => {
+                            let action = self.file_browser_view.handle_key(key)?;
+                            self.process_view_action(action);
+                        }
+                        View::Settings => {
+                            let action = self.settings_view.handle_key(key)?;
+                            self.process_view_action(action);
+                        }
+                        View::Launcher => {
+                            // Launcher handles its own keys above
+                        }
                     }
                 }
             }
@@ -692,28 +1042,52 @@ impl App {
                 self.switch_view(View::Training);
             }
             "nav.models" => {
-                self.switch_to_placeholder("Model Manager - Coming soon");
+                self.switch_view(View::ModelSelector);
             }
             "nav.config" => {
-                self.switch_to_placeholder("Config Editor - Coming soon");
+                let default_config = crate::config::config_dir().join("experiments/production_baseline.yaml");
+                let _ = self.config_editor_view.open(default_config);
+                self.switch_view(View::ConfigEditor);
             }
 
             // Trading commands
             "trading.killswitch" => {
-                self.notifications.push(
-                    Notification::warning("Kill Switch")
-                        .message("Kill switch toggled - trading halted"),
-                );
+                let new_state = !self.kill_switch_active;
+                let msg = if new_state {
+                    "ACTIVATE the kill switch? This will halt all trading immediately."
+                } else {
+                    "Deactivate the kill switch? Trading will resume."
+                };
+                self.pending_action = Some(PendingAction::ToggleKillSwitch(new_state));
+                self.confirm_dialog = Some(ConfirmDialog::new("Kill Switch", msg));
             }
             "trading.pause" => {
-                self.notifications.push(
-                    Notification::info("Trading Paused").message("Trading pipeline paused"),
-                );
+                match self.client.pause_engine().await {
+                    Ok(_) => {
+                        self.notifications.push(
+                            Notification::info("Trading Paused").message("Trading pipeline paused"),
+                        );
+                    }
+                    Err(e) => {
+                        self.notifications.push(
+                            Notification::warning("Pause Failed").message(format!("Bridge error: {}", e)),
+                        );
+                    }
+                }
             }
             "trading.resume" => {
-                self.notifications.push(
-                    Notification::success("Trading Resumed").message("Trading pipeline resumed"),
-                );
+                match self.client.resume_engine().await {
+                    Ok(_) => {
+                        self.notifications.push(
+                            Notification::success("Trading Resumed").message("Trading pipeline resumed"),
+                        );
+                    }
+                    Err(e) => {
+                        self.notifications.push(
+                            Notification::warning("Resume Failed").message(format!("Bridge error: {}", e)),
+                        );
+                    }
+                }
             }
             "trading.refresh" => {
                 let _ = self.trading_view.update_metrics().await;
@@ -727,17 +1101,27 @@ impl App {
                 self.switch_view(View::TrainingLauncher);
             }
             "training.stop" => {
-                self.notifications.push(
-                    Notification::warning("Training Stopped").message("Training run stopped"),
-                );
+                if let Some((pid, run_id)) = self.training_view.running_pid() {
+                    self.pending_action = Some(PendingAction::CancelTraining(pid));
+                    self.confirm_dialog = Some(ConfirmDialog::new(
+                        "Cancel Training",
+                        format!("Cancel training run {}? This will send SIGTERM to PID {}.", run_id, pid),
+                    ));
+                } else {
+                    self.notifications.push(
+                        Notification::info("No Training").message("No active training process to stop"),
+                    );
+                }
             }
             "training.logs" => {
-                self.switch_to_placeholder("Training Logs - Coming soon");
+                self.switch_view(View::LogViewer);
             }
 
             // Config commands
             "config.edit" => {
-                self.switch_to_placeholder("Config Editor - Coming soon");
+                let default_config = crate::config::config_dir().join("experiments/production_baseline.yaml");
+                let _ = self.config_editor_view.open(default_config);
+                self.switch_view(View::ConfigEditor);
             }
             "config.reload" => {
                 self.theme = Theme::load();
@@ -780,7 +1164,7 @@ impl App {
             }
             MenuAction::ConfigEditor => {
                 // Open config browser (will show production_baseline by default if available)
-                let default_config = std::path::PathBuf::from("CONFIG/experiments/production_baseline.yaml");
+                let default_config = crate::config::config_dir().join("experiments/production_baseline.yaml");
                 let _ = self.config_editor_view.open(default_config);
                 self.switch_view(View::ConfigEditor);
             }

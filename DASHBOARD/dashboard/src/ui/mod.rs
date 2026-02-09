@@ -5,6 +5,7 @@
 
 pub mod animation;
 pub mod borders;
+pub mod dialog;
 pub mod panels;
 pub mod status_bar;
 pub mod notification;

@@ -6,10 +6,42 @@ use ratatui::widgets::*;
 use crate::api::events::Position;
 use crate::themes::Theme;
 
+/// Sort mode for position table
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PositionSort {
+    Symbol,
+    PnlDesc,
+    SizeDesc,
+    WeightDesc,
+}
+
+impl PositionSort {
+    /// Cycle to next sort mode
+    pub fn next(self) -> Self {
+        match self {
+            Self::Symbol => Self::PnlDesc,
+            Self::PnlDesc => Self::SizeDesc,
+            Self::SizeDesc => Self::WeightDesc,
+            Self::WeightDesc => Self::Symbol,
+        }
+    }
+
+    /// Display label for sort mode
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Symbol => "Symbol",
+            Self::PnlDesc => "P&L",
+            Self::SizeDesc => "Size",
+            Self::WeightDesc => "Weight",
+        }
+    }
+}
+
 /// Position table widget
 pub struct PositionTable {
     positions: Vec<Position>,
     selected: usize,
+    sort_mode: PositionSort,
 }
 
 impl PositionTable {
@@ -17,15 +49,52 @@ impl PositionTable {
         Self {
             positions: Vec::new(),
             selected: 0,
+            sort_mode: PositionSort::Symbol,
         }
     }
 
     /// Update positions from API
     pub fn update(&mut self, positions: Vec<Position>) {
         self.positions = positions;
+        self.apply_sort();
         // Keep selection in bounds
         if self.selected >= self.positions.len() && !self.positions.is_empty() {
             self.selected = self.positions.len() - 1;
+        }
+    }
+
+    /// Cycle to next sort mode
+    pub fn cycle_sort(&mut self) {
+        self.sort_mode = self.sort_mode.next();
+        self.apply_sort();
+    }
+
+    /// Get current sort mode label
+    pub fn sort_label(&self) -> &'static str {
+        self.sort_mode.label()
+    }
+
+    /// Apply current sort to positions
+    fn apply_sort(&mut self) {
+        match self.sort_mode {
+            PositionSort::Symbol => {
+                self.positions.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+            }
+            PositionSort::PnlDesc => {
+                self.positions.sort_by(|a, b| {
+                    b.unrealized_pnl.partial_cmp(&a.unrealized_pnl).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+            PositionSort::SizeDesc => {
+                self.positions.sort_by(|a, b| {
+                    b.shares.abs().cmp(&a.shares.abs())
+                });
+            }
+            PositionSort::WeightDesc => {
+                self.positions.sort_by(|a, b| {
+                    b.weight.partial_cmp(&a.weight).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
         }
     }
 
@@ -95,13 +164,20 @@ impl PositionTable {
         let data_start_y = area.y + 2;
         let visible_rows = (area.height as usize).saturating_sub(2);
 
-        for (i, pos) in self.positions.iter().take(visible_rows).enumerate() {
+        // Calculate scroll offset to keep selected item visible
+        let scroll_offset = if self.selected >= visible_rows {
+            self.selected - visible_rows + 1
+        } else {
+            0
+        };
+
+        for (i, pos) in self.positions.iter().skip(scroll_offset).take(visible_rows).enumerate() {
             let y = data_start_y + i as u16;
             if y >= area.bottom() {
                 break;
             }
 
-            let is_selected = i == self.selected;
+            let is_selected = (i + scroll_offset) == self.selected;
             let row_bg = if is_selected {
                 theme.surface
             } else {

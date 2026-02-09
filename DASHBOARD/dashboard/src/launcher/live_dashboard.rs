@@ -18,7 +18,7 @@ use crate::ui::borders::Separators;
 use crate::ui::panels::Panel;
 
 /// Path to training events file
-const TRAINING_EVENTS_FILE: &str = "/tmp/foxml_training_events.jsonl";
+fn training_events_file() -> std::path::PathBuf { crate::config::training_events_file() }
 
 /// Maximum recent events to display
 const MAX_RECENT_EVENTS: usize = 5;
@@ -74,7 +74,7 @@ pub struct LiveDashboard {
 impl LiveDashboard {
     pub fn new() -> Self {
         let mut dashboard = Self {
-            client: DashboardClient::new("127.0.0.1:8765"),
+            client: DashboardClient::new(&crate::config::bridge_url()),
             last_bridge_update: Instant::now(),
             last_training_poll: Instant::now(),
 
@@ -108,7 +108,7 @@ impl LiveDashboard {
 
     /// Recover current training state from existing events file
     fn recover_training_state(&mut self) {
-        let file = match fs::File::open(TRAINING_EVENTS_FILE) {
+        let file = match fs::File::open(&training_events_file()) {
             Ok(f) => f,
             Err(_) => {
                 self.event_file_pos = 0;
@@ -175,7 +175,7 @@ impl LiveDashboard {
         }
         self.last_training_poll = Instant::now();
 
-        let file = match fs::File::open(TRAINING_EVENTS_FILE) {
+        let file = match fs::File::open(&training_events_file()) {
             Ok(f) => f,
             Err(_) => return, // File doesn't exist
         };

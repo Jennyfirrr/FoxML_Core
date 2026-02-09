@@ -36,7 +36,7 @@ pub struct StatusCanvas {
 impl StatusCanvas {
     pub fn new() -> Self {
         Self {
-            client: DashboardClient::new("127.0.0.1:8765"),
+            client: DashboardClient::new(&crate::config::bridge_url()),
             last_update: Instant::now(),
             bridge_connected: false,
             alpaca_connected: false,
