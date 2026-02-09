@@ -1,6 +1,6 @@
 # LIVE_TRADING Inference Fixes — Master Plan
 
-**Status**: Ready for implementation
+**Status**: Phases 0-3 COMPLETE, Phase 4 pending
 **Created**: 2026-02-08
 **Branch**: `analysis/code-review-and-raw-ohlcv`
 **Depends on**: `raw-ohlcv-sequence-mode.md` (Phases 1-2 complete), `cross-sectional-ranking-objective.md` (complete)
@@ -45,18 +45,18 @@ CrossSectionalRankingPredictor (NEW — future phase)
 
 ### Phase 0: Barrier Gate Quick Fix (standalone)
 **File**: `live-phase0-barrier-gate-fix.md`
-**Status**: Ready
+**Status**: ✅ COMPLETE (commit b8bdf39)
 **Estimated scope**: 1 file, ~10 lines
 
 Fix the broken `predict_single_target()` call in `trading_engine.py`. This is a regression that affects ALL model types (not just raw OHLCV). Can be done independently of Phases 1-3.
 
-- [ ] Add `predict_single_target()` method to `MultiHorizonPredictor`
-- [ ] Delegates to `predict_single_horizon()` with the default/first horizon
-- [ ] Verify barrier gate evaluates correctly
+- [x] Add `predict_single_target()` method to `MultiHorizonPredictor`
+- [x] Delegates to `_predict_single()` with first available family/horizon
+- [x] Added `.alpha` property to `ModelPrediction` (used by barrier gate sigmoid)
 
 ### Phase 1: Input Mode Awareness
 **File**: `live-phase1-input-mode-awareness.md`
-**Status**: Ready
+**Status**: ✅ COMPLETE (commit efcc723)
 **Estimated scope**: 3 files, ~60 lines
 
 Add `input_mode` detection throughout the inference pipeline. No new functionality — just make every component aware of which mode a model requires.
@@ -67,38 +67,40 @@ Files:
 - `LIVE_TRADING/prediction/predictor.py` — `_predict_single()`
 
 Key changes:
-- [ ] `ModelLoader.get_input_mode(target, family)` → returns `"features"` or `"raw_sequence"`
-- [ ] `ModelLoader.get_feature_list()` — suppress warning for raw_sequence models
-- [ ] `InferenceEngine._init_sequential_buffer()` — use `sequence_channels` for raw models
-- [ ] `InferenceEngine.predict()` — route to correct prediction path
-- [ ] `MultiHorizonPredictor._predict_single()` — branch on input_mode
+- [x] `ModelLoader.get_input_mode(target, family)` → returns `"features"` or `"raw_sequence"`
+- [x] `ModelLoader.get_sequence_config(target, family)` → returns seq config dict
+- [x] `ModelLoader.get_feature_list()` — suppress warning for raw_sequence models
+- [x] `InferenceEngine._init_sequential_buffer()` — use `sequence_channels` for raw models (F=5)
+- [x] `InferenceEngine.predict()` — route to `_predict_raw_sequential()` for raw models
+- [x] `InferenceEngine._predict_raw_sequential()` — full implementation (push to buffer, predict)
+- [x] `MultiHorizonPredictor._predict_single()` — branch on input_mode
 
 ### Phase 2: Raw OHLCV Inference Path
 **File**: `live-phase2-raw-ohlcv-inference.md`
-**Status**: Ready
+**Status**: ✅ COMPLETE (commit 2ef0fba)
 **Estimated scope**: 3 files, ~120 lines
 
 Implement the actual raw OHLCV data preparation and inference path.
 
 Key changes:
-- [ ] Import `_normalize_ohlcv_sequence` from `TRAINING/training_strategies/utils.py` (SST — single source of truth, already marked for LIVE_TRADING use)
-- [ ] `MultiHorizonPredictor._prepare_raw_sequence(prices, metadata)` — extract OHLCV columns, normalize, return `(T, 5)` array
-- [ ] `InferenceEngine._predict_raw_sequential()` — push OHLCV rows to buffer, predict when ready
-- [ ] Handle buffer warmup (return NaN while filling)
-- [ ] Validate `sequence_normalization` exists in metadata, default to `"returns"`
+- [x] Import `_normalize_ohlcv_sequence` from `TRAINING/training_strategies/utils.py` (SST)
+- [x] `MultiHorizonPredictor._prepare_raw_sequence(prices, target, family)` — extract OHLCV columns (case-insensitive), normalize via SST, return `(5,)` array for buffer
+- [x] `InferenceEngine._predict_raw_sequential()` — push OHLCV rows to buffer, predict when ready
+- [x] Handle buffer warmup (return NaN while filling)
+- [x] Validate `sequence_normalization` exists in metadata, default to `"returns"`
 
 ### Phase 3: Testing & Contract Verification
 **File**: `live-phase3-testing.md`
-**Status**: Ready
+**Status**: ✅ COMPLETE (commit daee527)
 **Estimated scope**: 2 new test files, ~200 lines
 
 End-to-end verification that raw OHLCV models work through the live pipeline.
 
-- [ ] Unit test: `test_inference_raw_sequence.py` — mock model, verify (T, 5) input
-- [ ] Unit test: `test_predictor_input_mode.py` — verify branching logic
-- [ ] Contract test: verify `model_meta.json` fields consumed correctly
-- [ ] Integration test: load a real raw_sequence model artifact, run prediction cycle
-- [ ] Backward compat test: models without `input_mode` still work (defaults to features)
+- [x] Unit test: `test_live_inference_input_mode.py` — 14 tests for loader, inference, predictor
+- [x] Integration test: `test_live_raw_ohlcv_e2e.py` — 9 tests for normalization, column mapping, edge cases
+- [x] Contract test: verify `model_meta.json` fields consumed correctly
+- [x] Backward compat test: models without `input_mode` default to features
+- [x] All 23 tests passing
 
 ### Phase 4: Cross-Sectional Ranking Inference (future)
 **File**: `live-phase4-cs-ranking-inference.md`
@@ -156,3 +158,11 @@ All changes must satisfy `INTEGRATION_CONTRACTS.md` v1.3:
 - Confirmed `input_mode` appears 0 times in LIVE_TRADING code
 - Confirmed INTEGRATION_CONTRACTS.md v1.3 already documents expected consumer behavior
 - Created master plan with 5 phases (0-4)
+
+### 2026-02-08: Phases 0-3 implemented
+- Phase 0: Added `predict_single_target()` + `.alpha` property on ModelPrediction
+- Phase 1: Added `get_input_mode()`, `get_sequence_config()` to loader; fixed buffer init for raw; added routing in predict(); full `_predict_raw_sequential()` implementation
+- Phase 2: Imported SST normalization function; implemented `_prepare_raw_sequence()` with case-insensitive column matching
+- Phase 3: 23 tests all passing (14 unit + 9 integration)
+- Phase 4 (CS ranking inference) remains for future implementation
+- All changes on branch `analysis/code-review-and-raw-ohlcv`
