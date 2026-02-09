@@ -413,19 +413,21 @@ impl super::ViewTrait for TradingView {
     fn handle_key(&mut self, key: crossterm::event::KeyCode) -> Result<bool> {
         match key {
             crossterm::event::KeyCode::Char('r') => {
-                // Refresh all data
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    self.refresh_all().await;
+                // Refresh all data (use existing runtime handle to avoid nested runtime panic)
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        self.refresh_all().await;
+                    });
                 });
                 Ok(false)
             }
             crossterm::event::KeyCode::Char('c') => {
                 // Connect to WebSocket
                 if !self.ws_connected {
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(async {
-                        let _ = self.connect_events().await;
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            let _ = self.connect_events().await;
+                        });
                     });
                 }
                 Ok(false)

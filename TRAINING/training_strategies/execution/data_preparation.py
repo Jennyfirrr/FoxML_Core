@@ -237,7 +237,8 @@ def prepare_training_data_cross_sectional(mtf_data: Dict[str, pd.DataFrame],
     if USE_POLARS:
         result = _prepare_training_data_polars(
             mtf_data, target, feature_names, min_cs, max_cs_samples, routing_decisions,
-            registry_overlay_dir=registry_overlay_dir
+            registry_overlay_dir=registry_overlay_dir,
+            detected_interval=detected_interval,
         )
     else:
         result = _prepare_training_data_pandas(
@@ -283,14 +284,15 @@ def prepare_training_data_cross_sectional(mtf_data: Dict[str, pd.DataFrame],
     
     return result
 
-def _prepare_training_data_polars(mtf_data: Dict[str, pd.DataFrame], 
-                                 target: str, 
+def _prepare_training_data_polars(mtf_data: Dict[str, pd.DataFrame],
+                                 target: str,
                                  feature_names: List[str] = None,
                                  min_cs: int = 10,
                                  max_cs_samples: int = None,
                                  routing_decisions: Optional[Dict[str, Dict[str, Any]]] = None,
                                  *,  # Keyword-only separator
-                                 registry_overlay_dir: Optional[Path] = None) -> Tuple[np.ndarray, np.ndarray, List[str], np.ndarray, np.ndarray, List[str], Optional[np.ndarray], Dict[str, Any]]:
+                                 registry_overlay_dir: Optional[Path] = None,
+                                 detected_interval: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray, List[str], np.ndarray, np.ndarray, List[str], Optional[np.ndarray], Dict[str, Any]]:
     """Polars-based data preparation for memory efficiency with cross-sectional sampling."""
     
     # Initialize feature auditor for tracking feature drops
@@ -383,18 +385,13 @@ def _prepare_training_data_polars(mtf_data: Dict[str, pd.DataFrame],
     if feature_names:
         try:
             from TRAINING.ranking.utils.leakage_filtering import filter_features_for_target
-            from TRAINING.ranking.utils.data_interval import detect_interval_from_dataframe
-            
-            # Detect data interval for horizon conversion
-            # DETERMINISTIC: Use lexicographically first symbol to ensure same dataframe across runs
-            first_symbol = min(mtf_data.keys())
-            first_df = mtf_data[first_symbol]
-            detected_interval = detect_interval_from_dataframe(first_df, timestamp_column='ts', default=5)
-            # Ensure interval is valid (> 0)
-            if detected_interval <= 0:
+
+            # Use pre-computed detected_interval passed from caller
+            # (mtf_data entries may be None after streaming_concat with release_after_convert=True)
+            if detected_interval is None or detected_interval <= 0:
                 detected_interval = 5
-                logger.warning(f"  Invalid detected interval, using default: 5m")
-            
+                logger.warning(f"  No detected interval available, using default: 5m")
+
             # Filter features using registry
             all_columns = list(combined_pl.columns)
             validated_features = filter_features_for_target(

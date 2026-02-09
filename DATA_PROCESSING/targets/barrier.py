@@ -385,17 +385,17 @@ def add_barrier_targets_to_dataframe(
             
             if len(barrier_targets) == 0:
                 continue
-                
-    # Add columns with horizon and barrier size suffix
-    suffix = f"_{horizon}m_{barrier_size:.1f}"
-    
-    # Rename columns with suffix
-    renamed_targets = barrier_targets.copy()
-    renamed_targets.columns = [f"{col}{suffix}" for col in barrier_targets.columns]
-    
-    # Concatenate all at once to avoid fragmentation
-    result_df = pd.concat([result_df, renamed_targets], axis=1)
-    
+
+            # Add columns with horizon and barrier size suffix
+            suffix = f"_{horizon}m_{barrier_size:.1f}"
+
+            # Rename columns with suffix
+            renamed_targets = barrier_targets.copy()
+            renamed_targets.columns = [f"{col}{suffix}" for col in barrier_targets.columns]
+
+            # Concatenate all at once to avoid fragmentation
+            result_df = pd.concat([result_df, renamed_targets], axis=1)
+
     return result_df
 
 def add_zigzag_targets_to_dataframe(

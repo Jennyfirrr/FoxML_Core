@@ -244,10 +244,19 @@ class SmartBarrierProcessor:
         try:
             # Find input file (handle interval=5m/symbol=SYMBOL structure)
             input_dir = None
+            interval_minutes = None
             for interval_dir in self.data_dir.glob("interval=*"):
                 symbol_dir = interval_dir / f"symbol={symbol}"
                 if symbol_dir.exists():
                     input_dir = symbol_dir
+                    # Parse interval from directory name (e.g., "interval=5m" -> 5.0)
+                    interval_str = interval_dir.name.split("=", 1)[1]
+                    if interval_str.endswith("m"):
+                        interval_minutes = float(interval_str[:-1])
+                    elif interval_str.endswith("h"):
+                        interval_minutes = float(interval_str[:-1]) * 60
+                    else:
+                        interval_minutes = float(interval_str)
                     break
             
             if not input_dir:
@@ -285,35 +294,39 @@ class SmartBarrierProcessor:
                     
                     # Add barrier targets with optimized parameters
                     df = add_barrier_targets_to_dataframe(
-                        df, 
+                        df,
                         price_col=price_col,
                         horizons=self.horizons,
-                        barrier_sizes=self.barrier_sizes
+                        barrier_sizes=self.barrier_sizes,
+                        interval_minutes=interval_minutes,
                     )
-                    
+
                     # Add ZigZag targets
                     df = add_zigzag_targets_to_dataframe(
                         df,
                         price_col=price_col,
                         horizons=self.horizons,
-                        reversal_pcts=[0.05, 0.1, 0.2]  # Default reversal percentages
+                        reversal_pcts=[0.05, 0.1, 0.2],  # Default reversal percentages
+                        interval_minutes=interval_minutes,
                     )
-                    
+
                     # Add MFE/MDD targets
                     df = add_mfe_mdd_targets_to_dataframe(
                         df,
                         price_col=price_col,
                         horizons=self.horizons,
-                        thresholds=[0.001, 0.002, 0.005]  # Default thresholds
+                        thresholds=[0.001, 0.002, 0.005],  # Default thresholds
+                        interval_minutes=interval_minutes,
                     )
-                    
+
                     # Add enhanced targets (TTH, ordinal, path quality, asymmetric)
                     df = add_enhanced_targets_to_dataframe(
                         df,
                         price_col=price_col,
                         horizons=self.horizons,
                         barrier_sizes=self.barrier_sizes,
-                        tp_sl_ratios=[(1.0, 0.5), (1.5, 0.75), (2.0, 1.0)]  # TP:SL ratios
+                        tp_sl_ratios=[(1.0, 0.5), (1.5, 0.75), (2.0, 1.0)],  # TP:SL ratios
+                        interval_minutes=interval_minutes,
                     )
                     
                     # 3) Sanity: enforce uniqueness again before write (defensive)

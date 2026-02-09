@@ -980,7 +980,7 @@ class TradingEngine:
             if arb_result.alpha > 0:
                 gate_result = self.barrier_gate.evaluate_long_entry(p_peak=p_peak, p_valley=p_valley)
             else:
-                gate_result = self.barrier_gate.evaluate_short_entry(p_peak=p_valley, p_valley=p_peak)
+                gate_result = self.barrier_gate.evaluate_short_entry(p_valley=p_valley, p_peak=p_peak)
 
             if trace:
                 trace.barrier_gate_result = gate_result.to_dict()
@@ -1058,6 +1058,11 @@ class TradingEngine:
                 trace=trace,
             )
 
+        # Use signed shares: positive for BUY, negative for SELL
+        # sizing_result.shares is always positive (from abs(trade_weight)),
+        # so we must apply the sign from sizing_result.side
+        signed_shares = sizing_result.shares if sizing_result.side == SIDE_BUY else -sizing_result.shares
+
         return TradeDecision(
             symbol=symbol,
             decision=DECISION_TRADE,
@@ -1065,7 +1070,7 @@ class TradingEngine:
             target_weight=sizing_result.target_weight,
             current_weight=current_weight,
             alpha=arb_result.alpha,
-            shares=sizing_result.shares,
+            shares=signed_shares,
             reason=arb_result.reason,
             timestamp=current_time,
             trace=trace,

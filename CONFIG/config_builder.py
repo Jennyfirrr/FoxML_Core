@@ -563,7 +563,7 @@ def build_data_config(experiment_cfg: Optional[ExperimentConfig] = None) -> Data
     if experiment_cfg:
         return DataConfig(
             timestamp_column="ts",  # Could come from system config
-            interval=experiment_cfg.interval,
+            bar_interval=experiment_cfg.data.bar_interval,
             max_samples_per_symbol=experiment_cfg.max_samples_per_symbol,
             validation_split=0.2,
             seed=42
