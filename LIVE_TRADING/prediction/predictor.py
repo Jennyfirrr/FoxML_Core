@@ -39,6 +39,11 @@ class ModelPrediction:
     confidence: ConfidenceComponents
     calibrated: float  # standardized × confidence
 
+    @property
+    def alpha(self) -> float:
+        """Alias for calibrated prediction (used by barrier gate)."""
+        return self.calibrated
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         return {
@@ -378,6 +383,58 @@ class MultiHorizonPredictor:
             confidence=confidence,
             calibrated=calibrated,
         )
+
+    def predict_single_target(
+        self,
+        target: str,
+        prices: pd.DataFrame,
+        symbol: str,
+        data_timestamp: datetime | None = None,
+    ) -> Optional[ModelPrediction]:
+        """
+        Get a single prediction for a target (first available horizon + family).
+
+        Used by barrier gate for peak/valley predictions.
+
+        Args:
+            target: Target name (e.g., "will_peak_5m")
+            prices: OHLCV DataFrame
+            symbol: Trading symbol
+            data_timestamp: Data timestamp for freshness
+
+        Returns:
+            ModelPrediction or None if no model available
+        """
+        if data_timestamp is None:
+            data_timestamp = datetime.now(timezone.utc)
+
+        # Use first configured horizon
+        horizon = self.horizons[0] if self.horizons else "5m"
+
+        available_families = self.loader.list_available_families(target)
+        if not available_families:
+            return None
+
+        # Try first available family
+        for family in available_families:
+            try:
+                pred = self._predict_single(
+                    target=target,
+                    horizon=horizon,
+                    family=family,
+                    prices=prices,
+                    symbol=symbol,
+                    data_timestamp=data_timestamp,
+                    adv=float("inf"),
+                    planned_dollars=0.0,
+                )
+                if pred is not None:
+                    return pred
+            except Exception as e:
+                logger.debug(f"predict_single_target failed for {family}/{target}: {e}")
+                continue
+
+        return None
 
     def update_actuals(
         self,
