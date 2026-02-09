@@ -1,6 +1,6 @@
 # LIVE_TRADING Inference Fixes — Master Plan
 
-**Status**: Phases 0-3 COMPLETE, Phase 4 pending
+**Status**: ALL PHASES COMPLETE (0-4)
 **Created**: 2026-02-08
 **Branch**: `analysis/code-review-and-raw-ohlcv`
 **Depends on**: `raw-ohlcv-sequence-mode.md` (Phases 1-2 complete), `cross-sectional-ranking-objective.md` (complete)
@@ -102,18 +102,21 @@ End-to-end verification that raw OHLCV models work through the live pipeline.
 - [x] Backward compat test: models without `input_mode` default to features
 - [x] All 23 tests passing
 
-### Phase 4: Cross-Sectional Ranking Inference (future)
+### Phase 4: Cross-Sectional Ranking Inference
 **File**: `live-phase4-cs-ranking-inference.md`
-**Status**: Planning (not blocking raw OHLCV)
+**Status**: ✅ COMPLETE
 **Estimated scope**: 1 new file + modifications, ~250 lines
 
-Implement ranking-aware inference for CS-trained models. This is a separate concern from raw OHLCV — CS ranking models output relative scores that need cross-symbol comparison.
+Implement ranking-aware inference for CS-trained models. CS ranking models output relative scores that need cross-symbol comparison.
 
-- [ ] New class: `CrossSectionalRankingPredictor` in `LIVE_TRADING/prediction/`
-- [ ] Collect predictions for all symbols at a timestamp
-- [ ] Rank cross-sectionally (percentile rank)
-- [ ] Feed ranked signals to blending/arbitration
-- [ ] Read `cross_sectional_ranking` metadata from `model_meta.json`
+- [x] New class: `CrossSectionalRankingPredictor` in `LIVE_TRADING/prediction/cs_ranking_predictor.py`
+- [x] `predict()` — collect raw scores for all symbols, rank cross-sectionally, convert to signals
+- [x] `_get_ranking_config()` — read `cross_sectional_ranking` metadata from `model_meta.json`
+- [x] `ModelLoader.get_cs_ranking_config()` — metadata extraction helper
+- [x] Engine integration: two-phase cycle (CS pre-prediction → per-symbol merge)
+- [x] Probit transform maps percentile ranks to z-score-like signals for blender compatibility
+- [x] Min universe size enforcement (configurable, default 5)
+- [x] 26 tests: ranking math, signal conversion, CS detection, contract fields, backward compat
 
 ## Dependency Graph
 
@@ -131,7 +134,7 @@ Phase 4 (CS ranking) ←— future, independent
 
 ## Contract Compliance
 
-All changes must satisfy `INTEGRATION_CONTRACTS.md` v1.3:
+All changes satisfy `INTEGRATION_CONTRACTS.md` v1.4:
 
 | Field | Used By | Phase |
 |-------|---------|-------|
@@ -166,3 +169,19 @@ All changes must satisfy `INTEGRATION_CONTRACTS.md` v1.3:
 - Phase 3: 23 tests all passing (14 unit + 9 integration)
 - Phase 4 (CS ranking inference) remains for future implementation
 - All changes on branch `analysis/code-review-and-raw-ohlcv`
+
+### 2026-02-08: Phase 4 implemented
+- New file: `LIVE_TRADING/prediction/cs_ranking_predictor.py` (~250 lines)
+  - `CrossSectionalRankingPredictor` with `predict()` and `_get_ranking_config()`
+  - `_percentile_rank()` using scipy.stats.rankdata for deterministic tie handling
+  - `_rank_to_signal()` using probit transform (norm.ppf) for z-score compatibility
+- `ModelLoader.get_cs_ranking_config()` extracts cross_sectional_ranking from metadata
+- Engine integration: two-phase cycle in `run_cycle()` — CS pre-prediction before per-symbol loop
+- `_process_symbol()` merges CS ranked predictions alongside pointwise predictions
+- 26 tests all passing in `tests/test_live_cs_ranking.py`
+- All 49 inference tests passing (23 Phase 3 + 26 Phase 4)
+- Design decisions:
+  - Min universe size: configurable via `live_trading.cs_ranking.min_universe_size` (default 5)
+  - Probit transform maps uniform ranks to normal z-scores (matches blender's z-score scale)
+  - CS rankings replicated across all horizons (one rank per timestamp, not per horizon)
+  - Mixed CS + pointwise families: CS predictions merged into AllPredictions alongside pointwise

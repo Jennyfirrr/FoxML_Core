@@ -1,6 +1,6 @@
 # Phase 4: Cross-Sectional Ranking Inference
 
-**Status**: Planning (not blocking raw OHLCV deployment)
+**Status**: ✅ COMPLETE
 **Parent**: `live-trading-inference-master.md`
 **Scope**: 1 new file + modifications, ~250 lines
 **Depends on**: Phase 1 (input mode awareness)
@@ -168,12 +168,12 @@ This requires a change to the cycle processing loop — predict all symbols, the
 
 ## Verification
 
-- [ ] CS ranking detected from model metadata
-- [ ] Raw scores collected for all symbols before ranking
-- [ ] Percentile ranks computed correctly
-- [ ] Ranked signals feed into blending pipeline
-- [ ] Non-CS models in same target unaffected
-- [ ] Minimum universe size enforced
+- [x] CS ranking detected from model metadata
+- [x] Raw scores collected for all symbols before ranking
+- [x] Percentile ranks computed correctly
+- [x] Ranked signals feed into blending pipeline (probit transform → z-score scale)
+- [x] Non-CS models in same target unaffected
+- [x] Minimum universe size enforced
 
 ## Files Changed
 
