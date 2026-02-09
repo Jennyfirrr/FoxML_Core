@@ -36,6 +36,7 @@ Exception:
 
 import yaml
 import os
+import threading
 from pathlib import Path
 from typing import Dict, Any, Optional
 import logging
@@ -47,8 +48,9 @@ logger = logging.getLogger(__name__)
 # Resolve CONFIG directory (parent of this file)
 CONFIG_DIR = Path(__file__).resolve().parent
 
-# Cache for defaults config (loaded once)
+# Cache for defaults config (loaded once), protected by RLock for thread safety
 _DEFAULTS_CACHE = None
+_DEFAULTS_CACHE_LOCK = threading.RLock()
 
 def clear_config_cache() -> None:
     """
@@ -56,8 +58,9 @@ def clear_config_cache() -> None:
     Useful when config files are modified and you want changes to take effect immediately.
     """
     global _DEFAULTS_CACHE
-    _DEFAULTS_CACHE = None
-    logger.info("✅ Cleared config cache - configs will be reloaded on next access")
+    with _DEFAULTS_CACHE_LOCK:
+        _DEFAULTS_CACHE = None
+    logger.info("Cleared config cache - configs will be reloaded on next access")
 
 def load_defaults_config() -> Dict[str, Any]:
     """
@@ -67,29 +70,30 @@ def load_defaults_config() -> Dict[str, Any]:
         Dictionary with default values organized by category
     """
     global _DEFAULTS_CACHE
-    if _DEFAULTS_CACHE is not None:
+    with _DEFAULTS_CACHE_LOCK:
+        if _DEFAULTS_CACHE is not None:
+            return _DEFAULTS_CACHE
+
+        defaults_file = CONFIG_DIR / "defaults.yaml"
+        if not defaults_file.exists():
+            logger.warning(f"Defaults config not found: {defaults_file}, using empty defaults")
+            _DEFAULTS_CACHE = {}
+            return _DEFAULTS_CACHE
+
+        try:
+            with open(defaults_file, 'r') as f:
+                loaded = yaml.safe_load(f)
+                if loaded is None:
+                    logger.warning(f"Defaults config {defaults_file} is empty or invalid YAML, using empty defaults")
+                    _DEFAULTS_CACHE = {}
+                else:
+                    _DEFAULTS_CACHE = loaded
+                    logger.debug(f"Loaded defaults config from {defaults_file}")
+        except Exception as e:
+            logger.error(f"Failed to load defaults config {defaults_file}: {e}")
+            _DEFAULTS_CACHE = {}
+
         return _DEFAULTS_CACHE
-    
-    defaults_file = CONFIG_DIR / "defaults.yaml"
-    if not defaults_file.exists():
-        logger.warning(f"Defaults config not found: {defaults_file}, using empty defaults")
-        _DEFAULTS_CACHE = {}
-        return _DEFAULTS_CACHE
-    
-    try:
-        with open(defaults_file, 'r') as f:
-            loaded = yaml.safe_load(f)
-            if loaded is None:
-                logger.warning(f"Defaults config {defaults_file} is empty or invalid YAML, using empty defaults")
-                _DEFAULTS_CACHE = {}
-            else:
-                _DEFAULTS_CACHE = loaded
-                logger.debug(f"Loaded defaults config from {defaults_file}")
-    except Exception as e:
-        logger.error(f"Failed to load defaults config {defaults_file}: {e}")
-        _DEFAULTS_CACHE = {}
-    
-    return _DEFAULTS_CACHE
 
 
 def inject_defaults(config: Dict[str, Any], model_family: Optional[str] = None) -> Dict[str, Any]:

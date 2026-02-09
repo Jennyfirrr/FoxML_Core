@@ -197,6 +197,8 @@ class HorizonBlender:
 
         if not pred_history:
             n = len(ic_values)
+            if n == 0:
+                return {}
             return {m: 1.0 / n for m in ic_values}
 
         return self.weight_calculator.calculate_from_predictions(

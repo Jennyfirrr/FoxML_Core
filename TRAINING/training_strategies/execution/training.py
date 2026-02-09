@@ -199,8 +199,8 @@ def _get_training_interval_minutes() -> float:
     try:
         if _CONFIG_AVAILABLE:
             return float(get_cfg("pipeline.data.interval_minutes", default=5.0))
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Failed to load interval_minutes from config: {e}")
     return 5.0  # Default to 5m if config unavailable
 
 
@@ -307,23 +307,26 @@ def train_model_comprehensive(family: str, X: np.ndarray, y: np.ndarray,
         if group_sizes is not None:
             try:
                 gs = np.asarray(group_sizes).ravel().tolist()
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Could not convert group_sizes to list: {e}")
                 gs = group_sizes
             trainer_config["groups"] = gs
         if sample_weights is not None:
             try:
                 sw = np.asarray(sample_weights).ravel().tolist()
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Could not convert sample_weights to list: {e}")
                 sw = sample_weights
             trainer_config["sample_weight"] = sw
-    
+
     elif family == 'XGBoost':
         if spec.task == 'multiclass' and routing_meta.get('label_map'):
             trainer_config["num_class"] = len(routing_meta['label_map'])
         if sample_weights is not None:
             try:
                 sw = np.asarray(sample_weights).ravel().tolist()
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Could not convert sample_weights to list: {e}")
                 sw = sample_weights
             trainer_config["sample_weight"] = sw
     
@@ -423,8 +426,8 @@ def normalize_selected_features(
     # Case 2b: Dict keys are symbol names (SYMBOL_SPECIFIC shape)
     symbol_keys = keys & set(symbols)  # Intersection with known symbols
     if symbol_keys and not (keys & META_KEYS):
-        # All keys are symbols -> SYMBOL_SPECIFIC
-        return {'symbol_specific': {sym: target_feat_data[sym] for sym in symbol_keys}}
+        # All keys are symbols -> SYMBOL_SPECIFIC (sorted for determinism)
+        return {'symbol_specific': {sym: target_feat_data[sym] for sym in sorted(symbol_keys)}}
     
     # Case 2c: Unknown structure
     raise ValueError(
@@ -2899,8 +2902,8 @@ def train_models_for_interval_comprehensive(interval: str, targets: List[str],
     total_skipped = 0
     total_attempted = 0
     
-    for target, target_results in results['models'].items():
-        for family, model_result in target_results.items():
+    for target, target_results in sorted_items(results['models']):
+        for family, model_result in sorted_items(target_results):
             total_attempted += 1
             if model_result and model_result.get('success', False):
                 total_saved += 1
@@ -2953,9 +2956,9 @@ def train_models_for_interval_comprehensive(interval: str, targets: List[str],
         
         # Build detailed summary by target
         by_target = {}
-        for target, target_models in results.get('models', {}).items():
+        for target, target_models in sorted_items(results.get('models', {})):
             by_target[target] = {}
-            for family, model_result in target_models.items():
+            for family, model_result in sorted_items(target_models):
                 if model_result and isinstance(model_result, dict):
                     status = "success" if model_result.get('success', False) else (
                         "skipped" if model_result.get('skipped', False) else "failed"

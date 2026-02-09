@@ -171,7 +171,7 @@ def train_cs_ranking_model(
             if val_ic > best_ic:
                 best_ic = val_ic
                 best_metrics = val_metrics.copy()
-                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
                 patience_counter = 0
             else:
                 patience_counter += 1

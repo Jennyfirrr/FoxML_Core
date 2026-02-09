@@ -734,9 +734,11 @@ def _process_combined_data_pandas(combined_df: pd.DataFrame, target: str, featur
             logger.warning(f"🔍 Debug [{target}]: {len(all_nan_before)} features are ALL NaN BEFORE coercion: {list(all_nan_before.index)[:10]}")
     
     # Convert to numeric, coerce errors to NaN, and sanitize infinities
+    # Explicit .copy() to avoid SettingWithCopyWarning if feature_df is a view
+    feature_df = feature_df.copy()
     for col in feature_df.columns:
-        feature_df.loc[:, col] = pd.to_numeric(feature_df[col], errors='coerce')
-    feature_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        feature_df[col] = pd.to_numeric(feature_df[col], errors='coerce')
+    feature_df = feature_df.replace([np.inf, -np.inf], np.nan)
     
     # DIAGNOSTIC: Check NaN ratios AFTER coercion
     if len(feature_df.columns) > 0:
