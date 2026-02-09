@@ -189,9 +189,18 @@ Upgrades the training objective from pointwise MSE to pairwise/listwise ranking 
 - LambdaRank and ListMLE loss functions
 - New metrics: NDCG@K, MRR, Precision@K
 
-**`raw-ohlcv-sequence-mode.md`** - Raw OHLCV sequences for neural models (Status: Planning)
+**`raw-ohlcv-sequence-mode.md`** - Raw OHLCV sequences for neural models (Status: Phases 1-2 complete, Phase 5 planned)
 
 Adds `input_mode: RAW_SEQUENCE` that feeds raw OHLCV bars directly to sequence models (Transformer, LSTM, CNN1D) instead of computed technical indicators.
+
+**`live-trading-inference-master.md`** - LIVE_TRADING inference fixes for raw OHLCV + CS ranking (Status: Ready for implementation)
+
+Wires raw OHLCV and cross-sectional ranking model support into the live inference pipeline:
+- Phase 0: Barrier gate crash fix (standalone)
+- Phase 1: Input mode awareness across loader/inference/predictor
+- Phase 2: Raw OHLCV normalization and inference path
+- Phase 3: Testing and contract verification
+- Phase 4: Cross-sectional ranking inference (future)
 
 #### Recently Completed Plans
 

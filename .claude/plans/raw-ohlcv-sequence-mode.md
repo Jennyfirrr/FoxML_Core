@@ -95,6 +95,17 @@ Parquet → build_sequences_from_ohlcv → Normalize → (N, T, 5) → Model
 - [ ] Ablation: sequence length impact (32, 64, 128, 256 bars)
 - [ ] Documentation: When to use which mode
 
+### Phase 5: LIVE_TRADING Integration
+**File**: `live-trading-inference-master.md` (separate master plan with sub-phases)
+**Status**: PLANNED (2026-02-08)
+
+LIVE_TRADING has zero `input_mode` awareness. Full plan created with 5 sub-phases:
+- Phase 0: Barrier gate quick fix (standalone bug)
+- Phase 1: Input mode detection in loader, inference engine, predictor
+- Phase 2: Raw OHLCV normalization and inference path
+- Phase 3: Testing and contract verification
+- Phase 4: Cross-sectional ranking inference (future)
+
 ## Configuration Schema
 
 ```yaml
