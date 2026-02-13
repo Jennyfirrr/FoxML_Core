@@ -259,7 +259,7 @@ class DiffTelemetry(DiffEngineMixin, FingerprintMixin, ComparisonGroupMixin, Nor
             temp_dir = self.output_dir
             for _ in range(10):
                 # DETERMINISM: Use iterdir_sorted for deterministic iteration order
-                if any((temp_dir / d).is_dir() and d.startswith("sample_") for d in iterdir_sorted(temp_dir) if d.is_dir()):
+                if any(d.is_dir() and d.name.startswith("sample_") for d in iterdir_sorted(temp_dir)):
                     results_dir = temp_dir
                     break
                 if not temp_dir.parent.exists():

@@ -2003,8 +2003,9 @@ def train_models_for_interval_comprehensive(interval: str, targets: List[str],
                 write_atomic_json(meta_path, metadata)
 
                 logger.info(f"✅ CS ranking model saved: {model_path}")
-                logger.info(f"   Best IC: {training_result['best_metrics'].get('spearman_ic', 0):.4f}")
-                logger.info(f"   Best Spread: {training_result['best_metrics'].get('spread', 0):.6f}")
+                best_metrics = training_result.get('best_metrics') or {}
+                logger.info(f"   Best IC: {best_metrics.get('spearman_ic', 0):.4f}")
+                logger.info(f"   Best Spread: {best_metrics.get('spread', 0):.6f}")
 
                 # Record results
                 target_results["cs_ranking_mlp"] = {

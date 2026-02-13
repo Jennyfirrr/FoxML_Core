@@ -415,7 +415,7 @@ class LoggingAPIMixin:
 
                     main_logger = _get_main_logger()
                     n_info = f"N={cohort_metadata['n_effective_cs']}, symbols={cohort_metadata['n_symbols']}"
-                    if cohort_metadata.get('date_range', {}).get('start_ts'):
+                    if (cohort_metadata.get('date_range') or {}).get('start_ts'):
                         date_info = f", date_range={cohort_metadata['date_range']['start_ts']}->{cohort_metadata['date_range'].get('end_ts', '')}"
                     else:
                         date_info = ""
@@ -1487,8 +1487,8 @@ class LoggingAPIMixin:
                         "target": ctx.target or ctx.target_column or "unknown",
                         "n_effective": cohort_metadata.get('n_effective_cs', 0) if cohort_metadata else 0,
                         "n_symbols": cohort_metadata.get('n_symbols', 0) if cohort_metadata else 0,
-                        "date_start": cohort_metadata.get('date_range', {}).get('start_ts') if cohort_metadata else None,
-                        "date_end": cohort_metadata.get('date_range', {}).get('end_ts') if cohort_metadata else None,
+                        "date_start": (cohort_metadata.get('date_range') or {}).get('start_ts') if cohort_metadata else None,
+                        "date_end": (cohort_metadata.get('date_range') or {}).get('end_ts') if cohort_metadata else None,
                         "created_at": datetime.now().isoformat()
                     }
 

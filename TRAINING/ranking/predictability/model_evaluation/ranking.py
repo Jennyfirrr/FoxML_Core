@@ -4325,7 +4325,7 @@ def evaluate_target_predictability(
                         pred_hashes = []
                         models_without_fp = []
                         for model_name, metrics in model_metrics.items():
-                            if isinstance(metrics, dict) and 'prediction_fingerprint' in metrics:
+                            if isinstance(metrics, dict) and metrics.get('prediction_fingerprint'):
                                 pred_hash = metrics['prediction_fingerprint'].get('prediction_hash', '')
                                 if pred_hash:
                                     pred_hashes.append(pred_hash)

@@ -3275,6 +3275,7 @@ def select_features_for_target(
     # Cross-sectional stability summary (if CS ranking was run)
     if cs_stability_results is not None:
         try:
+            _cs_results = cs_stability_results or {}
             status_emoji = {
                 'stable': '✅',
                 'drifting': '⚠️',
@@ -3283,13 +3284,13 @@ def select_features_for_target(
                 'snapshot_failed': '❌',
                 'analysis_failed': '❌',
                 'system_unavailable': '❌'
-            }.get(cs_stability_results.get('status', 'unknown'), '❓')
+            }.get(_cs_results.get('status', 'unknown'), '❓')
 
             logger.info(
-                f"📊 Cross-sectional stability summary: {status_emoji} {cs_stability_results.get('status', 'unknown').upper()} "
-                f"(overlap={cs_stability_results.get('mean_overlap', 'N/A')}, "
-                f"tau={cs_stability_results.get('mean_tau', 'N/A')}, "
-                f"snapshots={cs_stability_results.get('n_snapshots', 0)})"
+                f"📊 Cross-sectional stability summary: {status_emoji} {_cs_results.get('status', 'unknown').upper()} "
+                f"(overlap={_cs_results.get('mean_overlap', 'N/A')}, "
+                f"tau={_cs_results.get('mean_tau', 'N/A')}, "
+                f"snapshots={_cs_results.get('n_snapshots', 0)})"
             )
         except Exception:
             pass  # Non-critical summary logging

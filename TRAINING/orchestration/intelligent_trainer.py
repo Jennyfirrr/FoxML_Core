@@ -1340,7 +1340,7 @@ class IntelligentTrainer(PipelineStageMixin):
                         experiment_config=experiment_config_dict
                     )
                     # Validate manifest was created
-                    manifest_path = self.output_dir / "globals" / "manifest.json"
+                    manifest_path = self.output_dir / "manifest.json"
                     if not manifest_path.exists():
                         logger.warning(f"⚠️ Manifest creation reported success but manifest.json not found at {manifest_path}")
                     else:

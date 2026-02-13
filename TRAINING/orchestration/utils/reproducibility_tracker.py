@@ -1092,7 +1092,7 @@ class ReproducibilityTracker(IndexManagerMixin, CohortManagerMixin, ComparisonEn
         
         # FIX: Normalize cs_config before hashing to ensure consistent structure
         # Always include all keys (even if None) to prevent different hashes for same config
-        cs_config_for_hash = cohort_metadata.get('cs_config', {}).copy()
+        cs_config_for_hash = (cohort_metadata.get('cs_config') or {}).copy()
         # Ensure all expected keys are present (with None if missing)
         expected_keys = ['min_cs', 'max_cs_samples', 'leakage_filter_version', 'universe_sig']
         for key in expected_keys:
@@ -1112,13 +1112,13 @@ class ReproducibilityTracker(IndexManagerMixin, CohortManagerMixin, ComparisonEn
             "n_effective": cohort_metadata.get('n_effective_cs', 0),  # Changed from "n_effective" to match finalize_run() expectations
             "n_symbols": cohort_metadata.get('n_symbols', 0),
             "symbols": symbols_list,  # Sorted, deduplicated list of symbols
-            "date_start": cohort_metadata.get('date_range', {}).get('start_ts'),  # Changed from "date_start" to match finalize_run() expectations
-            "date_end": cohort_metadata.get('date_range', {}).get('end_ts'),  # Changed from "date_end" to match finalize_run() expectations
+            "date_start": (cohort_metadata.get('date_range') or {}).get('start_ts'),  # Changed from "date_start" to match finalize_run() expectations
+            "date_end": (cohort_metadata.get('date_range') or {}).get('end_ts'),  # Changed from "date_end" to match finalize_run() expectations
             # FIX: Single assignment with proper fallback - _normalize_universe_sig checks both top-level and cs_config
-            "universe_sig": _normalize_universe_sig(cohort_metadata) if _normalize_universe_sig else (cohort_metadata.get('cs_config', {}).get('universe_sig') or cohort_metadata.get('universe_sig')),
-            "min_cs": cohort_metadata.get('cs_config', {}).get('min_cs'),
-            "max_cs_samples": cohort_metadata.get('cs_config', {}).get('max_cs_samples'),
-            "leakage_filter_version": cohort_metadata.get('cs_config', {}).get('leakage_filter_version', 'v1'),
+            "universe_sig": _normalize_universe_sig(cohort_metadata) if _normalize_universe_sig else ((cohort_metadata.get('cs_config') or {}).get('universe_sig') or cohort_metadata.get('universe_sig')),
+            "min_cs": (cohort_metadata.get('cs_config') or {}).get('min_cs'),
+            "max_cs_samples": (cohort_metadata.get('cs_config') or {}).get('max_cs_samples'),
+            "leakage_filter_version": (cohort_metadata.get('cs_config') or {}).get('leakage_filter_version', 'v1'),
             "config_hash": config_hash,
             "seed": run_data.get('seed') or (additional_data.get('seed') if additional_data else None),
             "git_commit": self._get_git_commit(),

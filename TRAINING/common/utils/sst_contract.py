@@ -405,13 +405,19 @@ def resolve_target_horizon_minutes(target: str, config: Optional[Dict[str, Any]]
     for pattern_config in patterns:
         regex = pattern_config.get('regex')
         multiplier = pattern_config.get('multiplier', 1)
-        
+
         if regex:
             match = re.search(regex, target, re.IGNORECASE)
             if match:
                 value = int(match.group(1))
                 return value * multiplier
-    
+
+    # Fallback: fwd_ret_N (bare integer) → N minutes
+    # Targets like fwd_ret_10, fwd_ret_15, fwd_ret_60 use minutes without a suffix
+    bare_match = re.search(r'fwd_ret_(\d+)$', target, re.IGNORECASE)
+    if bare_match:
+        return int(bare_match.group(1))
+
     # No match found - return None (do NOT default silently)
     return None
 

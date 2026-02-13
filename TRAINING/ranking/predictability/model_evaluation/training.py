@@ -3235,32 +3235,26 @@ def train_and_evaluate_models(
                 logger.debug(f"  CatBoost final params (sample): task_type={params.get('task_type')}, devices={params.get('devices')}, iterations={params.get('iterations', 'default')}")
             
             # Set verbose level from backend config (similar to LightGBM)
-            # CatBoost verbose: 0=silent, 1=info, 2=debug, >2=more verbose
-            # CRITICAL: Ensure verbose is always an integer (CatBoost doesn't accept boolean)
-            # This conversion must happen ALWAYS, not just when 'verbose' is missing
-            if 'verbose' in params:
-                verbose_val = params['verbose']
-                # Convert boolean to integer: False -> 0, True -> 1
-                if isinstance(verbose_val, bool):
-                    params['verbose'] = 1 if verbose_val else 0
-                    logger.debug(f"  CatBoost: Converted verbose={verbose_val} (bool) -> {params['verbose']} (int)")
-                elif isinstance(verbose_val, (int, float)) and verbose_val < 0:
-                    # CRITICAL FIX: Negative verbose causes "Verbose period should be nonnegative" error
-                    # CatBoost requires verbose >= 0 (0=silent, 1=info, 2=debug)
-                    params['verbose'] = 0
-                    logger.debug(f"  CatBoost: Sanitized verbose={verbose_val} -> 0 (negative values cause errors)")
-                elif not isinstance(verbose_val, int):
-                    params['verbose'] = max(0, int(verbose_val))
+            # CRITICAL: Use logging_level='Silent' instead of verbose=0 to avoid
+            # "Verbose period should be nonnegative" errors in newer CatBoost versions.
+            # CatBoost internally maps verbose to verbose_period, and some versions
+            # reject verbose=0 as an invalid period.
+            verbose_val = params.pop('verbose', None)
+            if verbose_val is None:
+                verbose_val = catboost_backend_cfg.native_verbosity
+            # Determine if we should be silent
+            if isinstance(verbose_val, bool):
+                is_silent = not verbose_val
+            elif isinstance(verbose_val, (int, float)):
+                is_silent = verbose_val <= 0
             else:
-                verbose_level = catboost_backend_cfg.native_verbosity
-                # Convert boolean to integer: False -> 0, True -> 1
-                if isinstance(verbose_level, bool):
-                    verbose_level = 1 if verbose_level else 0
-                elif not isinstance(verbose_level, int):
-                    # Convert to int if it's a float or other type
-                    verbose_level = int(verbose_level) if verbose_level >= 0 else 0
-                params['verbose'] = verbose_level
-            
+                is_silent = True
+            if is_silent:
+                params['logging_level'] = 'Silent'
+                params.pop('verbose_period', None)
+            else:
+                params['verbose'] = max(1, int(verbose_val))
+
             # CatBoost: verbose_period must be >= 0 (if present)
             # Remove if negative to prevent "Verbose period should be nonnegative" error
             # This matches the logic in config_cleaner.py but applies it directly in the model evaluation path

@@ -12,6 +12,11 @@ All notable changes to FoxML Core will be documented in this file.
 - **`get_input_mode` crash with ExperimentConfig object** - Function assumed dict input but received a dataclass; now handles both dict and ExperimentConfig types
 - **Missing xgboost crashes all model training** - `model_fun/__init__.py` imported all CPU trainers unconditionally, so a missing `xgboost` package prevented even `lightgbm` from loading; now uses conditional imports per trainer
 - **`release_data` crash on None DataFrame** - `unified_loader.py` called `len(df)` without guarding against None values in the data dict
+- **CatBoost "Verbose period should be nonnegative"** - Newer CatBoost versions reject `verbose=0`; replaced with `logging_level='Silent'` for silent mode
+- **NoneType `.get()` errors in reproducibility tracking** - Fixed chained `.get('key', {}).get(...)` patterns that fail when nested values (date_range, cs_config, prediction_fingerprint, best_metrics) are explicitly None instead of missing
+- **PosixPath.startswith crash in run hash computation** - `iterdir_sorted()` returns Path objects but `.startswith()` was called directly instead of `.name.startswith()`
+- **`horizon_minutes is None` for `fwd_ret_N` targets** - Added fallback pattern matching bare integers in target names (e.g., `fwd_ret_15` → 15 minutes)
+- **Manifest path mismatch warning** - Validation check looked at `globals/manifest.json` but manifest is saved at `manifest.json`
 
 ## 2026-02-09
 
