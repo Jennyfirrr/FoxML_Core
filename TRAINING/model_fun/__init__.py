@@ -11,30 +11,43 @@ Uses conditional imports to avoid loading TF/Torch in CPU-only child processes.
 
 import os as _os
 
-# ---- CPU-only families (safe to import everywhere) ----
-from .lightgbm_trainer import LightGBMTrainer
-from .quantile_lightgbm_trainer import QuantileLightGBMTrainer
-from .xgboost_trainer import XGBoostTrainer
-from .reward_based_trainer import RewardBasedTrainer
-from .ngboost_trainer import NGBoostTrainer
-from .ensemble_trainer import EnsembleTrainer
-from .gmm_regime_trainer import GMMRegimeTrainer
-from .change_point_trainer import ChangePointTrainer
-from .ftrl_proximal_trainer import FTRLProximalTrainer
+# ---- Base trainer (always available) ----
 from .base_trainer import BaseModelTrainer
 
 __all__ = [
-    'LightGBMTrainer',
-    'QuantileLightGBMTrainer',
-    'XGBoostTrainer',
-    'RewardBasedTrainer',
-    'NGBoostTrainer',
-    'EnsembleTrainer',
-    'GMMRegimeTrainer',
-    'ChangePointTrainer',
-    'FTRLProximalTrainer',
     'BaseModelTrainer',
 ]
+
+# ---- CPU-only families (conditional imports for optional dependencies) ----
+import logging as _logging
+_logger = _logging.getLogger(__name__)
+
+def _try_import(name, module_attr):
+    """Import a trainer, returning None if its dependency is missing."""
+    try:
+        mod = __import__(f"TRAINING.model_fun.{name}", fromlist=[module_attr])
+        return getattr(mod, module_attr)
+    except ImportError as e:
+        _logger.debug(f"{module_attr} not available: {e}")
+        return None
+
+_cpu_trainers = {
+    'LightGBMTrainer': ('lightgbm_trainer', 'LightGBMTrainer'),
+    'QuantileLightGBMTrainer': ('quantile_lightgbm_trainer', 'QuantileLightGBMTrainer'),
+    'XGBoostTrainer': ('xgboost_trainer', 'XGBoostTrainer'),
+    'RewardBasedTrainer': ('reward_based_trainer', 'RewardBasedTrainer'),
+    'NGBoostTrainer': ('ngboost_trainer', 'NGBoostTrainer'),
+    'EnsembleTrainer': ('ensemble_trainer', 'EnsembleTrainer'),
+    'GMMRegimeTrainer': ('gmm_regime_trainer', 'GMMRegimeTrainer'),
+    'ChangePointTrainer': ('change_point_trainer', 'ChangePointTrainer'),
+    'FTRLProximalTrainer': ('ftrl_proximal_trainer', 'FTRLProximalTrainer'),
+}
+
+for _cls_name, (_mod_name, _attr) in _cpu_trainers.items():
+    _cls = _try_import(_mod_name, _attr)
+    if _cls is not None:
+        globals()[_cls_name] = _cls
+        __all__.append(_cls_name)
 
 # ---- TensorFlow families (only import if TF is allowed and available) ----
 if _os.getenv("TRAINER_CHILD_NO_TF", "0") != "1":

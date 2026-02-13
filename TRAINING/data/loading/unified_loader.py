@@ -656,7 +656,7 @@ def release_data(
 
     # Count items before release
     n_symbols = len(mtf_data)
-    n_rows = sum(len(df) for df in mtf_data.values()) if mtf_data else 0
+    n_rows = sum(len(df) for df in mtf_data.values() if df is not None) if mtf_data else 0
 
     # Release all DataFrames
     for key in list(mtf_data.keys()):
