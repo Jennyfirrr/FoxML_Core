@@ -25,15 +25,21 @@ If you or your organization are found using FoxML without a valid license:
 
 **Your identity will be kept strictly confidential.** Reports are evaluated in good faith. Acceptable evidence includes:
 
-- Screenshots or recordings of FoxML running in production, staging, or dev environments
-- Internal docs, Slack messages, emails, wiki pages, or tickets referencing FoxML
-- Source code, config files, or deployment artifacts showing FoxML integration (e.g., imports from `TRAINING/`, `CONFIG/`, `LIVE_TRADING/`, FoxML-specific config keys)
-- Git logs, CI/CD pipelines, or container images containing the software
-- Job postings or presentations referencing FoxML or its distinctive architecture (3-stage intelligent pipeline, deterministic strict mode, fingerprint lineage)
-- Network captures, API responses, or logs with FoxML-specific identifiers
-- Testimony from current/former employees with corroborating documentary evidence
+- **Screenshots or recordings** of FoxML running in production, staging, or dev environments (e.g., terminal output showing FoxML pipeline stages, dashboard TUI, training logs)
+- **Internal communications** — Slack messages, emails, wiki/Confluence pages, Jira/Linear tickets, or meeting notes referencing FoxML, FoxML Core, or its components
+- **Source code or config files** showing FoxML integration — look for:
+  - Imports from `TRAINING/`, `CONFIG/`, `LIVE_TRADING/`, `DATA_PROCESSING/` modules
+  - FoxML-specific config keys (e.g., `pipeline.determinism.base_seed`, SST helper calls like `get_cfg()`, `get_target_dir()`, `write_atomic_json()`)
+  - Directory structures matching FoxML's layout (`RESULTS/runs/`, `stage=TARGET_RANKING/`, `stage=TRAINING/`)
+  - Model metadata files containing FoxML-specific fields (`model_meta.json`, `manifest.json`, `routing_decision.json`)
+- **Deployment artifacts** — Docker images, Kubernetes manifests, Terraform configs, or CI/CD pipelines (GitHub Actions, Jenkins, GitLab CI) that build, test, or deploy FoxML
+- **Git history** — commits, branches, or repos containing FoxML code, even if renamed or restructured
+- **Job postings or presentations** referencing FoxML by name, or describing its distinctive architecture: 3-stage intelligent pipeline, deterministic strict mode, fingerprint lineage, cross-sectional + symbol-specific dual-view training, 20 model families
+- **Output artifacts** — run manifests, fingerprint files, `config.resolved.json`, or model artifacts with FoxML's characteristic schema (SHA256 fingerprints, `run_id`, `RunIdentity`)
+- **Network traffic or logs** — API responses, error messages, or log files containing FoxML-specific identifiers or artifact schemas
+- **Testimony** from current or former employees with direct knowledge, supported by at least one piece of corroborating documentary evidence
 
-Partial or circumstantial evidence may qualify if it establishes a reasonable basis for enforcement. See [LICENSE-COMMERCIAL](LICENSE-COMMERCIAL) Section 10 for full terms.
+**Even partial evidence counts.** A single screenshot, a Slack message mentioning "FoxML", or a job posting describing the pipeline architecture may be enough to open an investigation. See [LICENSE-COMMERCIAL](LICENSE-COMMERCIAL) Section 10 for full legal terms.
 
 **Report unauthorized use:** [jenn.lewis5789@gmail.com](mailto:jenn.lewis5789@gmail.com) — Subject: "FoxML License Enforcement Report"
 
