@@ -1,6 +1,40 @@
 # FoxML Core — ML Cross-Sectional Infrastructure
 
-> **License Enforcement Notice:** This software is dual-licensed under AGPL-3.0-or-later and a commercial license. Unauthorized use will be pursued. Settlement terms: **$250,000 USD flat fee + 1-10% of gross revenue** from date of first unauthorized use. **Whistleblower bounty:** Know a company using FoxML without a license? Report it confidentially to **jenn.lewis5789@gmail.com** — earn **50% of the flat fee ($125K) + 25% of the gross revenue recovery**. See [LICENSE-COMMERCIAL](LICENSE-COMMERCIAL) for full terms.
+---
+
+## License & Enforcement
+
+**This software is dual-licensed:** [AGPL-3.0-or-later](LICENSE) **or** [Commercial](LICENSE-COMMERCIAL). If you use this software without complying with the AGPL (including the requirement to publish your source code for any network-accessible deployment) and without a commercial license, you are infringing copyright.
+
+### Unauthorized Use — Settlement Terms
+
+If you or your organization are found using FoxML without a valid license:
+
+- **$250,000 USD flat fee** plus **1-10% of gross revenue** derived from use of the software, from date of first unauthorized use through settlement
+- The Copyright Holder reserves the right to pursue **full statutory damages** under 17 U.S.C. Section 504 (up to **$150,000 per work** for willful infringement), **injunctive relief**, and **attorney's fees**
+
+### Whistleblower Bounty Program
+
+**Know a company using FoxML without a license?** Report it confidentially and earn:
+
+- **$125,000** (50% of the flat fee recovery)
+- **25% of the gross revenue recovery** (25% of the 1-10% gross revenue settlement)
+
+**Your identity will be kept strictly confidential.** Reports are evaluated in good faith. Acceptable evidence includes:
+
+- Screenshots or recordings of FoxML running in production, staging, or dev environments
+- Internal docs, Slack messages, emails, wiki pages, or tickets referencing FoxML
+- Source code, config files, or deployment artifacts showing FoxML integration (e.g., imports from `TRAINING/`, `CONFIG/`, `LIVE_TRADING/`, FoxML-specific config keys)
+- Git logs, CI/CD pipelines, or container images containing the software
+- Job postings or presentations referencing FoxML or its distinctive architecture (3-stage intelligent pipeline, deterministic strict mode, fingerprint lineage)
+- Network captures, API responses, or logs with FoxML-specific identifiers
+- Testimony from current/former employees with corroborating documentary evidence
+
+Partial or circumstantial evidence may qualify if it establishes a reasonable basis for enforcement. See [LICENSE-COMMERCIAL](LICENSE-COMMERCIAL) Section 10 for full terms.
+
+**Report unauthorized use:** [jenn.lewis5789@gmail.com](mailto:jenn.lewis5789@gmail.com) — Subject: "FoxML License Enforcement Report"
+
+---
 
 **FoxML is research-grade ML infrastructure with deterministic strict mode + full fingerprint lineage. It assumes prior experience with Python, Linux, and quantitative workflows. Some stuff may not work properly, i had a breakdown and wasnt able to test some stuff.**
 
