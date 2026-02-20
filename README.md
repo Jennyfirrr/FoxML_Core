@@ -20,7 +20,7 @@
 >
 > **Known Issues:**
 > - **IBKR module**: Lost during development. The IBKR API is difficult to work with and this module will likely not be continued.
-> - **Alpaca module**: The Alpaca trading module is being redesigned. Legacy implementations are in `ARCHIVE/` for reference. The current execution engine is in `LIVE_TRADING/`.
+> - **Alpaca module**: The Alpaca trading module is being redesigned. Legacy implementations are in `ARCHIVE/` for reference. The current execution engine is in `LIVE_TRADING/`. This module is also untested, but updated as well. 
 >
 > **License:** Dual-licensed — AGPL-3.0-or-later ([LICENSE](LICENSE)) or Commercial ([LICENSE-COMMERCIAL](LICENSE-COMMERCIAL))
 
