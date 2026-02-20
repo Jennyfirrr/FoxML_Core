@@ -2,6 +2,8 @@
 
 ---
 
+- **Feel free to ask me questions as well, Im bored alot of the time and enjoy learning new methods or discussing my choices within the context of this repo.**
+
 ## License & Enforcement
 
 **© 2025-2026 Fox ML Infrastructure LLC. All rights reserved.**
