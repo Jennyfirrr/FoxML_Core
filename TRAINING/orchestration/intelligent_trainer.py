@@ -2805,8 +2805,28 @@ class IntelligentTrainer(PipelineStageMixin):
         }
 
 
+_LICENSE_BANNER = """
+================================================================================
+  FoxML Core — (c) 2025-2026 Fox ML Infrastructure LLC. All rights reserved.
+  U.S. Copyright Registration Case No. 1-15101732111
+
+  Dual-licensed: AGPL-3.0-or-later OR Commercial.
+  Unauthorized use is willful copyright infringement.
+
+  Settlement for unauthorized use:
+    - $250,000 USD flat fee + 1-10% of gross revenue from first unauthorized use
+    - Full statutory damages under 17 U.S.C. Section 504 (up to $150,000/work)
+
+  Report unauthorized use -> 33% of net recovery bounty.
+  Contact: jenn.lewis5789@gmail.com | See LICENSE-COMMERCIAL Section 10.
+================================================================================
+"""
+
+
 def main():
     """Main entry point for intelligent training orchestrator."""
+    print(_LICENSE_BANNER)
+
     # NOTE: ArgumentParser setup moved to intelligent_trainer/cli.py
     parser = create_argument_parser()
     args = parser.parse_args()

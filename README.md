@@ -2,14 +2,24 @@
 
 ---
 
-**Feel free to ask me questions as well, Im bored alot of the time and enjoy learning new methods or discussing my choices within the context of this repo. I dont really use much social media, so idk how to really communicate with people, but idk. Work has stalled due to some personal issues. I have also shifted focus to getting better at timed coding within leetcode/hackerrank exams to try and get hired somewhere. Work will most likely resume when I get a better PC, or be indefinitly discontinued assuming a hedge fund hires me. Im not sure if the last set of updates broke the regular feature->target training, I havent really tested that, but as far as im aware, the raw OHCLV training should work, and should have better(?) results if my theory was right, as well as faster inference during live trading as features do not have to be computed at run time, but thats not a huge issue, considering features are just mathmatical transformations of OHCLV data at the end of the day. The LIVE_EXECUTION module is completely untested, I was about to start testing and fixing that before some stuff happened. Use at your own risk, and I cant really fix nor test it properly atm. Good Luck, and happy trading!**
-
 ## License & Enforcement
 
 **© 2025-2026 Fox ML Infrastructure LLC. All rights reserved.**
 **U.S. Copyright Registration Case No. 1-15101732111** — Registered with the U.S. Copyright Office as a Literary Work.
 
 **This software is dual-licensed:** [AGPL-3.0-or-later](LICENSE) **or** [Commercial](LICENSE-COMMERCIAL). If you use this software without complying with the AGPL (including the requirement to publish your source code for any network-accessible deployment) and without a commercial license, you are infringing copyright.
+
+### Unauthorized Use — Settlement Terms
+
+If you or your organization are found using FoxML without a valid license:
+
+- **$250,000 USD flat fee** plus **1-10% of gross revenue** derived from use of the software, from date of first unauthorized use through settlement
+- The Copyright Holder reserves the right to pursue **full statutory damages** under 17 U.S.C. Section 504 (up to **$150,000 per work** for willful infringement), **injunctive relief**, and **attorney's fees**
+
+**Report unauthorized use:** If your report leads to a successful settlement or judgment, you receive **33% of net recovery** (after legal fees). No recovery, no obligation. Contact: [jenn.lewis5789@gmail.com](mailto:jenn.lewis5789@gmail.com) — See [LICENSE-COMMERCIAL](LICENSE-COMMERCIAL) Section 10(c) for full terms.
+
+---
+
 **FoxML is research-grade ML infrastructure with deterministic strict mode + full fingerprint lineage. It assumes prior experience with Python, Linux, and quantitative workflows. As always, some parts are experimental and subject to breakage as work continues.**
 
 > ⚠️ **Disclaimer:** This software is provided for research and educational purposes only. It does not constitute financial advice, and no guarantees of returns or performance are made. Use at your own risk.
