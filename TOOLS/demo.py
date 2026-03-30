@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-or-later OR Commercial
+# SPDX-License-Identifier: MIT
 """
 Demo Script - One-Command Reproducible Pipeline Run
 

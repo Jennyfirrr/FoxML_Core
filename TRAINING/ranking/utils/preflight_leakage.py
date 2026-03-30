@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-or-later OR Commercial
+# SPDX-License-Identifier: MIT
 # Copyright (c) 2025-2026 Fox ML Infrastructure LLC
 
 """Pre-flight leakage detection: filter features BEFORE loading data.

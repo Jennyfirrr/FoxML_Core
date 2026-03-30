@@ -1,6 +1,6 @@
 name: License Notice
 
-description: Standard license acknowledgment for AGPL v3.0
+description: Standard license acknowledgment for MIT License
 
 body:
   - type: markdown
@@ -8,7 +8,7 @@ body:
       value: |
         ### License Notice
 
-        This project is licensed under GNU AGPL v3.0.
+        This project is licensed under the MIT License.
 
         See the LICENSE file for full terms and conditions.
 
@@ -17,8 +17,8 @@ body:
       label: Acknowledgment
       description: Confirm you understand the license.
       options:
-        - label: I understand this software is licensed under GNU AGPL v3.0
-        - label: I will comply with the AGPL license terms
+        - label: I understand this software is licensed under the MIT License
+        - label: I will comply with the MIT license terms
 
 
 

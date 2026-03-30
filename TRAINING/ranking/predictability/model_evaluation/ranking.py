@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-or-later OR Commercial
+# SPDX-License-Identifier: MIT
 # Copyright (c) 2025-2026 Fox ML Infrastructure LLC
 
 """
@@ -10,7 +10,7 @@ for evaluating target predictability across symbols.
 Extracted from model_evaluation.py as part of Phase 1 modular decomposition.
 """
 
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 # Copyright (c) 2025-2026 Fox ML Infrastructure LLC
 
 """

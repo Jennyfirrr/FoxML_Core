@@ -2,6 +2,16 @@
 
 All notable changes to FoxML Core will be documented in this file.
 
+## 2026-03-30
+
+### Licensing
+
+#### Changed
+- **Relicensed from AGPL-3.0 dual-license to MIT** — Replaced AGPL-3.0-or-later + Commercial dual-license with the MIT License for broader adoption
+- Removed LICENSE-COMMERCIAL, enforcement terms, settlement clauses, and bounty program
+- Updated all SPDX headers across source files to `MIT`
+- Updated NOTICE, CITATION.cff, pyproject.toml, Cargo.toml, README, and GitHub templates
+
 ## 2026-02-18
 
 ### Licensing

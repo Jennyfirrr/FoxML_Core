@@ -6,7 +6,7 @@
 # IMPORTANT: Environment variables override these settings.
 #   REPRO_MODE, REPRO_SEED, REPRO_VERSION
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later OR Commercial
+# SPDX-License-Identifier: MIT
 
 reproducibility:
   # Mode: strict | best_effort

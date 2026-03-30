@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Commercial
+# SPDX-License-Identifier: MIT
 # Copyright (c) 2025-2026 Fox ML Infrastructure LLC
 
 """
@@ -15,14 +15,14 @@ from pathlib import Path
 import re
 
 # Standard header for Python files
-PYTHON_HEADER = """# SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Commercial
+PYTHON_HEADER = """# SPDX-License-Identifier: MIT
 # Copyright (c) 2025-2026 Fox ML Infrastructure LLC
 
 """
 
 # Standard header for shell scripts
 SHELL_HEADER = """#!/bin/bash
-# SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Commercial
+# SPDX-License-Identifier: MIT
 # Copyright (c) 2025-2026 Fox ML Infrastructure LLC
 
 """

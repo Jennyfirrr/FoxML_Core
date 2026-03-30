@@ -2,21 +2,11 @@
 
 ---
 
-## License & Enforcement
+## License
 
-**© 2025-2026 Fox ML Infrastructure LLC. All rights reserved.**
-**U.S. Copyright Registration Case No. 1-15101732111** — Registered with the U.S. Copyright Office as a Literary Work.
+**© 2025-2026 Fox ML Infrastructure LLC.**
 
-**This software is dual-licensed:** [AGPL-3.0-or-later](LICENSE) **or** [Commercial](LICENSE-COMMERCIAL). If you use this software without complying with the AGPL (including the requirement to publish your source code for any network-accessible deployment) and without a commercial license, you are infringing copyright.
-
-### Unauthorized Use — Settlement Terms
-
-If you or your organization are found using FoxML without a valid license:
-
-- **$250,000 USD flat fee** plus **1-10% of gross revenue** derived from use of the software, from date of first unauthorized use through settlement
-- The Copyright Holder reserves the right to pursue **full statutory damages** under 17 U.S.C. Section 504 (up to **$150,000 per work** for willful infringement), **injunctive relief**, and **attorney's fees**
-
-**Report unauthorized use:** If your report leads to a successful settlement or judgment, you receive **33% of net recovery** (after legal fees). No recovery, no obligation. Contact: [jenn.lewis5789@gmail.com](mailto:jenn.lewis5789@gmail.com) — See [LICENSE-COMMERCIAL](LICENSE-COMMERCIAL) Section 10(c) for full terms.
+Licensed under the [MIT License](LICENSE).
 
 ---
 
@@ -34,7 +24,7 @@ If you or your organization are found using FoxML without a valid license:
 > - **IBKR module**: Lost during development. The IBKR API is difficult to work with and this module will likely not be continued.
 > - **Alpaca module**: The Alpaca trading module is being redesigned. Legacy implementations are in `ARCHIVE/` for reference. The current execution engine is in `LIVE_TRADING/`. This module is also untested, but updated as well. 
 >
-> **License:** Dual-licensed — AGPL-3.0-or-later ([LICENSE](LICENSE)) or Commercial ([LICENSE-COMMERCIAL](LICENSE-COMMERCIAL))
+> **License:** [MIT](LICENSE)
 
 > **🔍 Reproducibility & Auditability:** This system supports **bitwise deterministic runs** via strict mode (`bin/run_deterministic.sh`) for financial audit compliance. Bitwise determinism requires CPU-only execution, pinned dependencies, fixed thread env vars, and deterministic data ordering. Note: Not guaranteed across different CPUs/BLAS versions/kernels/drivers/filesystem ordering. See [Deterministic Runs](DOCS/02_reference/configuration/DETERMINISTIC_RUNS.md).
 
